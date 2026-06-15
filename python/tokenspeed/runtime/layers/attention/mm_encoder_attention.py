@@ -428,9 +428,9 @@ class VisionAttention(nn.Module):
         qkv, _ = self.qkv_proj(x)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        q = q.reshape(bsz * s, head, -1).contiguous()
-        k = k.reshape(bsz * s, kv_head, -1).contiguous()
-        v = v.reshape(bsz * s, kv_head, -1).contiguous()
+        q = q.reshape(bsz * s, head, -1)
+        k = k.reshape(bsz * s, kv_head, -1)
+        v = v.reshape(bsz * s, kv_head, -1)
 
         cos = None
         sin = None
