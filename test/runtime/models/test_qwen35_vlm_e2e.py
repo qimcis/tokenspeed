@@ -90,7 +90,6 @@ def _serve_server(log_path: Path) -> subprocess.Popen:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_f = log_path.open("w")
     proc = subprocess.Popen(
-    proc = subprocess.Popen(
         cmd,
         stdout=log_f,
         stderr=subprocess.STDOUT,
