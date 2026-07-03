@@ -58,6 +58,7 @@ else:
         fused_add_rmsnorm,
         gemma_fused_add_rmsnorm,
         gemma_rmsnorm,
+        layernorm,
         rmsnorm,
     )
 
@@ -67,6 +68,28 @@ logger = get_colorful_logger(__name__)
 
 def _get_process_group(group: tuple[int, ...]):
     return pg_manager.get_process_group("nccl", group)
+
+
+class LayerNorm(nn.Module):
+    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=torch.float32))
+        self.bias = nn.Parameter(torch.zeros(hidden_size, dtype=torch.float32))
+        self.variance_epsilon = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # There might be no tokens here (e.g. idle/padded graph rows).
+        if x.shape[0] == 0:
+            return x
+        if current_platform().is_nvidia:
+            return layernorm(x, self.weight, self.bias, self.variance_epsilon)
+        return nn.functional.layer_norm(
+            x.float(),
+            (x.shape[-1],),
+            self.weight,
+            self.bias,
+            self.variance_epsilon,
+        ).to(x.dtype)
 
 
 class RMSNorm(torch.nn.Module):

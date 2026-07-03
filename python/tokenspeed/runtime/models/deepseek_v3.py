@@ -592,8 +592,6 @@ class DeepseekV3AttentionMLA(nn.Module):
                 scaling_factor = rope_scaling["factor"]
                 mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
                 self.scaling = self.scaling * mscale * mscale
-            elif hasattr(self.rotary_emb, "forward_cuda"):
-                self.rotary_emb.forward = self.rotary_emb.forward_cuda
         else:
             self.rotary_emb = None
 

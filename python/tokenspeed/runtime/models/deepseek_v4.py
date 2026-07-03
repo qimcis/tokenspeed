@@ -3391,8 +3391,6 @@ class DeepseekV4Attention(nn.Module):
             rope_scaling=rope_scaling,
             is_neox_style=False,
         )
-        if not rope_scaling and hasattr(self.rotary_emb, "forward_cuda"):
-            self.rotary_emb.forward = self.rotary_emb.forward_cuda
         self.indexer_rotary_emb = self.rotary_emb
         self.fused_wqa_wkv = MergedColumnParallelLinear(
             config.hidden_size,
