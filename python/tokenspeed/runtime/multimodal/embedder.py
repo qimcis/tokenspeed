@@ -48,6 +48,11 @@ Within a single forward batch we still de-duplicate by ``item.hash``: if
 two requests reference the same image content, only the first item is
 fed to the encoder; the second request's scatter ranges read from the
 first item's ``encoded`` tensor.
+
+Across different requests, :class:`EncodedFeatureCache` keeps recently
+encoded tensors keyed by ``(modality, item.hash)``.  When a later request
+references the same content, the cache hit is used directly and the
+vision encoder is skipped for that item.
 """
 
 from __future__ import annotations
@@ -62,6 +67,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from tokenspeed.runtime.multimodal.feature_cache import EncodedFeatureCache
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
     MultimodalDataItem,
@@ -184,6 +190,17 @@ class VisionEmbedder:
 
     def __init__(self) -> None:
         self._h2d_stream: torch.cuda.Stream | None = None
+        self._encoded_feature_cache: EncodedFeatureCache | None = None
+        cache_max_bytes = envs.TOKENSPEED_MM_ENCODER_FEATURE_CACHE_MAX_BYTES.get()
+        if cache_max_bytes and cache_max_bytes > 0:
+            self._encoded_feature_cache = EncodedFeatureCache(
+                max_bytes=cache_max_bytes
+            )
+            logger.info(
+                "VisionEmbedder: cross-request encoded feature cache enabled "
+                "(max_bytes=%d)",
+                cache_max_bytes,
+            )
 
     # --- public entry point ------------------------------------------------
 
@@ -205,6 +222,11 @@ class VisionEmbedder:
         if is_decode_or_idle or ctx is None or not ctx.has_extend_inputs():
             return None, {}
 
+        cache_stats_before = (
+            self._encoded_feature_cache.stats()
+            if self._encoded_feature_cache is not None
+            else None
+        )
         total_started = time.perf_counter() if LOG_MM_TIMING else None
         plan_started = time.perf_counter() if LOG_MM_TIMING else None
         plan = self._plan(ctx)
@@ -255,11 +277,27 @@ class VisionEmbedder:
                 for modality, items in plan.misses_by_modality.items()
                 if items
             }
+            cache_stats_after = (
+                self._encoded_feature_cache.stats()
+                if self._encoded_feature_cache is not None
+                else None
+            )
+            if cache_stats_before is not None and cache_stats_after is not None:
+                cache_hits = cache_stats_after["hits"] - cache_stats_before["hits"]
+                cache_misses = (
+                    cache_stats_after["misses"] - cache_stats_before["misses"]
+                )
+                cache_bytes = cache_stats_after["current_bytes"]
+            else:
+                cache_hits = 0
+                cache_misses = 0
+                cache_bytes = 0
             logger.info(
                 "mm_timing vision_embedder_apply_ms total=%.3f plan=%.3f "
                 "encode=%.3f alias=%.3f assemble=%.3f feature_cleanup=%.3f "
                 "scatter_ranges=%d misses=%s input_rows=%d aliases=%d "
-                "released_alias_features=%d released_encoded_features=%d",
+                "released_alias_features=%d released_encoded_features=%d "
+                "cache_hits=%d cache_misses=%d cache_bytes=%d",
                 (time.perf_counter() - total_started) * 1000,
                 plan_elapsed_ms,
                 encode_elapsed_ms,
@@ -272,6 +310,9 @@ class VisionEmbedder:
                 sum(len(items) for items in plan.aliases_by_canonical.values()),
                 released_alias_features,
                 released_encoded_features,
+                cache_hits,
+                cache_misses,
+                cache_bytes,
             )
         return input_embeds, kwargs
 
@@ -281,6 +322,27 @@ class VisionEmbedder:
         plan = EncodePlan()
         if not ctx.mm_inputs:
             return plan
+
+        # Cross-request cache lookup.  If another request already encoded the
+        # same content, reuse it now and drop the raw pixel payload so it does
+        # not linger through the forward pass.
+        if self._encoded_feature_cache is not None:
+            for mm_inputs in ctx.mm_inputs:
+                if mm_inputs is None:
+                    continue
+                for item in mm_inputs.mm_items:
+                    if (
+                        item is None
+                        or item.encoded is not None
+                        or item.hash is None
+                    ):
+                        continue
+                    cached = self._encoded_feature_cache.get(
+                        item.modality, item.hash
+                    )
+                    if cached is not None:
+                        item.encoded, item.encoded_deepstack = cached
+                        self._drop_raw_feature(item)
 
         # Within-batch dedup: first item per content hash is canonical;
         # duplicates reuse its encoded tensor.
@@ -310,8 +372,13 @@ class VisionEmbedder:
                 if item is None or not item.offsets:
                     continue
 
+                # Prefer an already-encoded item (either from the cross-request
+                # cache or from a previous chunk of the same request) as the
+                # canonical source so the encoder can be skipped.
                 if item.encoded is not None:
                     canonical = item
+                    if item.hash is not None:
+                        canonical_by_hash[item.hash] = item
                 elif item.hash is not None and item.hash in canonical_by_hash:
                     canonical = canonical_by_hash[item.hash]
                 else:
@@ -397,6 +464,26 @@ class VisionEmbedder:
             else:
                 for item, emb in zip(items, per_item_embs):
                     item.encoded = emb
+
+            # Cache the encoded result for cross-request reuse.  We ensure the
+            # cached tensor is not a view into a larger reusable buffer (e.g.
+            # an eager batch output or a CUDA-graph output_buffer) before
+            # storing, otherwise the cache would pin unrelated memory.
+            if self._encoded_feature_cache is not None:
+                for item in items:
+                    if item.hash is None or item.encoded is None:
+                        continue
+                    item.encoded = self._detach_from_shared_storage(item.encoded)
+                    item.encoded_deepstack = self._detach_from_shared_storage(
+                        item.encoded_deepstack
+                    )
+                    self._encoded_feature_cache.put(
+                        item.modality,
+                        item.hash,
+                        item.encoded,
+                        item.encoded_deepstack,
+                    )
+
             if LOG_MM_TIMING:
                 logger.info(
                     "mm_timing encoder_ms modality=%s items=%d "
@@ -515,6 +602,23 @@ class VisionEmbedder:
                 if isinstance(it.feature, torch.Tensor):
                     it.feature = it.feature.to(device, non_blocking=True)
         current.wait_stream(h2d)
+
+    @staticmethod
+    def _detach_from_shared_storage(t: torch.Tensor | None) -> torch.Tensor | None:
+        """Return ``t`` cloned if it views a larger buffer, else ``t`` itself.
+
+        CUDA-graph and eager encoder paths sometimes return slices that share
+        storage with a reusable or batch-wide buffer.  Caching such a slice
+        would keep the whole parent buffer alive, so we clone when the
+        underlying storage is larger than the tensor's logical bytes.
+        """
+        if t is None:
+            return None
+        logical_bytes = int(t.element_size() * t.nelement())
+        storage_bytes = int(t.untyped_storage().nbytes())
+        if storage_bytes > logical_bytes:
+            return t.clone()
+        return t
 
     @staticmethod
     def _drop_raw_feature(item: MultimodalDataItem) -> bool:
