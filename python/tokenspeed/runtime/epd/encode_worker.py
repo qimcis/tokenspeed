@@ -103,16 +103,13 @@ class EncodeWorker:
             cached = self.cache.get(item.hash)
             if isinstance(item.feature, ShmTensorHandle):
                 # EPD pixel-SHM: the servicer published pixels to POSIX SHM and
-                # the ZMQ hop carried only this handle (hash/pad_value were set on
-                # the real tensor before publish). consume() unlinks, so segments
-                # never outlive the item: materialize on a miss, and on a hit still
-                # consume-and-drop to unlink the unused segment.
-                handle, item.feature = item.feature, None
-                handle.attach()
-                if cached is None:
-                    item.feature = handle.consume()
-                else:
-                    handle.consume()
+                # the ZMQ hop carried only this handle. Misses stay lazy so item-DP
+                # materializes pixels only on the owner rank; cache hits release the
+                # already-attached segment without copying it.
+                item.feature.attach()
+                if cached is not None:
+                    item.feature.release()
+                    item.feature = None
             if cached is not None:
                 # Cache hit: tower skipped, but the embedding still must reach
                 # the prefill peer, so ship it directly. Entries are
@@ -134,21 +131,28 @@ class EncodeWorker:
                 )
                 self._pending[(request.request_id, idx)] = item
 
-    def step(self) -> int:
+    def prepare_step(self) -> int:
+        """Poll transfers and return slots available for another encode."""
+        self.executor.reap_concluded_senders({rid for (rid, _idx) in self._pending})
+        self.executor.drain_deferred()
+        if self.executor.has_deferred():
+            return 0
+        return self.executor.available_ring_slots()
+
+    def step(self, *, available_slots: int | None = None) -> int:
         """Run one scheduler batch through the tower + transfer. Returns the
         number of items encoded (0 when nothing is pending)."""
-        self.executor.reap_concluded_senders({rid for (rid, _idx) in self._pending})
-        # Retry sends that couldn't lease a ring slot last tick (non-blocking).
-        self.executor.drain_deferred()
+        if available_slots is None:
+            available_slots = self.prepare_step()
         # Backpressure: if sends are STILL deferred after the drain, the bounce
         # ring is saturated (all slots hold in-flight transfers). Pulling more ViT
         # now would only pile fresh embeddings into _deferred_sends -- each pins a
         # GPU embedding tensor with no slot to ship it, growing an unbounded
         # backlog into an OOM. Skip this tick; the loop yields the GIL (encode_loop
         # sees has_deferred) so the transfer daemons free slots, then we resume.
-        if self.executor.has_deferred():
+        if available_slots <= 0 or self.executor.has_deferred():
             return 0
-        batch = self.scheduler.next_batch()
+        batch = self.scheduler.next_batch(max_items=available_slots)
         if not batch:
             return 0
         request_items = [(p.request_id, self._pending[p.key]) for p in batch]

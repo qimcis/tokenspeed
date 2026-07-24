@@ -456,7 +456,7 @@ class MultimodalEmbedder:
                 output_width = embedding_width
                 if spec.deepstack:
                     output_width *= 1 + len(multimodal_model.deepstack_visual_indexes)
-                per_item_embs = self._encode_data_parallel(
+                per_item_embs = self.encode_data_parallel(
                     items,
                     spec,
                     device,
@@ -464,14 +464,14 @@ class MultimodalEmbedder:
                     embedding_dtype,
                 )
             else:
-                output = self._run_encoder(items, spec, device)
+                output = self.run_encoder(items, spec, device)
                 per_item_lens = [_item_token_count(it) for it in items]
                 output = output.reshape(-1, output.shape[-1])
                 per_item_embs = list(torch.split(output, per_item_lens, dim=0))
 
             self._store_encoder_outputs(items, per_item_embs, spec, multimodal_model)
 
-    def _run_encoder(
+    def run_encoder(
         self,
         items: list[MultimodalDataItem],
         spec: EncoderSpec,
@@ -480,7 +480,7 @@ class MultimodalEmbedder:
         self._move_features_to_device(items, device)
         return spec.fn(items)
 
-    def _encode_data_parallel(
+    def encode_data_parallel(
         self,
         items: list[MultimodalDataItem],
         spec: EncoderSpec,
@@ -496,11 +496,37 @@ class MultimodalEmbedder:
         local_rows = assignment.token_counts_by_rank[self._encoder_dp_rank]
 
         local_output = torch.empty((0, output_width), dtype=output_dtype, device=device)
-        if local_items:
-            local_output = self._run_encoder(local_items, spec, device)
-            local_output = local_output.reshape(local_rows, output_width).to(
-                device=device, dtype=output_dtype
+        local_error = None
+        try:
+            if local_items:
+                local_output = self.run_encoder(local_items, spec, device)
+                local_output = local_output.reshape(local_rows, output_width).to(
+                    device=device, dtype=output_dtype
+                )
+        except Exception as exc:
+            local_error = f"{type(exc).__name__}: {exc}"
+
+        # Production initializes both backends for every mapping group. Agree
+        # failures over Gloo before any rank enters the NCCL output broadcasts,
+        # otherwise an owner-only encoder error would strand its peers.
+        if process_group_manager.has_process_group("gloo", self._encoder_dp_group):
+            errors: list[str | None] = [None] * len(self._encoder_dp_group)
+            torch.distributed.all_gather_object(
+                errors,
+                local_error,
+                group=process_group_manager.get_process_group(
+                    "gloo", self._encoder_dp_group
+                ),
             )
+            if any(errors):
+                details = "; ".join(
+                    f"rank {rank}: {error}"
+                    for rank, error in enumerate(errors)
+                    if error is not None
+                )
+                raise RuntimeError(f"encoder item-DP execution failed: {details}")
+        elif local_error is not None:
+            raise RuntimeError(f"encoder item-DP execution failed: {local_error}")
 
         gathered = self._gather_encoder_outputs(
             local_output, assignment.token_counts_by_rank

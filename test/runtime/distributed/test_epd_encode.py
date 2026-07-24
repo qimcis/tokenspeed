@@ -55,6 +55,7 @@ from tokenspeed.runtime.multimodal.inputs import (
     Modality,
     MultimodalDataItem,
 )
+from tokenspeed.runtime.multimodal.shm_transport import sync_shm_handles
 from tokenspeed.runtime.pd.base.status import TransferPoll
 
 
@@ -63,6 +64,7 @@ class _FakeExecutor:
         self.registered = []
         self.executed_batches = []  # list of [item.hash, ...] the tower ran
         self.sent_direct = []  # cache-hit hashes shipped without the tower
+        self.available_slots = 99
 
     def register(self, rid, host, port, room):
         self.registered.append((rid, room))
@@ -83,6 +85,9 @@ class _FakeExecutor:
 
     def has_deferred(self):
         return False
+
+    def available_ring_slots(self):
+        return self.available_slots
 
 
 def _item(h, tokens=2):
@@ -122,6 +127,16 @@ def test_cache_hit_skips_tower_but_still_ships():
     assert ex.sent_direct == [111]
     assert not w.has_pending()
     assert ex.executed_batches == [[111]]  # tower ran exactly once
+
+
+def test_worker_caps_encode_batch_to_available_ring_slots():
+    ex, w = _worker()
+    ex.available_slots = 1
+    w.submit(_req("r0", [_item(111), _item(222), _item(333)]))
+
+    assert w.step() == 1
+    assert ex.executed_batches == [[111]]
+    assert w.scheduler.pending_size() == 2
 
 
 # --- The encode worker drives the cache through get()/put() only, so it works
@@ -180,6 +195,9 @@ class _RaisingExecutor:
 
     def has_deferred(self):
         return False
+
+    def available_ring_slots(self):
+        return 99
 
     def fail_rooms(self, request_ids, exc):
         rooms = set()
@@ -281,6 +299,22 @@ class _LeaseManager:
     def is_parked(self, room):
         with self._pending_lock:
             return room in self._pending
+
+
+def test_available_ring_slots_excludes_inflight_and_parked_rooms():
+    manager = _LeaseManager(_RecordingEngine())
+    ex = DisaggEncodeExecutor(
+        manager, multimodal_model=None, device="cpu", ring_slots=3, ring_bytes=8
+    )
+    ex._slot_rooms = [1, 2, 3]
+    manager.request_status = {
+        1: TransferPoll.Transferring,
+        2: TransferPoll.Success,
+        3: TransferPoll.Success,
+    }
+    manager._pending[3] = object()
+
+    assert ex.available_ring_slots() == 1
 
 
 # --- Staging errors on the UNGUARDED paths must fail the room, not the worker.
@@ -395,6 +429,9 @@ def test_split_assigns_per_item_rows_and_deepstack():
     assert torch.equal(items[1].encoded_deepstack, output[2:5, 4:])
     assert items[0].encoded.is_contiguous()
     assert items[1].encoded_deepstack.is_contiguous()
+    output.zero_()
+    assert torch.count_nonzero(items[0].encoded) > 0
+    assert torch.count_nonzero(items[1].encoded_deepstack) > 0
 
 
 def test_token_count_mismatch_raises():
@@ -431,6 +468,41 @@ def test_feature_fn_image_routes_through_image_encoder_seam():
     assert exe._feature_fn(Modality.VIDEO) is model.get_video_feature
 
 
+def test_executor_item_dp_reconstructs_full_output_before_send():
+    items = [_exec_item((0, 1)), _exec_item((0, 2))]
+    expected = [torch.full((2, 4), 1.0), torch.full((3, 4), 2.0)]
+
+    class _Tower:
+        dtype = torch.float32
+
+    class _Model(_PlainModel):
+        mapping = None
+        config = type("Config", (), {"hidden_size": 4})()
+        vision_tower = _Tower()
+        image_encoder = staticmethod(lambda batch: None)
+
+    class _DPEmbedder:
+        has_encoder_dp = True
+
+        def encode_data_parallel(self, batch, spec, device, width, dtype):
+            assert batch == items
+            assert spec.fn is _Model.image_encoder
+            assert (device, width, dtype) == (torch.device("cpu"), 4, torch.float32)
+            return expected
+
+        @staticmethod
+        def _drop_raw_feature(item):
+            item.feature = None
+
+    exe = DisaggEncodeExecutor(object(), _Model(), "cpu")
+    exe._encoder_embedder = _DPEmbedder()
+    exe._stage_and_send = lambda request_items: None
+    exe.execute([("r0", items[0]), ("r1", items[1])])
+
+    torch.testing.assert_close(items[0].encoded, expected[0])
+    torch.testing.assert_close(items[1].encoded, expected[1])
+
+
 def _sched_item(rid: str, idx: int, cost: int) -> PendingEncodeItem:
     return PendingEncodeItem(
         request_id=rid,
@@ -460,6 +532,33 @@ def test_scheduler_respects_max_items():
     assert len(s.next_batch()) == 2
     assert len(s.next_batch()) == 2
     assert len(s.next_batch()) == 1
+
+
+def test_scheduler_respects_transient_item_limit():
+    s = EncodeScheduler(max_tokens_per_batch=10_000, max_items_per_batch=5)
+    for i in range(3):
+        s.add(_sched_item("r0", i, 1))
+    assert len(s.next_batch(max_items=1)) == 1
+    assert s.pending_size() == 2
+
+
+def test_partial_shm_attach_failure_releases_every_handle():
+    class _Handle:
+        def __init__(self, fails=False):
+            self.fails = fails
+            self.released = False
+
+        def attach(self):
+            if self.fails:
+                raise FileNotFoundError("missing")
+
+        def release(self):
+            self.released = True
+
+    handles = [_Handle(), _Handle(fails=True), _Handle()]
+    with pytest.raises(RuntimeError, match="SHM attach failed"):
+        sync_shm_handles(handles, group=None, group_size=1)
+    assert all(handle.released for handle in handles)
 
 
 def test_scheduler_oversized_single_item_returned_alone():

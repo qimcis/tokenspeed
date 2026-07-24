@@ -30,13 +30,19 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
 def _mapping_from_cli(
-    mode: str | None = None, *, request_dp_size: int = 1, rank: int = 0
+    mode: str | None = None,
+    *,
+    request_dp_size: int = 1,
+    rank: int = 0,
+    disaggregation_mode: str = "null",
 ) -> Mapping:
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     argv = ["--model", "test/model", "--tensor-parallel-size", "2"]
     if mode is not None:
         argv.extend(["--mm-encoder-tp-mode", mode])
+    if disaggregation_mode != "null":
+        argv.extend(["--disaggregation-mode", disaggregation_mode])
     if request_dp_size > 1:
         argv.extend(["--data-parallel-size", str(request_dp_size)])
     args = parser.parse_args(argv)
@@ -156,6 +162,21 @@ def _run_item_dp_case(rank: int, device: torch.device, mapping: Mapping) -> None
     assert idle_calls == (1 if rank == 0 else 0)
     torch.testing.assert_close(idle_item.encoded, _encoded_rows(idle_item, 2, device))
 
+    failing_item = _item(50, 1)
+
+    def failing_encoder(batch):
+        raise ValueError("owner failed")
+
+    with pytest.raises(RuntimeError, match="rank 0: ValueError: owner failed"):
+        embedder._encode(
+            EncodePlan(misses_by_modality={Modality.IMAGE: [failing_item]}),
+            {Modality.IMAGE: EncoderSpec(failing_encoder)},
+            SimpleNamespace(),
+            device,
+            2,
+            torch.float32,
+        )
+
 
 def _item_dp_worker(rank: int, world_size: int, port: int) -> None:
     device = torch.device(f"cuda:{rank}")
@@ -179,9 +200,7 @@ def _item_dp_worker(rank: int, world_size: int, port: int) -> None:
             vision_tp_size=1,
             vision_dp_size=world_size,
         )
-        process_group_manager.init_process_group(
-            mapping.vision.dp_group, backend="nccl"
-        )
+        process_group_manager.init_process_group(mapping.vision.dp_group)
         _run_item_dp_case(rank, device, mapping)
     finally:
         dist.destroy_process_group()
@@ -206,3 +225,16 @@ def test_multimodal_encoder_item_dp() -> None:
         nprocs=world_size,
         join=True,
     )
+
+
+def test_multimodal_encoder_item_dp_is_available_for_epd_encode() -> None:
+    mapping = _mapping_from_cli("data", disaggregation_mode="encode", rank=1)
+    assert (mapping.attn.tp_size, mapping.attn.dp_size) == (2, 1)
+    assert (mapping.vision.tp_size, mapping.vision.dp_size) == (1, 2)
+    assert mapping.vision.dp_group == mapping.attn.tp_group == (0, 1)
+
+
+@pytest.mark.parametrize("mode", ["prefill", "decode"])
+def test_multimodal_encoder_item_dp_rejects_non_encode_disaggregation(mode) -> None:
+    with pytest.raises(ValueError, match="aggregate serving.*encode"):
+        _mapping_from_cli("data", disaggregation_mode=mode)

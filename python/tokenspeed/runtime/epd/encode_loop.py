@@ -33,18 +33,18 @@ on ``port_args.scheduler_input_ipc_name``. The smg grpc_servicer's TokenSpeedEnc
 handler sends an :class:`EncodeRequest` (pickled) over that channel; the loop
 drains them into ``EncodeWorker.submit`` and runs ``step`` to encode + transfer.
 
-TP: the vision tower is TP-sharded, so all encode ranks run each batch in lockstep
--- rank 0 owns the gateway ZMQ and broadcasts every batch to the TP group. The
-embedding transport is a 1->N broadcast: prefill_tp must be a multiple of
-encode_tp. Data-parallel encode workers inside one server are not supported;
-horizontal scale comes from multiple independent encode servers selected by the
-gateway.
+All encode ranks run each batch in lockstep. In weight mode the vision tower is
+TP-sharded; in data mode ranks own whole items and replicate the gathered output
+before transfer. Rank 0 owns the gateway ZMQ and broadcasts every request batch.
+The embedding transport is a 1->N broadcast: prefill_tp must be a multiple of
+the encode execution width.
 """
 
 from __future__ import annotations
 
 import time
 
+import torch
 import zmq
 
 from tokenspeed.runtime.cache.embedding_cache import (
@@ -238,10 +238,8 @@ def run_encode_loop(server_args, port_args, pipe_writer, gpu_id, global_rank):
         server_args, port_args, gpu_id, global_rank
     )
 
-    # TP coordination: the vision tower is TP-sharded (collective ops), so every
-    # encode rank must run each batch in lockstep. Only rank 0 owns the gateway
-    # ZMQ; it broadcasts each drained batch to the TP group so all ranks submit
-    # the same requests and step together. (TP=1 -> rank 0 only, no broadcast.)
+    # Encode-rank coordination: weight TP and item DP both require lockstep
+    # batches. Only rank 0 owns the gateway ZMQ and broadcasts requests.
     attn_tp_rank = server_args.mapping.attn.tp_rank
     attn_tp_size = server_args.attn_tp_size or server_args.mapping.attn.tp_size
     tp_cpu_group = None
@@ -257,6 +255,15 @@ def run_encode_loop(server_args, port_args, pipe_writer, gpu_id, global_rank):
         tp_cpu_group = pg_manager.get_process_group(
             "gloo", server_args.mapping.attn.tp_group
         )
+
+    def min_available_slots(local_slots: int) -> int:
+        if attn_tp_size == 1:
+            return local_slots
+        available = torch.tensor(local_slots, dtype=torch.int32)
+        torch.distributed.all_reduce(
+            available, op=torch.distributed.ReduceOp.MIN, group=tp_cpu_group
+        )
+        return int(available.item())
 
     context = zmq.Context(2)
     recv_from_gateway = None
@@ -279,11 +286,17 @@ def run_encode_loop(server_args, port_args, pipe_writer, gpu_id, global_rank):
     )
 
     while True:
+        available_slots = min_available_slots(worker.prepare_step())
         # Rank 0 drains the gateway ZMQ without blocking; other ranks get the
         # same batch by broadcast below.
         new_reqs = []
-        if attn_tp_rank == 0:
-            while True:
+        if (
+            attn_tp_rank == 0
+            and available_slots > 0
+            and not worker.has_pending()
+            and not worker.has_deferred()
+        ):
+            while len(new_reqs) < server_args.max_num_seqs:
                 try:
                     request = recv_from_gateway.recv_pyobj(flags=zmq.NOBLOCK)
                 except zmq.Again:
@@ -297,13 +310,33 @@ def run_encode_loop(server_args, port_args, pipe_writer, gpu_id, global_rank):
                 new_reqs, attn_tp_rank, tp_cpu_group, src=attn_tp_src_rank
             )
 
+        if new_reqs:
+            from tokenspeed.runtime.multimodal.shm_transport import (
+                ShmTensorHandle,
+                sync_shm_handles,
+            )
+
+            sync_shm_handles(
+                (
+                    item.feature
+                    for request in new_reqs
+                    for item in request.items
+                    if isinstance(item.feature, ShmTensorHandle)
+                ),
+                tp_cpu_group,
+                attn_tp_size,
+            )
+
         for request in new_reqs:
             worker.submit(request)
         drained = len(new_reqs) > 0
 
+        if drained:
+            available_slots = min_available_slots(worker.prepare_step())
+
         # Encode + ship one scheduler batch. step() returns 0 when idle. All ranks
         # hold the same pending set, so they make the same step decision together.
-        did = worker.step()
+        did = worker.step(available_slots=available_slots) if available_slots else 0
 
         # Yield the GIL when there is no fresh ZMQ work, OR when sends are deferred
         # on a full ring. The daemon transfer-workers that free ring slots are

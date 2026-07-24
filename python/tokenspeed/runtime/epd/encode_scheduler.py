@@ -93,18 +93,23 @@ class EncodeScheduler:
         # Sort by (request_id, item_index) for cross-rank determinism.
         return [self._pending[k] for k in sorted(self._pending.keys())]
 
-    def next_batch(self) -> list[PendingEncodeItem]:
+    def next_batch(self, max_items: int | None = None) -> list[PendingEncodeItem]:
         """Pop and return the next deterministic batch of items to encode.
 
         Empty when nothing is pending. Removes the returned items from the
-        pending set.
+        pending set. ``max_items`` may impose a smaller transient limit, such as
+        the number of currently available transfer-ring slots.
         """
+        item_limit = self.max_items_per_batch
+        if max_items is not None:
+            if max_items <= 0:
+                return []
+            item_limit = min(item_limit, max_items)
         batch: list[PendingEncodeItem] = []
         used = 0
         for it in self._ordered_pending():
             if batch and (
-                used + it.cost > self.max_tokens_per_batch
-                or len(batch) >= self.max_items_per_batch
+                used + it.cost > self.max_tokens_per_batch or len(batch) >= item_limit
             ):
                 break
             batch.append(it)

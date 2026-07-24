@@ -532,10 +532,10 @@ class ServerArgs:
             raise ValueError("MoE TP and EP cannot be both > 1")
 
         if self.mm_encoder_tp_mode == "data":
-            if self.disaggregation_mode != "null":
+            if self.disaggregation_mode not in ("null", "encode"):
                 raise ValueError(
-                    "--mm-encoder-tp-mode data currently requires "
-                    "--disaggregation-mode null (aggregate serving)"
+                    "--mm-encoder-tp-mode data currently supports aggregate "
+                    "serving or --disaggregation-mode encode"
                 )
             if self.mapping.nnodes != 1:
                 raise ValueError(

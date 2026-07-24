@@ -134,6 +134,42 @@ class ShmTensorHandle:
             )
 
 
+def sync_shm_handles(handles, group, group_size: int) -> None:
+    """Attach handles on every rank before any consumer may unlink them."""
+    handles = list(handles)
+    if not handles:
+        return
+    local_error = None
+    try:
+        for handle in handles:
+            handle.attach()
+    except Exception as exc:
+        local_error = f"{type(exc).__name__}: {exc}"
+
+    if group_size > 1:
+        errors: list[str | None] = [None] * group_size
+        torch.distributed.all_gather_object(errors, local_error, group=group)
+        if any(errors):
+            for handle in handles:
+                try:
+                    handle.release()
+                except Exception:
+                    logger.exception("failed to release SHM handle after attach error")
+            details = "; ".join(
+                f"rank {rank}: {error}"
+                for rank, error in enumerate(errors)
+                if error is not None
+            )
+            raise RuntimeError(f"multimodal SHM attach failed: {details}")
+    elif local_error is not None:
+        for handle in handles:
+            try:
+                handle.release()
+            except Exception:
+                logger.exception("failed to release SHM handle after attach error")
+        raise RuntimeError(f"multimodal SHM attach failed: {local_error}")
+
+
 def sync_shm_features(reqs, group, group_size: int) -> None:
     """Attach SHM-backed features in ``reqs`` on every rank.
 
@@ -150,10 +186,16 @@ def sync_shm_features(reqs, group, group_size: int) -> None:
     if not pending:
         return
     started = time.perf_counter() if LOG_MM_TIMING else None
-    for mm in pending:
-        mm.attach_shm_features()
-    if group_size > 1:
-        torch.distributed.barrier(group)
+    sync_shm_handles(
+        (
+            item.feature
+            for mm in pending
+            for item in mm.mm_items
+            if isinstance(item.feature, ShmTensorHandle)
+        ),
+        group,
+        group_size,
+    )
     if LOG_MM_TIMING and started is not None:
         item_count = sum(len(mm.mm_items) for mm in pending)
         logger.info(

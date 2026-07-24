@@ -31,7 +31,11 @@ import torch
 from tokenspeed.runtime.epd.mooncake.sender import (
     MooncakeEmbeddingSender,
 )
-from tokenspeed.runtime.multimodal.embedder import _item_token_count
+from tokenspeed.runtime.multimodal.embedder import (
+    EncoderSpec,
+    MultimodalEmbedder,
+    _item_token_count,
+)
 from tokenspeed.runtime.multimodal.inputs import Modality, MultimodalDataItem
 from tokenspeed.runtime.pd.base.status import TransferPoll
 from tokenspeed.runtime.utils.env import envs
@@ -68,15 +72,24 @@ def assign_encoded_embeddings(
             f"{total} post-merge tokens; check the token-count / grid contract"
         )
 
-    has_deepstack = getattr(model, "num_deepstack_embeddings", 0) > 0
     per_item_embeds = torch.split(output, per_item_tokens, dim=0)
+    assign_per_item_encoded_embeddings(items, per_item_embeds, model)
+
+
+def assign_per_item_encoded_embeddings(items, per_item_embeds, model) -> None:
+    """Store already-split encoder outputs without repacking the full batch."""
+    if len(items) != len(per_item_embeds):
+        raise ValueError(
+            f"received {len(per_item_embeds)} encoder outputs for {len(items)} items"
+        )
+    has_deepstack = getattr(model, "num_deepstack_embeddings", 0) > 0
     for item, emb in zip(items, per_item_embeds):
         if has_deepstack:
             main, deep = model.separate_deepstack_embeds(emb)
-            item.encoded = main.contiguous()
-            item.encoded_deepstack = deep.contiguous()
+            item.encoded = main.clone(memory_format=torch.contiguous_format)
+            item.encoded_deepstack = deep.clone(memory_format=torch.contiguous_format)
         else:
-            item.encoded = emb.contiguous()
+            item.encoded = emb.clone(memory_format=torch.contiguous_format)
             item.encoded_deepstack = None
 
 
@@ -105,6 +118,10 @@ class DisaggEncodeExecutor:
         self.manager = manager
         self.model = multimodal_model
         self.device = device
+        mapping = getattr(multimodal_model, "mapping", None)
+        self._encoder_embedder = MultimodalEmbedder(
+            encoder_mapping=mapping.vision if mapping is not None else None
+        )
         self.senders = {}
         # RDMA requires every transferred buffer to be a registered memory region,
         # and mooncake rejects OVERLAPPING registrations -- registering each
@@ -161,8 +178,37 @@ class DisaggEncodeExecutor:
             by_modality.setdefault(item.modality, []).append(item)
         with torch.inference_mode():
             for modality, items in by_modality.items():
-                output = self._feature_fn(modality)(items)
-                assign_encoded_embeddings(items, output, self.model)
+                try:
+                    feature_fn = self._feature_fn(modality)
+                    spec = EncoderSpec(feature_fn, deepstack=False)
+                    if self._encoder_embedder.has_encoder_dp:
+                        num_deepstack = getattr(
+                            self.model, "num_deepstack_embeddings", 0
+                        )
+                        output_width = self.model.config.hidden_size * (
+                            1 + num_deepstack
+                        )
+                        tower = (
+                            getattr(self.model, "visual", None)
+                            or self.model.vision_tower
+                        )
+                        spec = EncoderSpec(feature_fn, deepstack=num_deepstack > 0)
+                        per_item = self._encoder_embedder.encode_data_parallel(
+                            items,
+                            spec,
+                            torch.device(self.device),
+                            output_width,
+                            tower.dtype,
+                        )
+                        assign_per_item_encoded_embeddings(items, per_item, self.model)
+                    else:
+                        output = self._encoder_embedder.run_encoder(
+                            items, spec, torch.device(self.device)
+                        )
+                        assign_encoded_embeddings(items, output, self.model)
+                finally:
+                    for item in items:
+                        self._encoder_embedder._drop_raw_feature(item)
         # Stage every embedding into its ring slot, then issue the async
         # Mooncake sends. See _stage_and_send for the copy/RDMA
         # overwrite-safety invariant (one CUDA event gates each transfer).
@@ -218,6 +264,22 @@ class DisaggEncodeExecutor:
                 if not mgr.is_parked(room):
                     return slot
         return None
+
+    def available_ring_slots(self) -> int:
+        """Return reusable slot count without reserving or blocking."""
+        available = 0
+        for room in self._slot_rooms:
+            if room is None:
+                available += 1
+                continue
+            status = self.manager.room_status(room)
+            if status is None or status in (
+                TransferPoll.Success,
+                TransferPoll.Failed,
+            ):
+                if not self.manager.is_parked(room):
+                    available += 1
+        return available
 
     def _stage_and_send(self, items: list[tuple[str, MultimodalDataItem]]) -> None:
         """Lease a ring slot per item and ship it; items that cannot lease a free
