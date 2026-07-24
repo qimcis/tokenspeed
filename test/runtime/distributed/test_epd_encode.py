@@ -413,7 +413,8 @@ class _FeatureFnModel:
         # use a distinct sentinel so the test proves IMAGE routes via the seam.
         self.image_encoder = lambda items: "via-image_encoder-seam"
         self.get_image_feature = lambda items: "eager-get_image_feature"
-        self.get_video_feature = lambda items: "video"
+        self.video_encoder = lambda items: "via-video_encoder-seam"
+        self.get_video_feature = lambda items: "eager-get_video_feature"
 
 
 def test_feature_fn_image_routes_through_image_encoder_seam():
@@ -427,8 +428,8 @@ def test_feature_fn_image_routes_through_image_encoder_seam():
     # get_image_feature directly -- else the captured graph would be bypassed.
     assert exe._feature_fn(Modality.IMAGE) is model.image_encoder
     assert exe._feature_fn(Modality.IMAGE) is not model.get_image_feature
-    # VIDEO has no captured graph and stays on the eager entry point.
-    assert exe._feature_fn(Modality.VIDEO) is model.get_video_feature
+    assert exe._feature_fn(Modality.VIDEO) is model.video_encoder
+    assert exe._feature_fn(Modality.VIDEO) is not model.get_video_feature
 
 
 def _sched_item(rid: str, idx: int, cost: int) -> PendingEncodeItem:
@@ -523,14 +524,22 @@ class _FakeModel:
         # The model leaves image_encoder == get_image_feature by default; the
         # wrapper install overrides it.
         self.image_encoder = self.get_image_feature
+        self.video_encoder = self.get_video_feature
         self.built_with = None
 
     def get_image_feature(self, items):
         return "eager"
 
-    def make_encoder_cudagraph_wrapper(self, mapping):
+    def get_video_feature(self, items):
+        return "eager-video"
+
+    def make_encoder_cudagraph_wrappers(self, mapping):
         self.built_with = mapping
-        return _WRAPPER
+        return {
+            "image_encoder": _WRAPPER,
+            "video_encoder": _WRAPPER,
+            "missing_encoder": object(),
+        }
 
 
 class _FakeServerArgs:
@@ -551,4 +560,12 @@ def test_encoder_cudagraph_installed_when_enabled(monkeypatch):
     m = _FakeModel()
     assert _maybe_install_encoder_cudagraph(m, _FakeServerArgs()) is True
     assert m.image_encoder is _WRAPPER
+    assert m.video_encoder is _WRAPPER
     assert m.built_with is m.mapping
+
+
+def test_encoder_cudagraph_empty_wrapper_map_is_not_installed(monkeypatch):
+    _set_graph_flag(monkeypatch, True)
+    m = _FakeModel()
+    m.make_encoder_cudagraph_wrappers = lambda mapping: {}
+    assert _maybe_install_encoder_cudagraph(m, _FakeServerArgs()) is False

@@ -120,28 +120,45 @@ def _build_manager_args(server_args, mapping):
 
 
 def _maybe_install_encoder_cudagraph(model, server_args) -> bool:
-    """Install the vision-encoder CUDA-graph wrapper as ``model.image_encoder``,
+    """Install encoder CUDA-graph wrappers on their model attributes,
     mirroring the aggregated path's hook in ``execution/model_executor.py``.
 
     The encode loop never builds a ModelExecutor, so this is where the encode
     worker opts into capture/replay of the tower instead of running it eager. Same
     gate as the aggregated install: the model exposes the builder, multimodal is
     active, the env flag is on, and the attention backend is graph-capturable. The
-    wrapper IS the model's ``image_encoder`` seam (lazy capture on first encode);
-    the executor's IMAGE path dispatches through ``model.image_encoder`` and falls
-    back to eager ``get_image_feature`` (the default) when this returns False.
+    Each wrapper replaces its modality encoder seam (lazy capture on first encode);
+    the executor dispatches through that seam and falls back to the eager encoder
+    when this returns False.
     Returns whether the wrapper was installed.
     """
     if not (
-        hasattr(model, "make_encoder_cudagraph_wrapper")
+        hasattr(model, "make_encoder_cudagraph_wrappers")
         and getattr(model, "is_multimodal_active", True)
         and envs.TOKENSPEED_MM_ENABLE_ENCODER_CUDA_GRAPH.get()
         and server_args.mm_attention_backend != "flashinfer_cudnn"
     ):
         return False
-    model.image_encoder = model.make_encoder_cudagraph_wrapper(model.mapping)
-    logger.info("EPD encode worker: vision-encoder CUDA graph installed")
-    return True
+
+    installed = []
+    for encoder_attr, wrapper in model.make_encoder_cudagraph_wrappers(
+        model.mapping
+    ).items():
+        if not hasattr(model, encoder_attr):
+            logger.warning(
+                "Skipping EPD encoder CUDA graph wrapper for missing attribute %s",
+                encoder_attr,
+            )
+            continue
+        setattr(model, encoder_attr, wrapper)
+        installed.append(encoder_attr)
+
+    if installed:
+        logger.info(
+            "EPD encode worker: encoder CUDA graphs installed for %s",
+            ", ".join(installed),
+        )
+    return bool(installed)
 
 
 def _build_encode_worker(server_args, port_args, gpu_id, global_rank):

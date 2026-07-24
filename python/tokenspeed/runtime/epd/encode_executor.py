@@ -147,12 +147,11 @@ class DisaggEncodeExecutor:
         # IMAGE dispatches through the model's ``image_encoder`` seam, NOT
         # ``get_image_feature`` directly: that seam is what the encoder CUDA-graph
         # wrapper overrides (see _maybe_install_encoder_cudagraph). When the graph
-        # is disabled the model leaves ``image_encoder = get_image_feature`` (eager);
-        # VIDEO has no captured graph -> always eager.
+        # is disabled the model leaves these seams on their eager defaults.
         if modality == Modality.IMAGE:
             return self.model.image_encoder
         if modality == Modality.VIDEO:
-            return self.model.get_video_feature
+            return self.model.video_encoder
         raise ValueError(f"unsupported modality for encode: {modality}")
 
     def execute(self, request_items: list[tuple[str, MultimodalDataItem]]) -> None:
