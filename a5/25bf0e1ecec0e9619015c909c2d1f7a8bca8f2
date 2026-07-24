@@ -1,0 +1,45 @@
+docs/configuration/server.md
+  s_b1097b3c52e309::t_036020cc490d52 76
+docs/serving/parallelism.md
+  s_b1097b3c52e309::t_6f8f4881cac70b 38
+python/tokenspeed/runtime/epd/encode_executor.py
+  s_b1097b3c52e309::t_3b83a733ba5b8c 34-38,76-85,89-90,92,121-124,181-211,268-283
+python/tokenspeed/runtime/epd/encode_loop.py
+  s_414cd192908149::t_52a3760d9a3d64 36-40,47,241-242,259-267,289,293-299,313-329,334-336,339
+python/tokenspeed/runtime/epd/encode_scheduler.py
+  s_b1097b3c52e309::t_efbdd0eabb8e22 96,100-101,103-107,112
+python/tokenspeed/runtime/epd/encode_worker.py
+  s_414cd192908149::t_5ed3d4a5ae57c3 106-112,134-135,138-146,153,155
+python/tokenspeed/runtime/multimodal/embedder.py
+  s_b1097b3c52e309::t_90b03d07c1391d 459,467,474,483,499-519,521-529
+python/tokenspeed/runtime/utils/server_args.py
+  s_b1097b3c52e309::t_dfd416b17308de 535,537-538
+test/runtime/distributed/test_epd_encode.py
+  s_414cd192908149::t_fc803d683af00d 58,67,89-91,132-141,199-201,304-319,432-434,471-505,537-563
+test/runtime/distributed/test_multimodal_encoder_parallelism.py
+  s_b1097b3c52e309::t_82465a6aa80094 33-37,44-45,165-179,203,228-240
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a525bf0e1ecec0e9619015c909c2d1f7a8bca8f2",
+  "prompts": {},
+  "sessions": {
+    "s_414cd192908149": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_092e40640ffew2SWf2GjqC7eiw",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    },
+    "s_b1097b3c52e309": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0792ffeafffez4mxSzHCaghy7o",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    }
+  }
+}
