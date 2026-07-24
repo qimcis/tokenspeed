@@ -218,7 +218,7 @@ def download_safetensors_index_file_from_hf(
     index_file: str,
     cache_dir: str | None,
     revision: str | None = None,
-) -> None:
+) -> str | None:
     """Download hf safetensors index file from Hugging Face Hub.
 
     Args:
@@ -232,7 +232,7 @@ def download_safetensors_index_file_from_hf(
     with get_lock(model_name_or_path, cache_dir):
         try:
             # Download the safetensors index file.
-            hf_hub_download(
+            return hf_hub_download(
                 repo_id=model_name_or_path,
                 filename=index_file,
                 cache_dir=cache_dir,
@@ -245,6 +245,21 @@ def download_safetensors_index_file_from_hf(
             logger.info("No %s found in remote.", index_file)
         except huggingface_hub.utils.LocalEntryNotFoundError:
             logger.info("No %s found in local cache.", index_file)
+    return None
+
+
+def safetensors_files_for_weight_filter(
+    index_file_name: str,
+    weight_name_filter: Callable[[str], bool],
+) -> set[str]:
+    """Return checkpoint shard names containing at least one matching tensor."""
+    with open(index_file_name) as f:
+        weight_map = json.load(f)["weight_map"]
+    return {
+        weight_file
+        for weight_name, weight_file in weight_map.items()
+        if weight_name_filter(weight_name)
+    }
 
 
 # For models like Mistral-7B-v0.3, there are both sharded
@@ -253,7 +268,10 @@ def download_safetensors_index_file_from_hf(
 # So, we use the index_file to
 # look up which safetensors files should be used.
 def filter_duplicate_safetensors_files(
-    hf_weights_files: list[str], hf_folder: str, index_file: str
+    hf_weights_files: list[str],
+    hf_folder: str,
+    index_file: str,
+    weight_name_filter: Callable[[str], bool] | None = None,
 ) -> list[str]:
     # model.safetensors.index.json is a mapping from keys in the
     # torch state_dict to safetensors file holding that weight.
@@ -263,11 +281,16 @@ def filter_duplicate_safetensors_files(
 
     # Iterate through the weight_map (weight_name: safetensors files)
     # to identify weights that we should use.
-    with open(index_file_name) as f:
-        weight_map = json.load(f)["weight_map"]
-    weight_files_in_index = set()
-    for weight_name in weight_map:
-        weight_files_in_index.add(os.path.join(hf_folder, weight_map[weight_name]))
+    if weight_name_filter is None:
+        with open(index_file_name) as f:
+            selected_files = set(json.load(f)["weight_map"].values())
+    else:
+        selected_files = safetensors_files_for_weight_filter(
+            index_file_name, weight_name_filter
+        )
+    weight_files_in_index = {
+        os.path.join(hf_folder, weight_file) for weight_file in selected_files
+    }
     # Filter out any fields that are not found in the index file.
     hf_weights_files = [f for f in hf_weights_files if f in weight_files_in_index]
     return hf_weights_files

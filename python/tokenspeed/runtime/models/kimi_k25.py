@@ -750,6 +750,11 @@ class KimiK25ForConditionalGeneration(nn.Module):
         self.mapping = mapping
         self.quant_config = quant_config
         self.is_multimodal_active = is_multimodal_active
+        self.checkpoint_weight_name_filter = (
+            self._is_vision_checkpoint_weight
+            if getattr(config, "encoder_only", False)
+            else None
+        )
         if not self.is_multimodal_active:
             self.vision_tower = None
             self.mm_projector = None
@@ -936,10 +941,15 @@ class KimiK25ForConditionalGeneration(nn.Module):
             **kwargs,
         )
 
+    @staticmethod
+    def _is_vision_checkpoint_weight(name: str) -> bool:
+        return "vision_tower" in name or "mm_projector" in name
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         """Load weights for the model, separating vision and language weights"""
         vision_weights = []
         language_weights = []
+        encoder_only = getattr(self.config, "encoder_only", False)
 
         for name, loaded_weight in weights:
             # nvidia/Kimi-K2.5-NVFP4 stores decoder layers under
@@ -956,7 +966,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
                 name = name.replace("mm_projector.proj.0", "mm_projector.linear_1")
                 name = name.replace("mm_projector.proj.2", "mm_projector.linear_2")
                 vision_weights.append((name, loaded_weight))
-            else:
+            elif not encoder_only:
                 name = name.replace("language_model.", "")
                 language_weights.append((name, loaded_weight))
 
@@ -972,7 +982,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
-        if not getattr(self.config, "encoder_only", False) and language_weights:
+        if language_weights:
             self.language_model.load_weights(language_weights)
 
     @classmethod

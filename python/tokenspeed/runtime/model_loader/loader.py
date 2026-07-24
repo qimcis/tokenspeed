@@ -31,7 +31,7 @@ import os
 from abc import ABC, abstractmethod
 from collections.abc import Generator, Iterable, Iterator
 from contextlib import contextmanager
-from typing import Any, cast
+from typing import Any, Callable, cast
 
 import huggingface_hub
 import torch
@@ -57,6 +57,7 @@ from tokenspeed.runtime.model_loader.weight_utils import (
     initialize_dummy_weights,
     np_cache_weights_iterator,
     pt_weights_iterator,
+    safetensors_files_for_weight_filter,
     safetensors_weights_iterator,
 )
 from tokenspeed.runtime.models.extensible import ExtensibleLM
@@ -202,6 +203,9 @@ class DefaultModelLoader(BaseModelLoader):
         fall_back_to_pt: bool = True
         """Whether .pt weights can be used."""
 
+        weight_name_filter: Callable[[str], bool] | None = None
+        """Optional filter over checkpoint names after ``prefix`` is applied."""
+
     def __init__(self, load_config: LoadConfig) -> None:
         super().__init__(load_config)
         if load_config.model_loader_extra_config:
@@ -238,7 +242,11 @@ class DefaultModelLoader(BaseModelLoader):
         return None
 
     def _prepare_weights(
-        self, model_name_or_path: str, revision: str | None, fall_back_to_pt: bool
+        self,
+        model_name_or_path: str,
+        revision: str | None,
+        fall_back_to_pt: bool,
+        weight_name_filter: Callable[[str], bool] | None = None,
     ) -> tuple[str, list[str], bool]:
         """Prepare weights for the model.
 
@@ -272,6 +280,29 @@ class DefaultModelLoader(BaseModelLoader):
         if fall_back_to_pt:
             allow_patterns += ["*.pt"]
 
+        downloaded_index = None
+        if (
+            not is_local
+            and weight_name_filter is not None
+            and "*.safetensors" in allow_patterns
+        ):
+            downloaded_index = download_safetensors_index_file_from_hf(
+                model_name_or_path,
+                index_file,
+                self.load_config.download_dir,
+                revision,
+            )
+            if downloaded_index is not None:
+                selected_files = safetensors_files_for_weight_filter(
+                    downloaded_index, weight_name_filter
+                )
+                if not selected_files:
+                    raise RuntimeError(
+                        f"No checkpoint weights matched the model filter in {index_file}"
+                    )
+                allow_patterns = sorted(selected_files)
+                use_safetensors = True
+
         if not is_local:
             hf_folder = download_weights_from_hf(
                 model_name_or_path,
@@ -289,7 +320,11 @@ class DefaultModelLoader(BaseModelLoader):
             if len(hf_weights_files) > 0:
                 if pattern == "*.safetensors":
                     use_safetensors = True
-                break
+                # Exact shard names selected from an index are cumulative.
+                # Wildcard entries are format alternatives, so the first
+                # matching format retains the legacy fallback behavior.
+                if downloaded_index is None:
+                    break
 
         if use_safetensors:
             # For models like Mistral-7B-Instruct-v0.3
@@ -297,7 +332,7 @@ class DefaultModelLoader(BaseModelLoader):
             # safetensors file. Using both breaks.
             # Here, we download the `model.safetensors.index.json` and filter
             # any files not found in the index.
-            if not is_local:
+            if not is_local and downloaded_index is None:
                 download_safetensors_index_file_from_hf(
                     model_name_or_path,
                     index_file,
@@ -305,7 +340,10 @@ class DefaultModelLoader(BaseModelLoader):
                     revision,
                 )
             hf_weights_files = filter_duplicate_safetensors_files(
-                hf_weights_files, hf_folder, index_file
+                hf_weights_files,
+                hf_folder,
+                index_file,
+                weight_name_filter=weight_name_filter,
             )
         else:
             hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)
@@ -321,8 +359,17 @@ class DefaultModelLoader(BaseModelLoader):
         self, source: "Source"
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
+        raw_weight_name_filter = None
+        if source.weight_name_filter is not None:
+            raw_weight_name_filter = lambda name: source.weight_name_filter(
+                source.prefix + name
+            )
+
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
-            source.model_or_path, source.revision, source.fall_back_to_pt
+            source.model_or_path,
+            source.revision,
+            source.fall_back_to_pt,
+            weight_name_filter=raw_weight_name_filter,
         )
         if self.load_config.load_format == LoadFormat.NPCACHE:
             # Currently np_cache only support *.bin checkpoints
@@ -343,6 +390,13 @@ class DefaultModelLoader(BaseModelLoader):
         else:
             weights_iterator = pt_weights_iterator(hf_weights_files)
 
+        # Also filter tensors for mixed shards, non-safetensors checkpoints,
+        # and safetensors checkpoints without an index.
+        if raw_weight_name_filter is not None:
+            weights_iterator = (
+                item for item in weights_iterator if raw_weight_name_filter(item[0])
+            )
+
         # Apply the prefix.
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
 
@@ -357,6 +411,7 @@ class DefaultModelLoader(BaseModelLoader):
             model_config.revision,
             prefix="",
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", False),
+            weight_name_filter=getattr(model, "checkpoint_weight_name_filter", None),
         )
         yield from self._get_weights_iterator(primary_weights)
 
