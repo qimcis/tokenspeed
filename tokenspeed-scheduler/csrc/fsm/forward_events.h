@@ -45,7 +45,8 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
                                    ReqPoolAllocator* req_pool_allocator, PrefillSource source,
                                    KvCacheCoordinator* coordinator, std::vector<BlockTable> block_tables,
                                    std::int32_t hit_tokens, CacheProgress cache_progress,
-                                   std::vector<BlockTransfer> load_pairs)
+                                   std::vector<BlockTransfer> load_pairs,
+                                   std::vector<KvCacheCoordinator::StoreTransfer> store_load_pairs = {})
         : tokens_this_round_{tokens_this_round},
           reserve_num_tokens_in_next_schedule_event_{reserve_num_tokens_in_next_schedule_event},
           req_pool_allocator_{req_pool_allocator},
@@ -54,11 +55,13 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
           block_tables_{std::move(block_tables)},
           hit_tokens_{hit_tokens},
           cache_progress_{std::move(cache_progress)},
-          load_pairs_{std::move(load_pairs)} {}
+          load_pairs_{std::move(load_pairs)},
+          store_load_pairs_{std::move(store_load_pairs)} {}
 
     std::variant<PrefillDone, Prefilling> operator()(Submitted&& state);
     std::variant<PrefillDone, Prefilling> operator()(Retracted&& state);
     std::vector<BlockTransfer> TakeLoadPairs() { return std::exchange(load_pairs_, {}); }
+    std::vector<KvCacheCoordinator::StoreTransfer> TakeStoreLoadPairs() { return std::exchange(store_load_pairs_, {}); }
     PrefillSource Source() const { return source_; }
 
 private:
@@ -73,6 +76,7 @@ private:
     std::int32_t hit_tokens_{0};
     CacheProgress cache_progress_;
     std::vector<BlockTransfer> load_pairs_;
+    std::vector<KvCacheCoordinator::StoreTransfer> store_load_pairs_;
 };
 
 struct SchedulePrefillEvent : InvalidTransitionHandler<SchedulePrefillEvent> {

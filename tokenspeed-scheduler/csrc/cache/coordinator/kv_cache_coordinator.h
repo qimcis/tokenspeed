@@ -79,14 +79,23 @@ public:
         std::vector<std::vector<CacheKey>> group_keys;
         Tier device;
         Tier host;
+        Tier store;
+    };
+    struct StoreTransfer {
+        std::uint32_t group_id{0};
+        std::string content_hash{};
+        std::int32_t cache_block_offset{0};
+        CacheBlockRef destination;
     };
     struct AdmissionResult {
         std::int32_t device_prefix_tokens{0};
         std::int32_t host_prefix_tokens{0};
+        std::int32_t store_prefix_tokens{0};
         // Longer prefix-closed coverage worth materializing for non-closed groups.
         std::int32_t promotion_boundary_tokens{0};
         std::uint64_t access_epoch{0};
         std::vector<BlockTransfer> load_pairs;
+        std::vector<StoreTransfer> store_load_pairs;
         // Fresh device child pages appended by ordinary Acquire, aligned by
         // group_id. Cache hits and host-loaded destinations are excluded.
         std::vector<std::vector<std::int32_t>> new_page_ids;
@@ -140,6 +149,10 @@ public:
     // Missing keys and an absent Host tier are silently skipped.
     void QueueCachedBlocksForStore(std::span<const std::string> page_hashes);
     std::vector<StoreCandidate> TakePendingStores() { return std::exchange(pending_stores_, {}); }
+    bool IsStoreCached(const CacheKey& key) const;
+    void UpdateStoreIndex(const std::vector<std::string>& page_hashes, const std::vector<bool>& present);
+    void InsertStoreKey(const CacheKey& key);
+    std::int32_t StoreHitTokens(const std::vector<std::string>& page_hashes) const;
     CacheBlockRef AcquireDeviceCachedBlock(const CacheKey& key) const;
     CacheBlockRef AcquireHostBlock(std::uint32_t group_id);
     // Collection/pinning follows host-tier presence, so the slide credit flips count_uncached on this.
@@ -149,6 +162,12 @@ public:
     std::int32_t NumHostCachedBlocks() const;
     std::int32_t NumPinnedHostCachedBlocks() const;
     void CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& key);
+    // Lookup cached block metadata by location, trying Host then Device tier.
+    // Used by TierTransferManager to propagate content hashes to the runtime.
+    std::optional<KvCacheManager::CachedBlockMetadata> CachedBlockMetadataForHost(
+        CacheBlockLocation location, std::uint32_t group_id) const;
+    std::optional<KvCacheManager::CachedBlockMetadata> CachedBlockMetadataForDevice(
+        CacheBlockLocation location, std::uint32_t group_id) const;
 
     // Reports real device-cache entry insertions and removals. The scheduler
     // folds the per-group mutations into one externally visible prefix event.
@@ -160,6 +179,8 @@ private:
     struct AcquiredPrefix {
         CoordinatorMatch device;
         CoordinatorMatch host;
+        std::int32_t store_prefix_tokens{0};
+        std::vector<StoreTransfer> store_transfers;
     };
 
     std::vector<CacheKey> keysForGroup(std::span<const std::string> content_hashes, std::uint32_t group_id) const;
@@ -194,6 +215,7 @@ private:
     std::int32_t cache_block_tokens_{0};
     std::uint64_t next_access_epoch_{0};
     std::vector<StoreCandidate> pending_stores_;
+    std::unordered_set<CacheKey, CacheKeyHash> store_index_;
     CacheMutationSink cache_mutation_sink_;
 };
 

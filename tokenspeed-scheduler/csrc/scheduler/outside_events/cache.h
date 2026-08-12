@@ -33,7 +33,11 @@ struct LoadBackDone {
     std::uint32_t op_id{0};
 };
 
+struct StoreLoadDone {
+    std::uint32_t op_id{0};
+};
+
 };  // namespace cache
 
-using CacheEvent = std::variant<cache::WriteBackDone, cache::LoadBackDone>;
+using CacheEvent = std::variant<cache::WriteBackDone, cache::LoadBackDone, cache::StoreLoadDone>;
 }  // namespace tokenspeed

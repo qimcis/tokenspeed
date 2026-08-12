@@ -291,6 +291,47 @@ KvCacheCoordinator::PrefixProbe KvCacheCoordinator::ProbePrefix(std::span<const 
         out.host = probeTierWithKeys<CacheTier::kHost>(out.group_keys, match_order_, num_cache_blocks,
                                                        /*floor_tokens=*/out.device.num_common_tokens);
     }
+    const std::int32_t floor_tokens = std::max(out.device.num_common_tokens, out.host.num_common_tokens);
+    out.store.per_group.resize(groups_.size());
+    if (!store_index_.empty() && num_cache_blocks > 0) {
+        std::int32_t hit_pages = 0;
+        for (std::int32_t page = floor_tokens / cache_block_tokens_; page < num_cache_blocks; ++page) {
+            bool page_hit = true;
+            for (std::size_t gi = 0; gi < groups_.size(); ++gi) {
+                const std::int32_t g_tokens = groups_[gi].Manager().CacheBlockTokens();
+                const std::int32_t blocks_per_hash = cache_block_tokens_ / g_tokens;
+                for (std::int32_t off = 0; off < blocks_per_hash; ++off) {
+                    const std::size_t key_idx = static_cast<std::size_t>(page * blocks_per_hash + off);
+                    if (key_idx >= out.group_keys[gi].size() || !store_index_.contains(out.group_keys[gi][key_idx])) {
+                        page_hit = false;
+                        break;
+                    }
+                }
+                if (!page_hit) break;
+            }
+            if (!page_hit) break;
+            ++hit_pages;
+        }
+        out.store.num_common_tokens = floor_tokens + hit_pages * cache_block_tokens_;
+        for (std::size_t gi = 0; gi < groups_.size(); ++gi) {
+            const std::int32_t g_tokens = groups_[gi].Manager().CacheBlockTokens();
+            const std::int32_t blocks_per_hash = cache_block_tokens_ / g_tokens;
+            const std::int32_t total_blocks = num_cache_blocks * blocks_per_hash;
+            out.store.per_group[gi].hits.assign(static_cast<std::size_t>(total_blocks), 0);
+            for (std::int32_t page = floor_tokens / cache_block_tokens_; page < floor_tokens / cache_block_tokens_ + hit_pages; ++page) {
+                for (std::int32_t off = 0; off < blocks_per_hash; ++off) {
+                    out.store.per_group[gi].hits[static_cast<std::size_t>(page * blocks_per_hash + off)] = 1;
+                }
+            }
+        }
+    } else {
+        out.store.num_common_tokens = floor_tokens;
+        for (std::size_t gi = 0; gi < groups_.size(); ++gi) {
+            const std::int32_t g_tokens = groups_[gi].Manager().CacheBlockTokens();
+            const std::int32_t blocks_per_hash = cache_block_tokens_ / g_tokens;
+            out.store.per_group[gi].hits.assign(static_cast<std::size_t>(num_cache_blocks * blocks_per_hash), 0);
+        }
+    }
     return out;
 }
 
@@ -339,6 +380,7 @@ KvCacheCoordinator::AcquiredPrefix KvCacheCoordinator::acquirePrefix(PrefixProbe
         out.host = acquireTierWithKeys<CacheTier::kHost>(probe.group_keys, out.device.num_common_tokens,
                                                          std::move(probe.host), access_epoch);
     }
+    out.store_prefix_tokens = probe.store.num_common_tokens;
     return out;
 }
 
@@ -430,6 +472,50 @@ void KvCacheCoordinator::QueueCachedBlocksForStore(std::span<const std::string> 
             }
         }
     }
+}
+
+bool KvCacheCoordinator::IsStoreCached(const CacheKey& key) const {
+    return store_index_.contains(key);
+}
+
+void KvCacheCoordinator::UpdateStoreIndex(const std::vector<std::string>& page_hashes,
+                                          const std::vector<bool>& present) {
+    _assert(page_hashes.size() == present.size(), "store index update size mismatch");
+    for (std::size_t i = 0; i < page_hashes.size(); ++i) {
+        for (const CacheGroup& group : groups_) {
+            for (const CacheKey& key : keysForGroup(std::span<const std::string>(&page_hashes[i], 1), group.Id())) {
+                if (present[i]) {
+                    store_index_.insert(key);
+                } else {
+                    store_index_.erase(key);
+                }
+            }
+        }
+    }
+}
+
+void KvCacheCoordinator::InsertStoreKey(const CacheKey& key) {
+    store_index_.insert(key);
+}
+
+std::int32_t KvCacheCoordinator::StoreHitTokens(const std::vector<std::string>& page_hashes) const {
+    if (store_index_.empty() || page_hashes.empty()) return 0;
+    std::int32_t hit_pages = 0;
+    for (std::size_t i = 0; i < page_hashes.size(); ++i) {
+        bool page_hit = true;
+        for (const CacheGroup& group : groups_) {
+            for (const CacheKey& key : keysForGroup(std::span<const std::string>(&page_hashes[i], 1), group.Id())) {
+                if (!store_index_.contains(key)) {
+                    page_hit = false;
+                    break;
+                }
+            }
+            if (!page_hit) break;
+        }
+        if (!page_hit) break;
+        ++hit_pages;
+    }
+    return hit_pages * cache_block_tokens_;
 }
 
 void KvCacheCoordinator::CacheCompletedBlocks(std::span<BlockTable> tables, std::span<const std::string> page_hashes,
@@ -672,6 +758,22 @@ void KvCacheCoordinator::CacheHostBlock(CacheBlockRef& block_ref, const CacheKey
     _assert(host_pool_ != nullptr, "CacheHostBlock requires a host pool");
     _assert(key.group_id < groups_.size(), "CacheHostBlock group id out of range");
     groups_[key.group_id].Manager().RegisterCachedBlock(*host_pool_, block_ref, key, ++next_access_epoch_);
+}
+
+std::optional<KvCacheManager::CachedBlockMetadata> KvCacheCoordinator::CachedBlockMetadataForHost(
+    CacheBlockLocation location, std::uint32_t group_id) const {
+    if (host_pool_ == nullptr || group_id >= groups_.size()) {
+        return std::nullopt;
+    }
+    return groups_[group_id].Manager().CachedBlockMetadataFor(*host_pool_, location);
+}
+
+std::optional<KvCacheManager::CachedBlockMetadata> KvCacheCoordinator::CachedBlockMetadataForDevice(
+    CacheBlockLocation location, std::uint32_t group_id) const {
+    if (group_id >= groups_.size()) {
+        return std::nullopt;
+    }
+    return groups_[group_id].Manager().CachedBlockMetadataFor(pool_, location);
 }
 
 KvCacheCoordinator MakeCoordinator(std::span<const KvCacheSpec> specs, std::int32_t cache_block_tokens, BlockPool& pool,

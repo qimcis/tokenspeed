@@ -22,6 +22,8 @@
 
 // Scheduler-to-runtime wire types for transfers between cache tiers.
 
+#include <string>
+
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -36,6 +38,8 @@ struct CacheTransfer {
     std::uint32_t group_id{0};
     std::int32_t source_page{-1};
     std::int32_t destination_page{-1};
+    std::string content_hash{};  // page content hash (SHA-256 hex, 64 chars); empty if unavailable
+    std::int32_t cache_block_offset{0};  // offset within P-token page (for fused groups)
 
     bool operator==(const CacheTransfer&) const = default;
 };
@@ -49,6 +53,9 @@ struct CacheTransferHash {
         };
         combine(transfer.source_page);
         combine(transfer.destination_page);
+        const std::size_t ch = std::hash<std::string>{}(transfer.content_hash);
+        seed ^= ch + 0x9e3779b9U + (seed << 6U) + (seed >> 2U);
+        combine(transfer.cache_block_offset);
         return seed;
     }
 };
@@ -63,6 +70,8 @@ struct WriteBackBatch {
     std::vector<std::vector<std::uint32_t>> group_ids;
     std::vector<std::vector<std::int32_t>> src_pages;
     std::vector<std::vector<std::int32_t>> dst_pages;
+    std::vector<std::vector<std::string>> content_hashes;
+    std::vector<std::vector<std::int32_t>> cache_block_offsets;
 
     explicit WriteBackBatch(const std::vector<WriteBackOperation>& ops) {
         std::unordered_set<CacheTransfer, CacheTransferHash> seen;
@@ -70,11 +79,15 @@ struct WriteBackBatch {
             std::vector<std::uint32_t> operation_groups;
             std::vector<std::int32_t> operation_sources;
             std::vector<std::int32_t> operation_destinations;
+            std::vector<std::string> operation_hashes;
+            std::vector<std::int32_t> operation_offsets;
             for (const auto& transfer : op.transfers) {
                 if (seen.insert(transfer).second) {
                     operation_groups.push_back(transfer.group_id);
                     operation_sources.push_back(transfer.source_page);
                     operation_destinations.push_back(transfer.destination_page);
+                    operation_hashes.push_back(transfer.content_hash);
+                    operation_offsets.push_back(transfer.cache_block_offset);
                 }
             }
 
@@ -82,6 +95,8 @@ struct WriteBackBatch {
             group_ids.push_back(std::move(operation_groups));
             src_pages.push_back(std::move(operation_sources));
             dst_pages.push_back(std::move(operation_destinations));
+            content_hashes.push_back(std::move(operation_hashes));
+            cache_block_offsets.push_back(std::move(operation_offsets));
         }
     }
 };
@@ -91,11 +106,53 @@ struct LoadBackOperation {
     std::vector<CacheTransfer> transfers;  // HOST→DEVICE.
 };
 
+struct StoreLoadOperation {
+    std::uint32_t op_id{0};
+    std::vector<CacheTransfer> transfers;  // STORE→DEVICE (source_page=-1, content_hash set).
+};
+
+struct StoreLoadBatch {
+    std::vector<std::uint32_t> op_ids;
+    std::vector<std::vector<std::uint32_t>> group_ids;
+    std::vector<std::vector<std::int32_t>> src_pages;
+    std::vector<std::vector<std::int32_t>> dst_pages;
+    std::vector<std::vector<std::string>> content_hashes;
+    std::vector<std::vector<std::int32_t>> cache_block_offsets;
+
+    explicit StoreLoadBatch(const std::vector<StoreLoadOperation>& ops) {
+        std::unordered_set<CacheTransfer, CacheTransferHash> seen;
+        for (const auto& op : ops) {
+            std::vector<std::uint32_t> operation_groups;
+            std::vector<std::int32_t> operation_sources;
+            std::vector<std::int32_t> operation_destinations;
+            std::vector<std::string> operation_hashes;
+            std::vector<std::int32_t> operation_offsets;
+            for (const auto& transfer : op.transfers) {
+                if (seen.insert(transfer).second) {
+                    operation_groups.push_back(transfer.group_id);
+                    operation_sources.push_back(transfer.source_page);
+                    operation_destinations.push_back(transfer.destination_page);
+                    operation_hashes.push_back(transfer.content_hash);
+                    operation_offsets.push_back(transfer.cache_block_offset);
+                }
+            }
+            op_ids.push_back(op.op_id);
+            group_ids.push_back(std::move(operation_groups));
+            src_pages.push_back(std::move(operation_sources));
+            dst_pages.push_back(std::move(operation_destinations));
+            content_hashes.push_back(std::move(operation_hashes));
+            cache_block_offsets.push_back(std::move(operation_offsets));
+        }
+    }
+};
+
 struct LoadBackBatch {
     std::vector<std::uint32_t> op_ids;
     std::vector<std::vector<std::uint32_t>> group_ids;
     std::vector<std::vector<std::int32_t>> src_pages;
     std::vector<std::vector<std::int32_t>> dst_pages;
+    std::vector<std::vector<std::string>> content_hashes;
+    std::vector<std::vector<std::int32_t>> cache_block_offsets;
 
     explicit LoadBackBatch(const std::vector<LoadBackOperation>& ops) {
         std::unordered_set<CacheTransfer, CacheTransferHash> seen;
@@ -103,11 +160,15 @@ struct LoadBackBatch {
             std::vector<std::uint32_t> operation_groups;
             std::vector<std::int32_t> operation_sources;
             std::vector<std::int32_t> operation_destinations;
+            std::vector<std::string> operation_hashes;
+            std::vector<std::int32_t> operation_offsets;
             for (const auto& transfer : op.transfers) {
                 if (seen.insert(transfer).second) {
                     operation_groups.push_back(transfer.group_id);
                     operation_sources.push_back(transfer.source_page);
                     operation_destinations.push_back(transfer.destination_page);
+                    operation_hashes.push_back(transfer.content_hash);
+                    operation_offsets.push_back(transfer.cache_block_offset);
                 }
             }
 
@@ -115,10 +176,12 @@ struct LoadBackBatch {
             group_ids.push_back(std::move(operation_groups));
             src_pages.push_back(std::move(operation_sources));
             dst_pages.push_back(std::move(operation_destinations));
+            content_hashes.push_back(std::move(operation_hashes));
+            cache_block_offsets.push_back(std::move(operation_offsets));
         }
     }
 };
 
-using CacheOperation = std::variant<LoadBackBatch, WriteBackBatch>;
+using CacheOperation = std::variant<StoreLoadBatch, LoadBackBatch, WriteBackBatch>;
 
 }  // namespace tokenspeed

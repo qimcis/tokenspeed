@@ -8,6 +8,8 @@
 #include "cache/core/cache_types.h"
 #include "cache/tier/transfer.h"
 #include "cache/tier/transfer_manager.h"
+#include "integration_test_helper.h"
+#include "scheduler/page_hasher.h"
 #include "scheduler/scheduler.h"
 #include "scheduler/types.h"
 
@@ -15,6 +17,7 @@ namespace tokenspeed::test {
 
 static_assert(std::is_aggregate_v<WriteBackOperation>);
 static_assert(std::is_aggregate_v<LoadBackOperation>);
+static_assert(std::is_aggregate_v<StoreLoadOperation>);
 
 TEST(CacheOperationTest, WriteBackDeduplicatesTransfersAcrossBatch) {
     WriteBackOperation op;
@@ -67,6 +70,68 @@ TEST(CacheOperationTest, LoadBackPreservesTransferOrder) {
     EXPECT_EQ(batch.group_ids[0], std::vector<std::uint32_t>({0, 0}));
     EXPECT_EQ(batch.src_pages[0], std::vector<std::int32_t>({10, 30}));
     EXPECT_EQ(batch.dst_pages[0], std::vector<std::int32_t>({20, 40}));
+}
+
+TEST(CacheOperationTest, StoreLoadPreservesRemoteAddressingFields) {
+    StoreLoadOperation op;
+    op.op_id = 11;
+    op.transfers = {
+        CacheTransfer{.group_id = 0,
+                      .source_page = -1,
+                      .destination_page = 20,
+                      .content_hash = "h0",
+                      .cache_block_offset = 0},
+        CacheTransfer{.group_id = 1,
+                      .source_page = -1,
+                      .destination_page = 30,
+                      .content_hash = "h1",
+                      .cache_block_offset = 3},
+    };
+
+    StoreLoadBatch batch({op});
+
+    ASSERT_EQ(batch.op_ids, std::vector<std::uint32_t>({11}));
+    EXPECT_EQ(batch.group_ids[0], (std::vector<std::uint32_t>{0, 1}));
+    EXPECT_EQ(batch.src_pages[0], (std::vector<std::int32_t>{-1, -1}));
+    EXPECT_EQ(batch.dst_pages[0], (std::vector<std::int32_t>{20, 30}));
+    EXPECT_EQ(batch.content_hashes[0], (std::vector<std::string>{"h0", "h1"}));
+    EXPECT_EQ(batch.cache_block_offsets[0], (std::vector<std::int32_t>{0, 3}));
+}
+
+TEST(CacheOperationTest, StoreLoadPinsDestinationAndCountsAsLoadUntilDone) {
+    BlockPool device_pool{1};
+    const std::array specs{KvCacheSpec{
+        .kind = AttnKind::kFull,
+        .cache_blocks_per_lcm_block = 1,
+        .cache_block_tokens = 2,
+    }};
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, /*cache_block_tokens=*/2, device_pool);
+    TierTransferManager transfers{coordinator};
+    CacheBlockRef destination = device_pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
+    ASSERT_TRUE(destination);
+    std::vector<KvCacheCoordinator::StoreTransfer> store_transfers;
+    store_transfers.push_back(KvCacheCoordinator::StoreTransfer{
+        .group_id = 0,
+        .content_hash = "h0",
+        .cache_block_offset = 0,
+        .destination = std::move(destination),
+    });
+
+    const StoreLoadOperation operation = transfers.StartStoreLoad(std::move(store_transfers));
+
+    ASSERT_EQ(operation.transfers.size(), 1u);
+    EXPECT_EQ(operation.transfers[0].source_page, -1);
+    EXPECT_EQ(operation.transfers[0].content_hash, "h0");
+    EXPECT_TRUE(transfers.HasLoadBacksInFlight());
+    EXPECT_TRUE(transfers.HasAnyInFlight());
+    EXPECT_FALSE(device_pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1));
+
+    transfers.CompleteStoreLoad(operation.op_id);
+
+    EXPECT_FALSE(transfers.HasLoadBacksInFlight());
+    EXPECT_FALSE(transfers.HasAnyInFlight());
+    EXPECT_TRUE(device_pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1));
+    EXPECT_NO_THROW(transfers.CompleteStoreLoad(operation.op_id));
 }
 
 TEST(CacheOperationTest, HostCacheAndContinuousStreamingAreSeparatePolicies) {

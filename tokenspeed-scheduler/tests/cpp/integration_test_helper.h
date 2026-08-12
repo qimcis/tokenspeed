@@ -123,6 +123,14 @@ protected:
         scheduler_->Advance(std::move(event));
     }
 
+    void SendStoreLoadDone(std::uint32_t op_id) {
+        ExecutionEvent event;
+        event.With(cache::StoreLoadDone{
+            .op_id = op_id,
+        });
+        scheduler_->Advance(std::move(event));
+    }
+
     // Send ExtendResult (new decode tokens) to the scheduler.
     void SendForwardDone(const std::string& request_id, const std::vector<std::int32_t>& tokens) {
         ExecutionEvent event;

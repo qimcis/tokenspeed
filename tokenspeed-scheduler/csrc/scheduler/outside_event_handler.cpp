@@ -151,4 +151,8 @@ void Scheduler::handleEvent(const cache::LoadBackDone& event) {
     tier_transfers_.CompleteLoadBack(event.op_id);
 }
 
+void Scheduler::handleEvent(const cache::StoreLoadDone& event) {
+    tier_transfers_.CompleteStoreLoad(event.op_id);
+}
+
 }  // namespace tokenspeed

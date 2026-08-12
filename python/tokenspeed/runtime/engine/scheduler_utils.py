@@ -51,6 +51,8 @@ _CACHE_EVENT_TYPES = {
 # still imports this module and fails later with a targeted compatibility error.
 if hasattr(Cache, "LoadBackDoneEvent"):
     _CACHE_EVENT_TYPES["LoadBackDoneEvent"] = Cache.LoadBackDoneEvent
+if hasattr(Cache, "StoreLoadDoneEvent"):
+    _CACHE_EVENT_TYPES["StoreLoadDoneEvent"] = Cache.StoreLoadDoneEvent
 _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 
 # Pool-spec string -> scheduler enum (pool_to_paged_cache_groups).

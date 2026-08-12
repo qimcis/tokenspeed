@@ -135,7 +135,11 @@ private:
                 prefix_.host.per_group.empty()
                     ? 0
                     : static_cast<std::int32_t>(std::ranges::count(prefix_.host.per_group[i].hits, std::uint8_t{1}));
-            blocks_needed_[i] = static_cast<std::int64_t>(device_blocks) + host_blocks;
+            const std::int32_t store_blocks = [&]() -> std::int32_t {
+                if (prefix_.store.per_group.empty()) return 0;
+                return static_cast<std::int32_t>(std::ranges::count(prefix_.store.per_group[i].hits, std::uint8_t{1}));
+            }();
+            blocks_needed_[i] = static_cast<std::int64_t>(device_blocks) + host_blocks + store_blocks;
         }
 
         for (std::int32_t parent_id = 1; parent_id <= pool_.NumLcmBlocks(); ++parent_id) {
@@ -339,10 +343,12 @@ std::optional<KvCacheCoordinator::AdmissionResult> KvCacheCoordinator::Admit(
     }
     const std::uint64_t access_epoch = request_access_epoch.has_value() ? *request_access_epoch : ++next_access_epoch_;
     const std::int32_t promotion_boundary_tokens = PromotionBoundaryTokens(plan.prefix);
+    std::vector<std::vector<CacheKey>> group_keys = plan.prefix.group_keys;
     AcquiredPrefix acquired_prefix = acquirePrefix(std::move(plan.prefix), access_epoch);
     AdmissionResult result{
         .device_prefix_tokens = acquired_prefix.device.num_common_tokens,
         .host_prefix_tokens = acquired_prefix.host.num_common_tokens,
+        .store_prefix_tokens = acquired_prefix.store_prefix_tokens,
         .promotion_boundary_tokens = promotion_boundary_tokens,
         .access_epoch = access_epoch,
         .new_page_ids = std::vector<std::vector<std::int32_t>>(groups_.size()),
@@ -384,11 +390,47 @@ std::optional<KvCacheCoordinator::AdmissionResult> KvCacheCoordinator::Admit(
             groups_[i].Manager().AppendHostExtension(
                 pool_, *demand.table, std::move(acquired_prefix.host.per_group[i].blocks), result.load_pairs);
         }
-        const std::int32_t first_new_block = demand.table->NumBlocks();
+    }
+    const std::int32_t host_tokens = result.host_prefix_tokens > 0 ? result.host_prefix_tokens : result.device_prefix_tokens;
+    const std::int32_t store_extra_tokens = result.store_prefix_tokens - std::max(result.device_prefix_tokens, host_tokens);
+    const std::int32_t store_extra_pages = store_extra_tokens > 0 ? store_extra_tokens / cache_block_tokens_ : 0;
+    const std::int32_t host_pages = std::max(result.device_prefix_tokens, host_tokens) / cache_block_tokens_;
+    if (store_extra_pages > 0) {
+        for (std::size_t gi = 0; gi < groups_.size(); ++gi) {
+            const std::int32_t g_tokens = groups_[gi].Manager().CacheBlockTokens();
+            const std::int32_t blocks_per_hash = cache_block_tokens_ / g_tokens;
+            const std::int32_t num_store_blocks = store_extra_pages * blocks_per_hash;
+            if (num_store_blocks == 0) continue;
+            std::vector<CacheBlockRef> dest_refs = pool_.AcquireBlocks(static_cast<std::uint32_t>(gi),
+                                                                        groups_[gi].Manager().CacheBlocksPerLcmBlock(),
+                                                                        num_store_blocks);
+            FatalCheck(static_cast<std::int32_t>(dest_refs.size()) == num_store_blocks,
+                       "store extension: admission plan no longer fits the block pool");
+            auto dest_it = dest_refs.begin();
+            for (std::int32_t page = host_pages; page < host_pages + store_extra_pages; ++page) {
+                for (std::int32_t off = 0; off < blocks_per_hash; ++off) {
+                    const std::size_t key_idx = static_cast<std::size_t>(page * blocks_per_hash + off);
+                    const CacheKey& key = group_keys[gi][key_idx];
+                    demands[gi].table->blocks_.push_back(std::move(*dest_it));
+                    ++dest_it;
+                    result.store_load_pairs.push_back(StoreTransfer{
+                        .group_id = static_cast<std::uint32_t>(gi),
+                        .content_hash = key.content_hash,
+                        .cache_block_offset = key.cache_block_offset,
+                        .destination = demands[gi].table->blocks_.back(),
+                    });
+                }
+            }
+            _assert(dest_it == dest_refs.end(), "unused store extension destination");
+        }
+    }
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        const GroupDemand& demand = demands[i];
+        const std::int32_t pre_acquire_blocks = demand.table->NumBlocks();
         const bool acquired = groups_[i].Manager().Acquire(pool_, *demand.table, demand);
         FatalCheck(acquired, "admission plan no longer fits the block pool");
         const std::span<const CacheBlockRef> blocks = demand.table->Blocks();
-        for (std::int32_t block = first_new_block; block < demand.table->NumBlocks(); ++block) {
+        for (std::int32_t block = pre_acquire_blocks; block < demand.table->NumBlocks(); ++block) {
             if (!blocks[static_cast<std::size_t>(block)]) {
                 continue;
             }

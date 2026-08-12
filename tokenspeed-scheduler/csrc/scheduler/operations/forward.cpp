@@ -196,12 +196,15 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
         return match;
     }
     match.probe = probe(probe_hashes);
-    const std::int32_t hit_pages =
-        std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens) / cache_block_tokens;
+    const std::int32_t hit_pages = std::max({match.probe.device.num_common_tokens, match.probe.host.num_common_tokens,
+                                             match.probe.store.num_common_tokens}) /
+                                   cache_block_tokens;
     match.page_hashes.assign(hashes.begin(), hashes.begin() + hit_pages);
 
-    const std::int32_t extension_pages =
-        std::max(match.probe.host.num_common_tokens - match.probe.device.num_common_tokens, 0) / cache_block_tokens;
+    const std::int32_t extension_tokens =
+        std::max(match.probe.host.num_common_tokens, match.probe.store.num_common_tokens) -
+        match.probe.device.num_common_tokens;
+    const std::int32_t extension_pages = std::max(extension_tokens, 0) / cache_block_tokens;
     const auto extension_begin = hashes.begin() + match.probe.device.num_common_tokens / cache_block_tokens;
     match.extension_hashes.assign(extension_begin, extension_begin + extension_pages);
     return match;
@@ -255,7 +258,8 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     }
 
     AdmissionMatch match = matchPrefixAtAdmission(request);
-    const std::int32_t hit_tokens = std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
+    const std::int32_t hit_tokens =
+        std::max({match.probe.device.num_common_tokens, match.probe.host.num_common_tokens, match.probe.store.num_common_tokens});
     const std::int32_t promotion_boundary_tokens = coordinator_.PromotionBoundaryTokens(match.probe);
     _assert(promotion_boundary_tokens == 0 ||
                 (promotion_boundary_tokens % coordinator_.CacheBlockTokens() == 0 &&
@@ -321,6 +325,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
             .promotion_boundary_tokens = admission->promotion_boundary_tokens,
         },
         std::move(admission->load_pairs),
+        std::move(admission->store_load_pairs),
     };
 }
 
@@ -404,14 +409,17 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(PlanBuildConte
 }
 
 PrefillOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::SchedulePrefillFirstChunkEvent event,
-                                                        std::vector<LoadBackOperation>& load_back_operations) {
+                                                        std::vector<LoadBackOperation>& load_back_operations,
+                                                        std::vector<StoreLoadOperation>& store_load_operations) {
     PrefillOperation operation = applyPrefillEvent(*request, event, coordinator_, cache_group_ids_);
     std::vector<BlockTransfer> load_pairs = event.TakeLoadPairs();
-    if (load_pairs.empty()) {
-        return operation;
+    if (!load_pairs.empty()) {
+        load_back_operations.push_back(tier_transfers_.StartPrefixLoad(std::move(load_pairs)));
     }
-
-    load_back_operations.push_back(tier_transfers_.StartPrefixLoad(std::move(load_pairs)));
+    auto store_pairs = event.TakeStoreLoadPairs();
+    if (!store_pairs.empty()) {
+        store_load_operations.push_back(tier_transfers_.StartStoreLoad(std::move(store_pairs)));
+    }
     return operation;
 }
 
@@ -508,8 +516,9 @@ void Scheduler::retractForCapacity(PlanBuildContext& context, const std::vector<
                  request_to_retract->TokenSize());
 }
 
-std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Scheduler::buildForwardOperations(
-    ExecutionPlan& plan, std::vector<Request*> candidates, std::vector<WriteBackOperation>& write_back_operations) {
+std::tuple<std::vector<ForwardOperation>, std::vector<LoadBackOperation>, std::vector<StoreLoadOperation>>
+Scheduler::buildForwardOperations(ExecutionPlan& plan, std::vector<Request*> candidates,
+                                  std::vector<WriteBackOperation>& write_back_operations) {
     PlanBuildContext context{plan};
     while (!recovery_queue_.empty()) {
         Request* request = findRequest(recovery_queue_.front());
@@ -570,6 +579,7 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
 
     std::vector<ForwardOperation> operations;
     std::vector<LoadBackOperation> load_back_operations;
+    std::vector<StoreLoadOperation> store_load_operations;
     std::int32_t token_budget = config_.max_scheduled_tokens;
     bool pushed_prefill = false;
     bool pushed_decode = false;
@@ -640,7 +650,7 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
                 break;
             }
             if (auto event = schedulePrefillFirstChunk(context, request, token_budget, config_.decode_input_tokens)) {
-                push_operation(applyEventAndBuildOperation(request, std::move(*event), load_back_operations));
+                push_operation(applyEventAndBuildOperation(request, std::move(*event), load_back_operations, store_load_operations));
                 trackPendingForwardResult(request);
                 if (config_.role == Role::kD || request->Is<fsm::Prefilling>()) {
                     // Keep a Decode-side recovery batch local-only.
@@ -658,7 +668,7 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
             const std::int32_t decode_input_tokens = config_.role == Role::kP ? 0 : config_.decode_input_tokens;
             const std::int32_t prefill_budget = config_.role == Role::kD ? request->PrefillSize() : token_budget;
             if (auto event = schedulePrefillFirstChunk(context, request, prefill_budget, decode_input_tokens)) {
-                push_operation(applyEventAndBuildOperation(request, std::move(*event), load_back_operations));
+                push_operation(applyEventAndBuildOperation(request, std::move(*event), load_back_operations, store_load_operations));
                 if (config_.enable_pd_cache) {
                     pd_transfer_pins_.insert(request->Id());
                 }
@@ -687,7 +697,7 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
     if (operations.empty() && context.admission_failed) {
         retractForCapacity(context, candidates, write_back_operations);
     }
-    return {std::move(operations), std::move(load_back_operations)};
+    return {std::move(operations), std::move(load_back_operations), std::move(store_load_operations)};
 }
 
 }  // namespace tokenspeed

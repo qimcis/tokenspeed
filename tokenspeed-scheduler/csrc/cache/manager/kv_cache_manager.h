@@ -49,6 +49,7 @@ public:
         std::int32_t logical_block_index{-1};
         CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
         bool was_acquired{false};
+        CacheKey key{};
     };
 
     explicit KvCacheManager(std::int32_t cache_block_tokens, std::int32_t cache_blocks_per_lcm_block = 1,
@@ -328,6 +329,7 @@ public:
             .logical_block_index = entry_it->logical_block_index,
             .boundary_kind = entry_it->boundary_kind,
             .was_acquired = entry_it->was_acquired,
+            .key = entry_it->key,
         };
     }
     std::int32_t NumCachedBlocks(const BlockPool& pool) const {

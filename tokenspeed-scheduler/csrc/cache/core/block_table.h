@@ -52,6 +52,7 @@ public:
 
 private:
     friend class KvCacheManager;
+    friend class KvCacheCoordinator;
 
     std::vector<CacheBlockRef> blocks_{};
     // Unconsumed capacity at the logical tail. This may span multiple blocks

@@ -60,6 +60,8 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores() {
             .group_id = candidate.key.group_id,
             .source_page = manager.ResolveKernelPageId(device_block_ref->Location()),
             .destination_page = manager.ResolveKernelPageId(host_block_ref->Location()),
+            .content_hash = candidate.key.content_hash,
+            .cache_block_offset = candidate.key.cache_block_offset,
         });
         tickets.push_back(StoreTicket{
             std::move(candidate.key),
@@ -118,6 +120,30 @@ void TierTransferManager::CompleteLoadBack(std::uint32_t op_id) {
     load_backs_.erase(op_id);
 }
 
+StoreLoadOperation TierTransferManager::StartStoreLoad(std::vector<KvCacheCoordinator::StoreTransfer> store_transfers) {
+    _assert(!store_transfers.empty(), "store load requires at least one transfer");
+    std::vector<CacheTransfer> transfers;
+    transfers.reserve(store_transfers.size());
+    for (const auto& st : store_transfers) {
+        const KvCacheManager& manager = coordinator_.GroupManager(static_cast<std::int32_t>(st.group_id));
+        transfers.push_back(CacheTransfer{
+            .group_id = st.group_id,
+            .source_page = -1,
+            .destination_page = manager.ResolveKernelPageId(st.destination->Location()),
+            .content_hash = st.content_hash,
+            .cache_block_offset = st.cache_block_offset,
+        });
+    }
+    const std::uint32_t op_id = nextOpId();
+    const bool inserted = store_loads_.emplace(op_id, std::move(store_transfers)).second;
+    _assert(inserted, "duplicate store-load op id");
+    return StoreLoadOperation{op_id, std::move(transfers)};
+}
+
+void TierTransferManager::CompleteStoreLoad(std::uint32_t op_id) {
+    store_loads_.erase(op_id);
+}
+
 std::vector<CacheTransfer> TierTransferManager::resolveTransfers(std::span<const BlockTransfer> block_transfers) const {
     std::vector<CacheTransfer> transfers;
     transfers.reserve(block_transfers.size());
@@ -125,10 +151,25 @@ std::vector<CacheTransfer> TierTransferManager::resolveTransfers(std::span<const
         _assert(block_transfer.source && block_transfer.destination,
                 "cache transfer requires pinned source and destination blocks");
         const KvCacheManager& manager = coordinator_.GroupManager(static_cast<std::int32_t>(block_transfer.group_id));
+        std::string content_hash;
+        std::int32_t cache_block_offset = 0;
+        if (enable_l3_storage_ && block_transfer.source) {
+            if (auto meta = coordinator_.CachedBlockMetadataForHost(block_transfer.source->Location(),
+                                                                    block_transfer.group_id)) {
+                content_hash = meta->key.content_hash;
+                cache_block_offset = meta->key.cache_block_offset;
+            } else if (auto dmeta = coordinator_.CachedBlockMetadataForDevice(block_transfer.source->Location(),
+                                                                               block_transfer.group_id)) {
+                content_hash = dmeta->key.content_hash;
+                cache_block_offset = dmeta->key.cache_block_offset;
+            }
+        }
         transfers.push_back(CacheTransfer{
             .group_id = block_transfer.group_id,
             .source_page = manager.ResolveKernelPageId(block_transfer.source->Location()),
             .destination_page = manager.ResolveKernelPageId(block_transfer.destination->Location()),
+            .content_hash = std::move(content_hash),
+            .cache_block_offset = cache_block_offset,
         });
     }
     return transfers;

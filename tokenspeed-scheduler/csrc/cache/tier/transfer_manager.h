@@ -39,15 +39,19 @@ class TierTransferManager {
 public:
     explicit TierTransferManager(KvCacheCoordinator& coordinator) : coordinator_{coordinator} {}
 
+    void SetEnableL3(bool enable) { enable_l3_storage_ = enable; }
+
     std::optional<WriteBackOperation> StartPendingStores();
     LoadBackOperation StartPrefixLoad(std::vector<BlockTransfer> block_transfers);
+    StoreLoadOperation StartStoreLoad(std::vector<KvCacheCoordinator::StoreTransfer> store_transfers);
 
     void CompleteWriteBack(std::uint32_t op_id);
     void CompleteLoadBack(std::uint32_t op_id);
+    void CompleteStoreLoad(std::uint32_t op_id);
 
     bool HasStoresInFlight() const { return !write_backs_.empty(); }
-    bool HasLoadBacksInFlight() const { return !load_backs_.empty(); }
-    bool HasAnyInFlight() const { return !write_backs_.empty() || !load_backs_.empty(); }
+    bool HasLoadBacksInFlight() const { return !load_backs_.empty() || !store_loads_.empty(); }
+    bool HasAnyInFlight() const { return !write_backs_.empty() || !load_backs_.empty() || !store_loads_.empty(); }
     std::vector<std::pair<std::uint32_t, CacheBlockLocation>> DeviceLocationsReleasedOnStoreAck() const;
 
 private:
@@ -62,10 +66,12 @@ private:
     std::vector<CacheTransfer> resolveTransfers(std::span<const BlockTransfer> block_transfers) const;
 
     KvCacheCoordinator& coordinator_;
+    bool enable_l3_storage_{false};
     std::unordered_map<std::uint32_t, std::vector<StoreTicket>> write_backs_;
     std::unordered_set<CacheKey, CacheKeyHash> store_keys_;
     // Each transfer pins both tiers until the runtime acknowledges the copy.
     std::unordered_map<std::uint32_t, std::vector<BlockTransfer>> load_backs_;
+    std::unordered_map<std::uint32_t, std::vector<KvCacheCoordinator::StoreTransfer>> store_loads_;
     std::uint32_t next_op_id_{0};
 };
 

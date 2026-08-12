@@ -76,6 +76,12 @@ public:
 
     std::int32_t PagedCacheGroupTotalPages(const std::string& group_id) const;
     std::int32_t PagedCacheGroupAvailablePages(const std::string& group_id) const;
+    void UpdateStoreIndex(const std::vector<std::string>& page_hashes, const std::vector<bool>& present) {
+        coordinator_.UpdateStoreIndex(page_hashes, present);
+    }
+    std::int32_t StoreHitTokens(const std::vector<std::string>& page_hashes) const {
+        return coordinator_.StoreHitTokens(page_hashes);
+    }
 
     bool PdTransferPinned(const std::string& request_id) const { return pd_transfer_pins_.contains(request_id); }
     std::int32_t PoolFreeBlocks() const { return coordinator_.NumAvailableLcmBlocks(); }
@@ -105,8 +111,9 @@ private:
         std::optional<std::string> capacity_blocker;
     };
 
-    std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> buildForwardOperations(
-        ExecutionPlan& plan, std::vector<Request*> candidates, std::vector<WriteBackOperation>& write_back_operations);
+    std::tuple<std::vector<ForwardOperation>, std::vector<LoadBackOperation>, std::vector<StoreLoadOperation>>
+    buildForwardOperations(ExecutionPlan& plan, std::vector<Request*> candidates,
+                           std::vector<WriteBackOperation>& write_back_operations);
     std::optional<fsm::SchedulePrefillFirstChunkEvent> schedulePrefillFirstChunk(PlanBuildContext& context,
                                                                                  Request* request,
                                                                                  std::int32_t remaining,
@@ -117,7 +124,8 @@ private:
     std::optional<fsm::ScheduleDecodeEvent> scheduleDecode(PlanBuildContext& context, Request* request);
 
     PrefillOperation applyEventAndBuildOperation(Request* request, fsm::SchedulePrefillFirstChunkEvent event,
-                                                 std::vector<LoadBackOperation>& load_back_operations);
+                                                 std::vector<LoadBackOperation>& load_back_operations,
+                                                 std::vector<StoreLoadOperation>& store_load_operations);
     PrefillOperation applyEventAndBuildOperation(Request* request, fsm::SchedulePrefillEvent event);
     DecodeOperation applyEventAndBuildOperation(Request* request, fsm::ScheduleDecodeEvent event);
 
@@ -144,6 +152,7 @@ private:
 
     void handleEvent(const cache::WriteBackDone& event);
     void handleEvent(const cache::LoadBackDone& event);
+    void handleEvent(const cache::StoreLoadDone& event);
     void handleEvent(const pd::BootstrappedEvent& event);
     void handleEvent(const pd::FailedEvent& event);
     void handleEvent(const pd::SucceededEvent& event);

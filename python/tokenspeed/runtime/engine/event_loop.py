@@ -25,6 +25,8 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 
+from types import SimpleNamespace
+
 import psutil
 import setproctitle
 import torch
@@ -352,11 +354,6 @@ class EventLoop:
             self._dp_local_info = torch.zeros(1, 3, dtype=torch.int32)
             self._dp_global_info = torch.zeros(mapping.world_size, 3, dtype=torch.int32)
         if server_args.enable_kvstore:
-            if server_args.kvstore_storage_backend is not None:
-                raise NotImplementedError(
-                    "the cache-group scheduler has no L3 storage tier; unset "
-                    "--kvstore-storage-backend"
-                )
             self.l2_cache_executor = L2CacheExecutor(
                 device_pool=token_to_kv_pool,
                 draft_pool=draft_token_to_kv_pool,
@@ -368,6 +365,67 @@ class EventLoop:
         else:
             self.l2_cache_executor = None
             num_host_pages = 0
+
+        self.l3_cache_executor = None
+        if server_args.kvstore_storage_backend is not None:
+            if not server_args.enable_kvstore:
+                raise ValueError(
+                    "--kvstore-storage-backend requires --enable-kvstore "
+                    "(L3 is a spill tier on top of L2)"
+                )
+            from tokenspeed.runtime.cache.l3.executor import L3CacheExecutor
+            from tokenspeed.runtime.cache.store.base import create_kv_store
+
+            kv_store = None
+            try:
+                kv_store = create_kv_store(
+                    server_args.kvstore_storage_backend,
+                    server_args.kvstore_storage_backend_extra_config,
+                )
+            except Exception as exc:
+                logger.warning("L3 Store init failed — running without L3: %s", exc)
+                kv_store = None
+            if kv_store is not None:
+                try:
+                    # Namespace isolates KV bytes across models/revisions/layouts sharing a Store.
+                    # Explicit extra_backend_tag wins; otherwise derive from model + layout fingerprint.
+                    explicit_ns = getattr(kv_store, "extra_backend_tag", None)
+                    if isinstance(explicit_ns, str) and explicit_ns.strip():
+                        store_namespace = explicit_ns.strip()
+                        model_id_for_ns = None
+                        model_rev_for_ns = None
+                        abi_for_ns = None
+                    else:
+                        model_id_for_ns = getattr(self.model_config, "model_path", None) or server_args.model
+                        model_rev_for_ns = getattr(self.model_config, "revision", None) or getattr(server_args, "revision", None)
+                        abi_for_ns = None
+                        try:
+                            from tokenspeed.runtime.cache.l3.executor import _fingerprint_cache_layout
+
+                            abi_for_ns = _fingerprint_cache_layout(token_to_kv_pool.cache_transfer_layout())
+                        except Exception:
+                            abi_for_ns = None
+                        store_namespace = None
+                    self.l3_cache_executor = L3CacheExecutor(
+                        store=kv_store,
+                        device_pool=token_to_kv_pool,
+                        draft_pool=draft_token_to_kv_pool,
+                        l2_executor=self.l2_cache_executor,
+                        io_backend=server_args.kvstore_io_backend,
+                        tp_rank=self.attn_tp_rank if self.attn_tp_size > 1 else None,
+                        tp_size=self.attn_tp_size if self.attn_tp_size > 1 else None,
+                        model_id=model_id_for_ns,
+                        model_revision=model_rev_for_ns,
+                        cache_abi_fingerprint=abi_for_ns,
+                        store_namespace=store_namespace,
+                    )
+                except Exception as exc:
+                    logger.warning("L3 executor init failed — running without L3: %s", exc)
+                    try:
+                        kv_store.close()
+                    except Exception:
+                        pass
+                    self.l3_cache_executor = None
 
         self._kv_events_enabled = (
             EventPublisherFactory.is_enabled(server_args.kv_events_config)
@@ -417,7 +475,7 @@ class EventLoop:
             page_size=geometry.page_size,
             num_host_pages=num_host_pages,
             disable_l2_cache=not server_args.enable_kvstore,
-            enable_l3_storage=server_args.kvstore_storage_backend is not None,
+            enable_l3_storage=self.l3_cache_executor is not None,
             role=server_args.disaggregation_mode,
             enable_kv_cache_events=self._kv_events_enabled,
             decode_input_tokens=decode_input_tokens,
@@ -736,9 +794,16 @@ class EventLoop:
             time.sleep(0.0005)
 
     def _commit_cache_results(self) -> None:
-        if self.l2_cache_executor is None:
+        if self.l2_cache_executor is None and self.l3_cache_executor is None:
             return
-        cache_results = self.l2_cache_executor.poll_results()
+        cache_results: list = []
+        if self.l2_cache_executor is not None:
+            cache_results.extend(self.l2_cache_executor.poll_results())
+        if self.l3_cache_executor is not None:
+            try:
+                cache_results.extend(self.l3_cache_executor.poll_results())
+            except Exception as exc:
+                logger.debug("L3 poll failed: %s", exc)
         self._num_inflight_cache_ops -= len(cache_results)
         for event in cache_results:
             payload = cache_event_to_payload(event)
@@ -995,13 +1060,39 @@ class EventLoop:
         )
 
     def _submit_cache_ops(self, execution_plan) -> None:
-        if self.l2_cache_executor is None:
+        if self.l2_cache_executor is None and self.l3_cache_executor is None:
             return
-        self.l2_cache_executor.submit_plan(execution_plan)
+        # L2 only understands WriteBack/LoadBack; StoreLoad must not be routed there.
+        if self.l2_cache_executor is not None:
+            l2_plan = SimpleNamespace(
+                cache=[op for op in execution_plan.cache if isinstance(op, (Cache.WriteBackOp, Cache.LoadBackOp))]
+            )
+            if l2_plan.cache:
+                self.l2_cache_executor.submit_plan(l2_plan)
+        if self.l3_cache_executor is not None:
+            l3_plan = SimpleNamespace(
+                cache=[op for op in execution_plan.cache if isinstance(op, (Cache.WriteBackOp, Cache.StoreLoadOp))]
+            )
+            if l3_plan.cache:
+                self.l3_cache_executor.submit_plan(l3_plan)
+            # Publish successful Store puts to the scheduler's store index.
+            # L3 writes are synchronous; only fully-succeeded base hashes are reported.
+            try:
+                ready_hashes = self.l3_cache_executor.take_store_index_updates()
+            except Exception as exc:
+                logger.debug("L3 take_store_index_updates failed: %s", exc)
+                ready_hashes = []
+            if ready_hashes:
+                try:
+                    self.scheduler.update_store_index(ready_hashes, [True] * len(ready_hashes))
+                except Exception as exc:
+                    logger.debug("update_store_index failed for %s hashes: %s", len(ready_hashes), exc)
         for op in execution_plan.cache:
             if isinstance(op, Cache.WriteBackOp):
                 self._num_inflight_cache_ops += len(op.op_ids)
             elif isinstance(op, Cache.LoadBackOp):
+                self._num_inflight_cache_ops += len(op.op_ids)
+            elif isinstance(op, Cache.StoreLoadOp):
                 self._num_inflight_cache_ops += len(op.op_ids)
             else:
                 raise ValueError(f"unsupported cache op kind: {type(op).__name__}")
@@ -1860,7 +1951,17 @@ class EventLoop:
             send_engine_dead()
         close_transfer = getattr(self.kv_transfer, "close", None)
         if callable(close_transfer):
-            close_transfer()
+            try:
+                close_transfer()
+            except Exception:
+                pass
+        for executor in (self.l2_cache_executor, self.l3_cache_executor):
+            shutdown = getattr(executor, "shutdown", None)
+            if callable(shutdown):
+                try:
+                    shutdown()
+                except Exception:
+                    pass
 
 
 def run_event_loop(

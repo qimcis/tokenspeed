@@ -200,6 +200,10 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def(nb::init<>())
         .def_rw("op_id", &tokenspeed::cache::LoadBackDone::op_id);
 
+    nb::class_<tokenspeed::cache::StoreLoadDone>(cache, "StoreLoadDoneEvent")
+        .def(nb::init<>())
+        .def_rw("op_id", &tokenspeed::cache::StoreLoadDone::op_id);
+
     nb::class_<tokenspeed::pd::BootstrappedEvent>(pd, "BootstrappedEvent")
         .def(nb::init<std::string>(), nb::arg("request_id"))
         .def_ro("request_id", &tokenspeed::pd::BootstrappedEvent::request_id);
@@ -267,13 +271,25 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("op_ids", &tokenspeed::LoadBackBatch::op_ids)
         .def_ro("group_ids", &tokenspeed::LoadBackBatch::group_ids)
         .def_ro("src_pages", &tokenspeed::LoadBackBatch::src_pages)
-        .def_ro("dst_pages", &tokenspeed::LoadBackBatch::dst_pages);
+        .def_ro("dst_pages", &tokenspeed::LoadBackBatch::dst_pages)
+        .def_ro("content_hashes", &tokenspeed::LoadBackBatch::content_hashes)
+        .def_ro("cache_block_offsets", &tokenspeed::LoadBackBatch::cache_block_offsets);
+
+    nb::class_<tokenspeed::StoreLoadBatch>(cache, "StoreLoadOp")
+        .def_ro("op_ids", &tokenspeed::StoreLoadBatch::op_ids)
+        .def_ro("group_ids", &tokenspeed::StoreLoadBatch::group_ids)
+        .def_ro("src_pages", &tokenspeed::StoreLoadBatch::src_pages)
+        .def_ro("dst_pages", &tokenspeed::StoreLoadBatch::dst_pages)
+        .def_ro("content_hashes", &tokenspeed::StoreLoadBatch::content_hashes)
+        .def_ro("cache_block_offsets", &tokenspeed::StoreLoadBatch::cache_block_offsets);
 
     nb::class_<tokenspeed::WriteBackBatch>(cache, "WriteBackOp")
         .def_ro("op_ids", &tokenspeed::WriteBackBatch::op_ids)
         .def_ro("group_ids", &tokenspeed::WriteBackBatch::group_ids)
         .def_ro("src_pages", &tokenspeed::WriteBackBatch::src_pages)
-        .def_ro("dst_pages", &tokenspeed::WriteBackBatch::dst_pages);
+        .def_ro("dst_pages", &tokenspeed::WriteBackBatch::dst_pages)
+        .def_ro("content_hashes", &tokenspeed::WriteBackBatch::content_hashes)
+        .def_ro("cache_block_offsets", &tokenspeed::WriteBackBatch::cache_block_offsets);
 
     auto collect_forward = [](const tokenspeed::ExecutionPlan& plan) -> nb::list {
         nb::list result;
@@ -326,6 +342,16 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("max_single_request_tokens", &tokenspeed::Scheduler::MaxSingleRequestTokens)
         .def("clear_l1_cache", &tokenspeed::Scheduler::ClearL1Cache)
         .def("clear_cache", &tokenspeed::Scheduler::ClearCache)
+        .def("update_store_index",
+             [](tokenspeed::Scheduler& s, std::vector<std::string> hashes, std::vector<bool> present) {
+                 s.UpdateStoreIndex(hashes, present);
+             },
+             nb::arg("page_hashes"), nb::arg("present"))
+        .def("store_hit_tokens",
+             [](tokenspeed::Scheduler& s, std::vector<std::string> hashes) {
+                 return s.StoreHitTokens(hashes);
+             },
+             nb::arg("page_hashes"))
         .def("paged_cache_group_total_pages", &tokenspeed::Scheduler::PagedCacheGroupTotalPages, nb::arg("group_id"))
         .def("paged_cache_group_available_pages", &tokenspeed::Scheduler::PagedCacheGroupAvailablePages,
              nb::arg("group_id"));

@@ -98,9 +98,7 @@ Scheduler::Scheduler(SchedulerConfig config)
     if (config_.prefix_replay_tokens < 0) {
         throw std::invalid_argument("Scheduler: prefix_replay_tokens must be >= 0");
     }
-    if (config_.enable_l3_storage) {
-        throw std::invalid_argument("Scheduler: L3 storage is not supported by the cache coordinator");
-    }
+    tier_transfers_.SetEnableL3(config_.enable_l3_storage);
     if (coordinator_.HasMambaStateGroup() && config_.max_scheduled_tokens < coordinator_.CacheBlockTokens()) {
         throw std::invalid_argument("Scheduler: Mamba max_scheduled_tokens must cover one cache block");
     }
@@ -432,7 +430,7 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
 
     ExecutionPlan plan;
     std::vector<WriteBackOperation> write_back_operations;
-    auto [forward_operations, load_back_operations] =
+    auto [forward_operations, load_back_operations, store_load_operations] =
         buildForwardOperations(plan, std::move(candidates), write_back_operations);
     plan.With(ForwardBatch{std::move(forward_operations)});
 
@@ -446,6 +444,9 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     }
     if (!load_back_operations.empty()) {
         plan.With(CacheOperation{LoadBackBatch{load_back_operations}});
+    }
+    if (!store_load_operations.empty()) {
+        plan.With(CacheOperation{StoreLoadBatch{store_load_operations}});
     }
     return plan;
 }
