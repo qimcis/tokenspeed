@@ -46,7 +46,9 @@ def _two_layer_executor(executor_module):
     layout = CacheTransferLayout(
         num_lcm_blocks=16,
         groups=(
-            CacheGroupLayout(group_id="full", cache_blocks_per_lcm_block=1, fields=fields),
+            CacheGroupLayout(
+                group_id="full", cache_blocks_per_lcm_block=1, fields=fields
+            ),
         ),
         buffers=(object(),),
         consumers=(("layer.0.k", "layer.0.v"), ("layer.1.k", "layer.1.v")),
@@ -96,7 +98,9 @@ class L3TransferRangeTest(unittest.TestCase):
                     self.assertEqual(
                         num_bytes,
                         next(
-                            f.payload_bytes for f in group.fields if f.field_id == field_id
+                            f.payload_bytes
+                            for f in group.fields
+                            if f.field_id == field_id
                         ),
                     )
                 for field_id in consumer:

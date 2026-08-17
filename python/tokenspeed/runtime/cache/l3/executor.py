@@ -264,8 +264,6 @@ class L3CacheExecutor:
             self._store_namespace,
         )
 
-    # -- host buffer management ----------------------------------------------
-
     def _ensure_registered(self, buffer: torch.Tensor) -> bool:
         if self.store is None:
             return False
@@ -468,8 +466,6 @@ class L3CacheExecutor:
                 )
                 transfers.append((int(group), int(device_block_id), int(host_block_id)))
 
-    # -- Store writes --------------------------------------------------------
-
     def _start_writing(
         self,
         op_ids: Sequence[int],
@@ -602,8 +598,6 @@ class L3CacheExecutor:
             content_hash for content_hash, success in hash_success.items() if success
         ]
 
-    # -- Store loads ---------------------------------------------------------
-
     def _start_loading(
         self,
         op_ids: Sequence[int],
@@ -725,8 +719,6 @@ class L3CacheExecutor:
         finally:
             if not retained_for_async_copy:
                 self._release_stash(slot)
-
-    # -- polling and lifecycle ----------------------------------------------
 
     def poll_results(self) -> list:
         results: list = []
