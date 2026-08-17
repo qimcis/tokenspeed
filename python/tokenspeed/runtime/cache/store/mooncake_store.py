@@ -272,7 +272,14 @@ class MooncakeStore(BaseKVStore):
         return self.store.register_buffer(ptr, size)
 
     def close(self) -> None:
-        pass
+        for method_name in ("close", "teardown", "destroy"):
+            method = getattr(self.store, method_name, None)
+            if callable(method):
+                try:
+                    method()
+                except Exception:
+                    pass
+                break
 
     @staticmethod
     def _uses_multi_buffer(ptrs: list[Any]) -> bool:

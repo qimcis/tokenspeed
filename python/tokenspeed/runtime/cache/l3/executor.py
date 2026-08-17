@@ -251,12 +251,6 @@ class L3CacheExecutor:
         except Exception:
             pass
 
-        if l2_executor is not None:
-            try:
-                self._ensure_registered(l2_executor.host_storage.host_buffer)
-            except Exception as exc:
-                logger.debug("L3: failed to register L2 host buffer: %s", exc)
-
         logger.info(
             "L3 Store: enabled backend=%s groups=%s namespace=%s",
             type(store).__name__,
@@ -424,12 +418,17 @@ class L3CacheExecutor:
             else:
                 raise TypeError(f"unsupported cache op {type(operation).__name__}")
 
-        load_index = self._start_loading(
-            store_op_ids,
-            store_transfers,
-            content_hashes=store_hashes or None,
-            cache_block_offsets=store_offsets or None,
-        )
+        load_error: Exception | None = None
+        load_index: int | None = None
+        try:
+            load_index = self._start_loading(
+                store_op_ids,
+                store_transfers,
+                content_hashes=store_hashes or None,
+                cache_block_offsets=store_offsets or None,
+            )
+        except Exception as exc:
+            load_error = exc
         for tracker, _ in self._load_trackers:
             tracker.set_consumers(load_index if load_index is not None else -1)
         self._start_writing(
@@ -438,6 +437,8 @@ class L3CacheExecutor:
             content_hashes=write_hashes or None,
             cache_block_offsets=write_offsets or None,
         )
+        if load_error is not None:
+            raise load_error
 
     @staticmethod
     def _append_transfers(

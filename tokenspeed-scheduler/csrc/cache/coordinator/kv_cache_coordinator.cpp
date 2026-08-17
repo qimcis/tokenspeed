@@ -90,6 +90,7 @@ bool KvCacheCoordinator::ClearDeviceCache() {
     }
 
     pending_stores_.clear();
+    store_index_.clear();
     for (const auto& [group_id, location] : cached_locations) {
         _assert(evictCachedBlock(group_id, location), "clearable Device cache entry disappeared");
     }
