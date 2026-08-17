@@ -22,7 +22,6 @@
 
 from __future__ import annotations
 
-import ctypes
 import hashlib
 import re
 from collections.abc import Sequence
@@ -97,12 +96,20 @@ def _build_store_namespace(
     if model_id is None or not str(model_id).strip():
         raise ValueError(
             "L3 Store namespace requires a model identifier: set "
-            "--kvstore-storage-backend-extra-config '{\"extra_backend_tag\": \"<ns>\"}' "
+            '--kvstore-storage-backend-extra-config \'{"extra_backend_tag": "<ns>"}\' '
             "or ensure the model path/revision is available"
         )
     model_component = _sanitize_namespace_component(str(model_id))
-    revision_component = _sanitize_namespace_component(str(model_revision)) if model_revision else "default"
-    abi_component = _sanitize_namespace_component(str(cache_abi_fingerprint)) if cache_abi_fingerprint else "unknown-abi"
+    revision_component = (
+        _sanitize_namespace_component(str(model_revision))
+        if model_revision
+        else "default"
+    )
+    abi_component = (
+        _sanitize_namespace_component(str(cache_abi_fingerprint))
+        if cache_abi_fingerprint
+        else "unknown-abi"
+    )
     raw = f"{model_component}@{revision_component}:{abi_component}"
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
     return f"{_sanitize_namespace_component(model_component)}_{digest}"
@@ -113,8 +120,12 @@ def _fingerprint_cache_layout(layout: Any) -> str:
     for group in getattr(layout, "groups", ()):
         fields = getattr(group, "fields", ())
         field_ids = ",".join(sorted(getattr(field, "field_id", "") for field in fields))
-        payloads = ",".join(str(getattr(field, "payload_bytes", "")) for field in fields)
-        strides = ",".join(str(getattr(field, "block_stride_bytes", "")) for field in fields)
+        payloads = ",".join(
+            str(getattr(field, "payload_bytes", "")) for field in fields
+        )
+        strides = ",".join(
+            str(getattr(field, "block_stride_bytes", "")) for field in fields
+        )
         parts.append(
             f"{group.group_id}:{group.cache_blocks_per_lcm_block}:{field_ids}:{payloads}:{strides}"
         )
@@ -169,7 +180,11 @@ class L3CacheExecutor:
         self.transfer_backend = "dma" if io_backend == "direct" else "auto"
         self.tp_rank = tp_rank
         self.tp_size = tp_size
-        self._explicit_namespace = store_namespace.strip() if isinstance(store_namespace, str) and store_namespace.strip() else None
+        self._explicit_namespace = (
+            store_namespace.strip()
+            if isinstance(store_namespace, str) and store_namespace.strip()
+            else None
+        )
         self._model_id = model_id
         self._model_revision = model_revision
         self._cache_abi_fingerprint = cache_abi_fingerprint
@@ -193,7 +208,6 @@ class L3CacheExecutor:
 
         self._stash_slots: list[_StashSlot] = []
         self._registered_ptrs: set[int] = set()
-        self._mooncake_allocator = None
         self._closed = False
 
         pool_layouts = [(device_pool, target_layout)]
@@ -213,7 +227,9 @@ class L3CacheExecutor:
         self._ready_store_hashes: list[str] = []
 
         if self._explicit_namespace is not None:
-            self._store_namespace = _sanitize_namespace_component(self._explicit_namespace)
+            self._store_namespace = _sanitize_namespace_component(
+                self._explicit_namespace
+            )
         else:
             abi = self._cache_abi_fingerprint or _fingerprint_cache_layout(self.layout)
             # Include TP size in ABI so different sharding doesn't collide.
@@ -276,19 +292,12 @@ class L3CacheExecutor:
         return True
 
     def _allocate_stash(self, nbytes: int) -> _StashSlot:
-        try:
-            from mooncake.store import (  # type: ignore[import-not-found]
-                MooncakeHostMemAllocator,
-            )
-
-            if self._mooncake_allocator is None:
-                self._mooncake_allocator = MooncakeHostMemAllocator()
-            ptr = self._mooncake_allocator.alloc(nbytes)
-            c_type = ctypes.c_byte * nbytes
-            c_array = c_type.from_address(ptr)
-            buffer = torch.frombuffer(c_array, dtype=torch.uint8, count=nbytes)
-        except Exception:
-            buffer = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+        # Use a regular pinned torch tensor: transfer_cache_ranges validates
+        # host_buffer.is_pinned(), which a raw foreign allocation (e.g. from
+        # MooncakeHostMemAllocator) can never satisfy, and _ensure_registered
+        # already exposes the same memory to the Store backend for zero-copy
+        # put/get.
+        buffer = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
         slot = _StashSlot(buffer=buffer, capacity=nbytes, busy=True)
         self._stash_slots.append(slot)
         if not self._ensure_registered(buffer):
@@ -319,6 +328,12 @@ class L3CacheExecutor:
             group = self.layout.groups[group_index]
             for field in group.fields:
                 if field_ids is not None and field.field_id not in field_ids:
+                    # The stash packs every field of every transfer contiguously
+                    # (see _do_store_put/_do_store_get), so a skipped field must
+                    # still advance the cursor: per-layer H2D copies otherwise
+                    # read the wrong absolute host offsets beyond the first
+                    # layer/transfer.
+                    host_offset += field.payload_bytes
                     continue
                 ranges.append(
                     (
@@ -449,13 +464,9 @@ class L3CacheExecutor:
             collected_op_ids.append(int(op_id))
             for group, source, destination in zip(groups, sources, destinations):
                 device_block_id, host_block_id = (
-                    (source, destination)
-                    if source_is_device
-                    else (destination, source)
+                    (source, destination) if source_is_device else (destination, source)
                 )
-                transfers.append(
-                    (int(group), int(device_block_id), int(host_block_id))
-                )
+                transfers.append((int(group), int(device_block_id), int(host_block_id)))
 
     # -- Store writes --------------------------------------------------------
 
@@ -473,7 +484,9 @@ class L3CacheExecutor:
                 transfers, content_hashes, cache_block_offsets
             )
         except Exception as exc:
-            logger.warning("L3 put failed (op_ids=%s): %s", _ordered_unique(op_ids), exc)
+            logger.warning(
+                "L3 put failed (op_ids=%s): %s", _ordered_unique(op_ids), exc
+            )
             return
         self._ready_store_hashes.extend(completed_hashes)
 
@@ -498,8 +511,7 @@ class L3CacheExecutor:
             content_hash = content_hashes[index]
             offset = (
                 cache_block_offsets[index]
-                if cache_block_offsets is not None
-                and index < len(cache_block_offsets)
+                if cache_block_offsets is not None and index < len(cache_block_offsets)
                 else 0
             )
             group_id = self.layout.groups[group_index].group_id
@@ -583,8 +595,12 @@ class L3CacheExecutor:
 
         hash_success: dict[str, bool] = {}
         for (_transfer_index, content_hash, _key), success in zip(records, succeeded):
-            hash_success[content_hash] = hash_success.get(content_hash, True) and success
-        return [content_hash for content_hash, success in hash_success.items() if success]
+            hash_success[content_hash] = (
+                hash_success.get(content_hash, True) and success
+            )
+        return [
+            content_hash for content_hash, success in hash_success.items() if success
+        ]
 
     # -- Store loads ---------------------------------------------------------
 
@@ -605,7 +621,9 @@ class L3CacheExecutor:
                 op_ids, transfers, content_hashes, cache_block_offsets
             )
         except Exception as exc:
-            raise RuntimeError(f"L3 Store load failed for op_ids={op_ids}: {exc}") from exc
+            raise RuntimeError(
+                f"L3 Store load failed for op_ids={op_ids}: {exc}"
+            ) from exc
 
     def _do_store_get(
         self,
@@ -627,8 +645,7 @@ class L3CacheExecutor:
                 raise RuntimeError(f"Store load transfer {index} has no content hash")
             offset = (
                 cache_block_offsets[index]
-                if cache_block_offsets is not None
-                and index < len(cache_block_offsets)
+                if cache_block_offsets is not None and index < len(cache_block_offsets)
                 else 0
             )
             keys.append(
@@ -687,9 +704,7 @@ class L3CacheExecutor:
                 load_events.start_event.record()
                 load_events.start_event.wait(self.load_stream)
                 for layer_index in range(consumer_count):
-                    consumer = self.layout.consumers[
-                        consumer_offset + layer_index
-                    ]
+                    consumer = self.layout.consumers[consumer_offset + layer_index]
                     transfer_cache_ranges(
                         "h2d",
                         self.layout.buffers,
@@ -766,7 +781,6 @@ class L3CacheExecutor:
                 logger.warning("L3 Store close failed: %s", exc)
         self._stash_slots.clear()
         self._registered_ptrs.clear()
-        self._mooncake_allocator = None
         self._closed = True
 
     def reset(self) -> None:

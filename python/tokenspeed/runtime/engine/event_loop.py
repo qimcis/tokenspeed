@@ -24,7 +24,6 @@ import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-
 from types import SimpleNamespace
 
 import psutil
@@ -396,13 +395,22 @@ class EventLoop:
                         model_rev_for_ns = None
                         abi_for_ns = None
                     else:
-                        model_id_for_ns = getattr(self.model_config, "model_path", None) or server_args.model
-                        model_rev_for_ns = getattr(self.model_config, "revision", None) or getattr(server_args, "revision", None)
+                        model_id_for_ns = (
+                            getattr(self.model_config, "model_path", None)
+                            or server_args.model
+                        )
+                        model_rev_for_ns = getattr(
+                            self.model_config, "revision", None
+                        ) or getattr(server_args, "revision", None)
                         abi_for_ns = None
                         try:
-                            from tokenspeed.runtime.cache.l3.executor import _fingerprint_cache_layout
+                            from tokenspeed.runtime.cache.l3.executor import (
+                                _fingerprint_cache_layout,
+                            )
 
-                            abi_for_ns = _fingerprint_cache_layout(token_to_kv_pool.cache_transfer_layout())
+                            abi_for_ns = _fingerprint_cache_layout(
+                                token_to_kv_pool.cache_transfer_layout()
+                            )
                         except Exception:
                             abi_for_ns = None
                         store_namespace = None
@@ -420,7 +428,9 @@ class EventLoop:
                         store_namespace=store_namespace,
                     )
                 except Exception as exc:
-                    logger.warning("L3 executor init failed — running without L3: %s", exc)
+                    logger.warning(
+                        "L3 executor init failed — running without L3: %s", exc
+                    )
                     try:
                         kv_store.close()
                     except Exception:
@@ -1065,16 +1075,83 @@ class EventLoop:
         # L2 only understands WriteBack/LoadBack; StoreLoad must not be routed there.
         if self.l2_cache_executor is not None:
             l2_plan = SimpleNamespace(
-                cache=[op for op in execution_plan.cache if isinstance(op, (Cache.WriteBackOp, Cache.LoadBackOp))]
+                cache=[
+                    op
+                    for op in execution_plan.cache
+                    if isinstance(op, (Cache.WriteBackOp, Cache.LoadBackOp))
+                ]
             )
             if l2_plan.cache:
                 self.l2_cache_executor.submit_plan(l2_plan)
+        # StoreLoadOp op_ids whose L3 submit failed. They generate no polled
+        # StoreLoadDone events, so they must not be counted as in-flight, and
+        # the scheduler must complete them locally to release the pinned blocks.
+        dropped_store_op_ids: set[int] = set()
         if self.l3_cache_executor is not None:
             l3_plan = SimpleNamespace(
-                cache=[op for op in execution_plan.cache if isinstance(op, (Cache.WriteBackOp, Cache.StoreLoadOp))]
+                cache=[
+                    op
+                    for op in execution_plan.cache
+                    if isinstance(op, (Cache.WriteBackOp, Cache.StoreLoadOp))
+                ]
             )
             if l3_plan.cache:
-                self.l3_cache_executor.submit_plan(l3_plan)
+                try:
+                    self.l3_cache_executor.submit_plan(l3_plan)
+                except Exception as exc:
+                    # Admission issued a Store load that the Store could not
+                    # satisfy (evicted data, node loss, short read). Degrade
+                    # instead of crashing the scheduler process: complete the
+                    # ops locally so the scheduler unpins the destination
+                    # blocks, and invalidate the hashes so future probes
+                    # recompute instead of re-attempting the load. The request
+                    # admitted this round still runs over the unprepared
+                    # pages; a recompute fallback needs scheduler support.
+                    dropped_store_op_ids = {
+                        int(op_id)
+                        for op in l3_plan.cache
+                        if isinstance(op, Cache.StoreLoadOp)
+                        for op_id in op.op_ids
+                    }
+                    logger.warning(
+                        "L3 Store load failed for op_ids=%s (%s); invalidating "
+                        "their store-index entries and completing the ops locally",
+                        sorted(dropped_store_op_ids),
+                        exc,
+                    )
+                    if dropped_store_op_ids:
+                        try:
+                            completion = ExecutionEvent()
+                            for op_id in dropped_store_op_ids:
+                                event = Cache.StoreLoadDoneEvent()
+                                event.op_id = op_id
+                                completion.add_event(event)
+                            self.scheduler.advance(completion)
+                        except Exception as adv_exc:
+                            logger.debug(
+                                "L3 store-load local completion failed: %s",
+                                adv_exc,
+                            )
+                    try:
+                        failed_hashes = list(
+                            dict.fromkeys(
+                                str(hash_value)
+                                for op in l3_plan.cache
+                                if isinstance(op, Cache.StoreLoadOp)
+                                for hashes in getattr(op, "content_hashes", None) or []
+                                for hash_value in hashes
+                                if hash_value
+                            )
+                        )
+                        if failed_hashes:
+                            self.scheduler.update_store_index(
+                                failed_hashes, [False] * len(failed_hashes)
+                            )
+                    except Exception as invalidation_exc:
+                        logger.debug(
+                            "L3 store-index invalidation failed: %s",
+                            invalidation_exc,
+                        )
             # Publish successful Store puts to the scheduler's store index.
             # L3 writes are synchronous; only fully-succeeded base hashes are reported.
             try:
@@ -1084,15 +1161,23 @@ class EventLoop:
                 ready_hashes = []
             if ready_hashes:
                 try:
-                    self.scheduler.update_store_index(ready_hashes, [True] * len(ready_hashes))
+                    self.scheduler.update_store_index(
+                        ready_hashes, [True] * len(ready_hashes)
+                    )
                 except Exception as exc:
-                    logger.debug("update_store_index failed for %s hashes: %s", len(ready_hashes), exc)
+                    logger.debug(
+                        "update_store_index failed for %s hashes: %s",
+                        len(ready_hashes),
+                        exc,
+                    )
         for op in execution_plan.cache:
             if isinstance(op, Cache.WriteBackOp):
                 self._num_inflight_cache_ops += len(op.op_ids)
             elif isinstance(op, Cache.LoadBackOp):
                 self._num_inflight_cache_ops += len(op.op_ids)
             elif isinstance(op, Cache.StoreLoadOp):
+                if any(int(op_id) in dropped_store_op_ids for op_id in op.op_ids):
+                    continue
                 self._num_inflight_cache_ops += len(op.op_ids)
             else:
                 raise ValueError(f"unsupported cache op kind: {type(op).__name__}")

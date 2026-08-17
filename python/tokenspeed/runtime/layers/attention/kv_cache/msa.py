@@ -70,7 +70,7 @@ class MSATokenToKVPool(MHATokenToKVPool):
 
     def get_index_k_buffer(self, layer_id: int) -> torch.Tensor:
         if self.layerwise_load_tracker is not None:
-            self.layerwise_load_tracker.wait_for_layer(layer_id)
+            self.wait_for_layerwise_load(layer_id)
         if layer_id not in self.index_k_buffer:
             raise RuntimeError(f"Layer {layer_id} has no index-key cache.")
         return self.index_k_buffer[layer_id]

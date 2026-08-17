@@ -132,6 +132,10 @@ class CachePool:
 
         # default state for optional layer-wise transfer control
         self.layerwise_load_tracker = None
+        # Additional trackers (e.g. one per cache executor tier) whose loads
+        # must all complete before a layer reads its KV buffers. Kept separate
+        # from layerwise_load_tracker so both L2 and L3 loads stay gated.
+        self._layerwise_load_trackers: list[LayerwiseLoadTracker] = []
         logger.info(
             f"Initialized token to kv pool with size {size}, dtype {dtype}, device {device}, page size {page_size}, rank {rank}"
         )
@@ -310,7 +314,29 @@ class CachePool:
     def register_layerwise_load_tracker(
         self, layerwise_load_tracker: LayerwiseLoadTracker
     ) -> None:
-        self.layerwise_load_tracker = layerwise_load_tracker
+        # The pool can hold only one layerwise_load_tracker attribute; keep the
+        # first registration there for callers/tests that read it directly, and
+        # accumulate every tier's tracker so wait_for_layerwise_load() gates on
+        # all of them. Without this, an L3 executor registering after L2 would
+        # orphan L2's tracker and silently drop its load barrier.
+        if self.layerwise_load_tracker is None:
+            self.layerwise_load_tracker = layerwise_load_tracker
+        self._layerwise_load_trackers.append(layerwise_load_tracker)
+
+    def wait_for_layerwise_load(self, layer_id: int) -> None:
+        """Wait for every registered cache-tier load to reach this layer.
+
+        Args:
+            layer_id: Local layer index whose KV buffers are about to be read.
+        """
+        trackers = self._layerwise_load_trackers
+        if trackers:
+            for tracker in trackers:
+                tracker.wait_for_layer(layer_id)
+            return
+        tracker = self.layerwise_load_tracker
+        if tracker is not None:
+            tracker.wait_for_layer(layer_id)
 
     def bind_paged_cache_scheduler(self, scheduler: object) -> None:
         """Optional hook for model-specific paged-cache diagnostics."""

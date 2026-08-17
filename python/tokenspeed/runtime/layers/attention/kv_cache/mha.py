@@ -249,7 +249,7 @@ class MHATokenToKVPool(CachePool):
         # it is supposed to be used only by attention backend not for information purpose
         # same applies to get_value_buffer and get_kv_buffer
         if self.layerwise_load_tracker is not None:
-            self.layerwise_load_tracker.wait_for_layer(layer_id)
+            self.wait_for_layerwise_load(layer_id)
         return self._get_key_buffer(layer_id)
 
     def _get_value_buffer(self, layer_id: int):
@@ -263,7 +263,7 @@ class MHATokenToKVPool(CachePool):
 
     def get_value_buffer(self, layer_id: int):
         if self.layerwise_load_tracker is not None:
-            self.layerwise_load_tracker.wait_for_layer(layer_id)
+            self.wait_for_layerwise_load(layer_id)
         return self._get_value_buffer(layer_id)
 
     def get_kv_buffer(self, layer_id: int):

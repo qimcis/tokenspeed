@@ -49,7 +49,9 @@ def _parse_global_segment_size(value: Any) -> int:
         if s.endswith("gb"):
             num = s[:-2].strip()
             if not num:
-                raise ValueError("Invalid global_segment_size: missing number before 'gb'")
+                raise ValueError(
+                    "Invalid global_segment_size: missing number before 'gb'"
+                )
             return int(num) * 1024 * 1024 * 1024
         return int(s)
     return int(value)
@@ -76,7 +78,9 @@ class InMemoryStore(BaseKVStore):
             if v is None:
                 out.append(-1)
                 continue
-            n = min(len(v), int(size[0]) if isinstance(size, (list, tuple)) else int(size))
+            n = min(
+                len(v), int(size[0]) if isinstance(size, (list, tuple)) else int(size)
+            )
             # buffer_ptrs are host pointers; copy via ctypes
             ctypes.memmove(ptr, v, n)
             out.append(n)
@@ -101,7 +105,9 @@ class MooncakeStore(BaseKVStore):
         self.config = config
         self.extra_backend_tag: str | None = config.extra_backend_tag
         try:
-            from mooncake.store import MooncakeDistributedStore  # type: ignore[import-not-found]
+            from mooncake.store import (
+                MooncakeDistributedStore,  # type: ignore[import-not-found]
+            )
         except ImportError as exc:
             raise ImportError(
                 "Please install mooncake (kvcache-ai/Mooncake) to use "
@@ -194,7 +200,9 @@ class MooncakeStore(BaseKVStore):
                     setup_kwargs.pop(k, None)
 
         if ret != 0:
-            raise RuntimeError(f"Mooncake Store setup failed: ret={ret} (master={master})")
+            raise RuntimeError(
+                f"Mooncake Store setup failed: ret={ret} (master={master})"
+            )
         logger.info(
             "MooncakeStore: setup ok host=%s master=%s proto=%s seg=%s",
             client_hostname,
@@ -211,10 +219,17 @@ class MooncakeStore(BaseKVStore):
             last_ret = self.store.put(key, val)
             if last_ret == 0:
                 break
-            logger.warning("MooncakeStore warmup put attempt %s/%s ret=%s", attempt + 1, _WARMUP_RETRIES, last_ret)
+            logger.warning(
+                "MooncakeStore warmup put attempt %s/%s ret=%s",
+                attempt + 1,
+                _WARMUP_RETRIES,
+                last_ret,
+            )
             time.sleep(1.0)
         else:
-            raise RuntimeError(f"MooncakeStore warmup put failed after {_WARMUP_RETRIES} attempts ret={last_ret}")
+            raise RuntimeError(
+                f"MooncakeStore warmup put failed after {_WARMUP_RETRIES} attempts ret={last_ret}"
+            )
         assert self.store.is_exist(key) == 1
         assert self.store.get(key) == val
         logger.info("MooncakeStore: warmup ok")
@@ -235,7 +250,9 @@ class MooncakeStore(BaseKVStore):
     ) -> list[int]:
         tagged = self._tag(keys)
         if self._uses_multi_buffer(buffer_ptrs):
-            return self.store.batch_get_into_multi_buffers(tagged, buffer_ptrs, buffer_sizes)
+            return self.store.batch_get_into_multi_buffers(
+                tagged, buffer_ptrs, buffer_sizes
+            )
         return self.store.batch_get_into(tagged, buffer_ptrs, buffer_sizes)
 
     def batch_put_from(
@@ -246,7 +263,9 @@ class MooncakeStore(BaseKVStore):
     ) -> list[int]:
         tagged = self._tag(keys)
         if self._uses_multi_buffer(buffer_ptrs):
-            return self.store.batch_put_from_multi_buffers(tagged, buffer_ptrs, buffer_sizes)
+            return self.store.batch_put_from_multi_buffers(
+                tagged, buffer_ptrs, buffer_sizes
+            )
         return self.store.batch_put_from(tagged, buffer_ptrs, buffer_sizes)
 
     def register_buffer(self, ptr: int, size: int) -> int:

@@ -134,7 +134,7 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
 
     def get_component(self, layer_id: int, component_name: str) -> torch.Tensor:
         if self.layerwise_load_tracker is not None:
-            self.layerwise_load_tracker.wait_for_layer(layer_id)
+            self.wait_for_layerwise_load(layer_id)
         if component_name == "latent_kv":
             buffer = self.kv_buffer[layer_id]
             if buffer is None:

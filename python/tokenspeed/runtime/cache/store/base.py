@@ -90,11 +90,15 @@ def _parse_extra_config(raw: str | None) -> dict[str, Any] | None:
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise ValueError(f"invalid --kvstore-storage-backend-extra-config JSON: {exc}") from exc
+        raise ValueError(
+            f"invalid --kvstore-storage-backend-extra-config JSON: {exc}"
+        ) from exc
     if not isinstance(parsed, dict):
         raise ValueError("--kvstore-storage-backend-extra-config must be a JSON object")
     # Allow both flat and nested: {"mooncake_store_config": {...}} or {...}
-    if "mooncake_store_config" in parsed and isinstance(parsed["mooncake_store_config"], dict):
+    if "mooncake_store_config" in parsed and isinstance(
+        parsed["mooncake_store_config"], dict
+    ):
         return parsed["mooncake_store_config"]
     # Also unwrap {"backend_name":..., "module_path":..., "class_name":...} style
     if "extra_config" in parsed and isinstance(parsed["extra_config"], dict):
@@ -136,11 +140,18 @@ def load_mooncake_store_config(
             with open(cfg_path) as f:
                 cfg = json.load(f)
         except Exception as exc:
-            raise RuntimeError(f"Failed to load Mooncake config from {cfg_path}: {exc}") from exc
+            raise RuntimeError(
+                f"Failed to load Mooncake config from {cfg_path}: {exc}"
+            ) from exc
         if not isinstance(cfg, dict):
             raise ValueError(f"Mooncake config file {cfg_path} must be a JSON object")
-        if cfg.get("master_server_address") is None and cfg.get("client_server_address") is None:
-            raise ValueError(f"Mooncake config file {cfg_path} requires master_server_address or client_server_address")
+        if (
+            cfg.get("master_server_address") is None
+            and cfg.get("client_server_address") is None
+        ):
+            raise ValueError(
+                f"Mooncake config file {cfg_path} requires master_server_address or client_server_address"
+            )
         return MooncakeStoreConfig(
             master_server_address=cfg.get("master_server_address"),
             client_server_address=cfg.get("client_server_address"),
@@ -171,8 +182,10 @@ def load_mooncake_store_config(
         protocol=os.getenv("MOONCAKE_PROTOCOL", "tcp"),
         device_name=os.getenv("MOONCAKE_DEVICE", ""),
         master_metrics_port=int(os.getenv("MOONCAKE_MASTER_METRICS_PORT", "9003")),
-        check_server=os.getenv("MOONCAKE_CHECK_SERVER", "false").lower() in ("1", "true", "yes"),
-        standalone_storage=os.getenv("MOONCAKE_STANDALONE_STORAGE", "false").lower() in ("1", "true", "yes"),
+        check_server=os.getenv("MOONCAKE_CHECK_SERVER", "false").lower()
+        in ("1", "true", "yes"),
+        standalone_storage=os.getenv("MOONCAKE_STANDALONE_STORAGE", "false").lower()
+        in ("1", "true", "yes"),
     )
 
 
@@ -188,7 +201,9 @@ def _load_custom_backend(extra_config_raw: str | None) -> BaseKVStore | None:
         mod = importlib.import_module(module_path)
         cls = getattr(mod, class_name)
     except Exception as exc:
-        raise ImportError(f"Failed to load custom KVStore backend {module_path}:{class_name}: {exc}") from exc
+        raise ImportError(
+            f"Failed to load custom KVStore backend {module_path}:{class_name}: {exc}"
+        ) from exc
     try:
         return cls(extra)  # type: ignore[call-arg]
     except TypeError:
@@ -212,7 +227,7 @@ def create_kv_store(
         if cfg is None:
             raise ValueError(
                 "Mooncake Store requires master/client address: set "
-                "--kvstore-storage-backend-extra-config '{\"master_server_address\": \"host:port\"}' "
+                '--kvstore-storage-backend-extra-config \'{"master_server_address": "host:port"}\' '
                 "or TOKENSPEED_KVSTORE_MOONCAKE_CONFIG_PATH or MOONCAKE_MASTER env"
             )
         # Defer import so unit tests without mooncake can still import this module
@@ -220,4 +235,6 @@ def create_kv_store(
 
         return MooncakeStore(cfg)
 
-    raise ValueError(f"Unknown --kvstore-storage-backend {backend!r}; expected 'mooncake' or custom module_path/class_name")
+    raise ValueError(
+        f"Unknown --kvstore-storage-backend {backend!r}; expected 'mooncake' or custom module_path/class_name"
+    )

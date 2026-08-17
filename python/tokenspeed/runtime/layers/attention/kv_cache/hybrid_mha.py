@@ -156,7 +156,7 @@ class HybridMHATokenToKVPool(MHATokenToKVPool):
 
     def get_component(self, layer_id: int, component_name: str) -> torch.Tensor:
         if self.layerwise_load_tracker is not None:
-            self.layerwise_load_tracker.wait_for_layer(layer_id)
+            self.wait_for_layerwise_load(layer_id)
         conv, recurrent = self.get_state_buffers(layer_id)
         if component_name == "conv_state":
             return conv
