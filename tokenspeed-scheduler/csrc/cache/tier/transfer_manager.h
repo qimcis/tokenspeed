@@ -22,6 +22,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -37,17 +38,24 @@ namespace tokenspeed {
 // Scheduler.
 class TierTransferManager {
 public:
+    struct FailedStoreLoad {
+        std::string request_id;
+        std::vector<std::pair<std::uint32_t, CacheBlockLocation>> destinations;
+    };
+
     explicit TierTransferManager(KvCacheCoordinator& coordinator) : coordinator_{coordinator} {}
 
     void SetEnableL3(bool enable) { enable_l3_storage_ = enable; }
 
     std::optional<WriteBackOperation> StartPendingStores();
     LoadBackOperation StartPrefixLoad(std::vector<BlockTransfer> block_transfers);
-    StoreLoadOperation StartStoreLoad(std::vector<KvCacheCoordinator::StoreTransfer> store_transfers);
+    StoreLoadOperation StartStoreLoad(std::string request_id,
+                                      std::vector<KvCacheCoordinator::StoreTransfer> store_transfers);
 
     void CompleteWriteBack(std::uint32_t op_id);
     void CompleteLoadBack(std::uint32_t op_id);
     void CompleteStoreLoad(std::uint32_t op_id);
+    std::optional<FailedStoreLoad> FailStoreLoad(std::uint32_t op_id);
 
     bool HasStoresInFlight() const { return !write_backs_.empty(); }
     bool HasLoadBacksInFlight() const { return !load_backs_.empty() || !store_loads_.empty(); }
@@ -61,6 +69,11 @@ private:
         CacheBlockRef host_block_ref;
     };
 
+    struct StoreLoadTicket {
+        std::string request_id;
+        std::vector<KvCacheCoordinator::StoreTransfer> transfers;
+    };
+
     std::uint32_t nextOpId() { return next_op_id_++; }
     LoadBackOperation startLoadBack(std::vector<BlockTransfer> block_transfers);
     std::vector<CacheTransfer> resolveTransfers(std::span<const BlockTransfer> block_transfers) const;
@@ -71,7 +84,7 @@ private:
     std::unordered_set<CacheKey, CacheKeyHash> store_keys_;
     // Each transfer pins both tiers until the runtime acknowledges the copy.
     std::unordered_map<std::uint32_t, std::vector<BlockTransfer>> load_backs_;
-    std::unordered_map<std::uint32_t, std::vector<KvCacheCoordinator::StoreTransfer>> store_loads_;
+    std::unordered_map<std::uint32_t, StoreLoadTicket> store_loads_;
     std::uint32_t next_op_id_{0};
 };
 

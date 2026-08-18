@@ -37,7 +37,12 @@ struct StoreLoadDone {
     std::uint32_t op_id{0};
 };
 
+struct StoreLoadFailed {
+    std::uint32_t op_id{0};
+};
+
 };  // namespace cache
 
-using CacheEvent = std::variant<cache::WriteBackDone, cache::LoadBackDone, cache::StoreLoadDone>;
+using CacheEvent =
+    std::variant<cache::WriteBackDone, cache::LoadBackDone, cache::StoreLoadDone, cache::StoreLoadFailed>;
 }  // namespace tokenspeed

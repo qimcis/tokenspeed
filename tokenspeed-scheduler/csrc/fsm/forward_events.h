@@ -170,6 +170,7 @@ struct RetractEvent : InvalidTransitionHandler<RetractEvent> {
     explicit RetractEvent(KvCacheCoordinator* coordinator) : coordinator_{coordinator} {}
 
     Submitted operator()(PrefillDone&& state);
+    Submitted operator()(Prefilling&& state);
     Submitted operator()(Decoding&& state);
 
 private:

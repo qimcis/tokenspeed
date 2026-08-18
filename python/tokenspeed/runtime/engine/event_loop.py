@@ -343,6 +343,10 @@ class EventLoop:
         # rank has anything pending. Lets us skip the TP collective in
         # _commit_cache_results entirely when nothing is in flight.
         self._num_inflight_cache_ops = 0
+        self._deferred_execution_plan = None
+        self._deferred_cache_zero_event = None
+        self._deferred_store_op_ids: tuple[int, ...] = ()
+        self._deferred_store_submit_error: str | None = None
         self.dp_rank = dp_rank
         self.dp_size = mapping.attn.dp_size
         self.has_dp = mapping.has_attn_dp
@@ -382,38 +386,40 @@ class EventLoop:
                     server_args.kvstore_storage_backend_extra_config,
                 )
             except Exception as exc:
+                if not server_args.kvstore_storage_allow_degraded:
+                    raise RuntimeError("L3 Store initialization failed") from exc
                 logger.warning("L3 Store init failed — running without L3: %s", exc)
                 kv_store = None
             if kv_store is not None:
                 try:
-                    # Namespace isolates KV bytes across models/revisions/layouts sharing a Store.
-                    # Explicit extra_backend_tag wins; otherwise derive from model + layout fingerprint.
+                    # Namespace always includes model artifacts and layout. A
+                    # backend tag is an additional partition, never a safety override.
                     explicit_ns = getattr(kv_store, "extra_backend_tag", None)
-                    if isinstance(explicit_ns, str) and explicit_ns.strip():
-                        store_namespace = explicit_ns.strip()
-                        model_id_for_ns = None
-                        model_rev_for_ns = None
-                        abi_for_ns = None
-                    else:
-                        model_id_for_ns = (
-                            getattr(self.model_config, "model_path", None)
-                            or server_args.model
+                    store_namespace = (
+                        explicit_ns.strip()
+                        if isinstance(explicit_ns, str) and explicit_ns.strip()
+                        else None
+                    )
+                    model_id_for_ns = (
+                        getattr(self.model_config, "model_path", None)
+                        or server_args.model
+                    )
+                    model_rev_for_ns = (
+                        getattr(self.model_config, "revision", None)
+                        or getattr(server_args, "revision", None)
+                        or getattr(self.model_config.hf_config, "_commit_hash", None)
+                    )
+                    abi_for_ns = None
+                    try:
+                        from tokenspeed.runtime.cache.l3.executor import (
+                            _fingerprint_cache_layout,
                         )
-                        model_rev_for_ns = getattr(
-                            self.model_config, "revision", None
-                        ) or getattr(server_args, "revision", None)
-                        abi_for_ns = None
-                        try:
-                            from tokenspeed.runtime.cache.l3.executor import (
-                                _fingerprint_cache_layout,
-                            )
 
-                            abi_for_ns = _fingerprint_cache_layout(
-                                token_to_kv_pool.cache_transfer_layout()
-                            )
-                        except Exception:
-                            abi_for_ns = None
-                        store_namespace = None
+                        abi_for_ns = _fingerprint_cache_layout(
+                            token_to_kv_pool.cache_transfer_layout()
+                        )
+                    except Exception:
+                        abi_for_ns = None
                     self.l3_cache_executor = L3CacheExecutor(
                         store=kv_store,
                         device_pool=token_to_kv_pool,
@@ -426,15 +432,29 @@ class EventLoop:
                         model_revision=model_rev_for_ns,
                         cache_abi_fingerprint=abi_for_ns,
                         store_namespace=store_namespace,
+                        max_stash_bytes=(
+                            server_args.kvstore_l3_max_stash_size_mb * 1024 * 1024
+                        ),
+                        store_probe_ttl=server_args.kvstore_l3_store_probe_ttl,
+                        io_workers=server_args.kvstore_l3_io_workers,
+                        direct_gpu=server_args.kvstore_l3_direct_gpu,
+                        direct_gpu_chunk_objects=(
+                            server_args.kvstore_l3_direct_gpu_chunk_objects
+                        ),
+                        host_pipeline_chunk_pages=(
+                            server_args.kvstore_l3_host_pipeline_chunk_pages
+                        ),
                     )
                 except Exception as exc:
-                    logger.warning(
-                        "L3 executor init failed — running without L3: %s", exc
-                    )
                     try:
                         kv_store.close()
                     except Exception:
                         pass
+                    if not server_args.kvstore_storage_allow_degraded:
+                        raise RuntimeError("L3 executor initialization failed") from exc
+                    logger.warning(
+                        "L3 executor init failed — running without L3: %s", exc
+                    )
                     self.l3_cache_executor = None
 
         self._kv_events_enabled = (
@@ -814,6 +834,7 @@ class EventLoop:
                 cache_results.extend(self.l3_cache_executor.poll_results())
             except Exception as exc:
                 logger.debug("L3 poll failed: %s", exc)
+            self._commit_l3_store_index_outcomes()
         self._num_inflight_cache_ops -= len(cache_results)
         for event in cache_results:
             payload = cache_event_to_payload(event)
@@ -824,17 +845,11 @@ class EventLoop:
         # _pending_cache_event_payloads) diverges transiently. A rank-local skip
         # would let some ranks gather while others return, deadlocking the group.
         # Agree on the skip via a cheap single-int all_reduce.
-        # NOTE: For non-DFLASH algorithms, cache ops are deterministic across
-        # ranks, so the local short-circuit is safe and avoids collective overhead.
         local_has_work = bool(
             self._num_inflight_cache_ops != 0 or self._pending_cache_event_payloads
         )
-        if self.server_args.speculative_algorithm in ("DFLASH", "DSPARK"):
-            if not self._cache_group_has_work(local_has_work):
-                return
-        else:
-            if not local_has_work:
-                return
+        if not self._cache_group_has_work(local_has_work):
+            return
 
         ready_payloads = self._pop_ready_cache_event_payloads()
         if not ready_payloads:
@@ -891,6 +906,34 @@ class EventLoop:
         flag = torch.tensor([1 if local_has_work else 0], dtype=torch.int32)
         dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=self.attn_tp_cpu_group)
         return bool(flag.item())
+
+    def _commit_l3_store_index_outcomes(self) -> None:
+        """Publish only Store writes that reached the same result on every TP rank."""
+        if self.l3_cache_executor is None:
+            return
+        local = self.l3_cache_executor.peek_store_index_outcomes()
+        if not self._cache_group_has_work(bool(local)):
+            return
+        if self.attn_tp_size == 1:
+            gathered = [local]
+        else:
+            gathered = [None] * self.attn_tp_size
+            dist.all_gather_object(gathered, local, group=self.attn_tp_cpu_group)
+        common = set(gathered[0])
+        for rank_outcome in gathered[1:]:
+            common.intersection_update(rank_outcome)
+        if not common:
+            return
+        hashes = sorted(common)
+        present = [
+            all(bool(rank_outcome[value]) for rank_outcome in gathered)
+            for value in hashes
+        ]
+        self.scheduler.update_store_index(hashes, present)
+        self.l3_cache_executor.acknowledge_store_index_outcomes(hashes)
+        failed = [value for value, ok in zip(hashes, present) if not ok]
+        if failed:
+            self.l3_cache_executor.record_presence(failed, present=False)
 
     def _pop_ready_cache_event_payloads(self) -> list[dict]:
         local_payloads = list(self._pending_cache_event_payloads.values())
@@ -1069,9 +1112,11 @@ class EventLoop:
             extend_seq_lens=list(forward_op.input_lengths[:num_extends]),
         )
 
-    def _submit_cache_ops(self, execution_plan) -> None:
+    def _submit_cache_ops(
+        self, execution_plan, cache_zero_event=None
+    ) -> tuple[tuple[int, ...], str | None]:
         if self.l2_cache_executor is None and self.l3_cache_executor is None:
-            return
+            return (), None
         # L2 only understands WriteBack/LoadBack; StoreLoad must not be routed there.
         if self.l2_cache_executor is not None:
             l2_plan = SimpleNamespace(
@@ -1083,10 +1128,15 @@ class EventLoop:
             )
             if l2_plan.cache:
                 self.l2_cache_executor.submit_plan(l2_plan)
-        # StoreLoadOp op_ids whose L3 submit failed. They generate no polled
-        # StoreLoadDone events, so they must not be counted as in-flight, and
-        # the scheduler must complete them locally to release the pinned blocks.
-        dropped_store_op_ids: set[int] = set()
+        store_op_ids = tuple(
+            dict.fromkeys(
+                int(op_id)
+                for op in execution_plan.cache
+                if isinstance(op, Cache.StoreLoadOp)
+                for op_id in op.op_ids
+            )
+        )
+        submit_error = None
         if self.l3_cache_executor is not None:
             l3_plan = SimpleNamespace(
                 cache=[
@@ -1097,90 +1147,169 @@ class EventLoop:
             )
             if l3_plan.cache:
                 try:
-                    self.l3_cache_executor.submit_plan(l3_plan)
+                    submitted = self.l3_cache_executor.submit_plan(
+                        l3_plan, cache_zero_event=cache_zero_event
+                    )
+                    if tuple(submitted) != store_op_ids:
+                        raise RuntimeError(
+                            "L3 executor returned mismatched Store load op ids: "
+                            f"expected={store_op_ids} submitted={tuple(submitted)}"
+                        )
                 except Exception as exc:
-                    # Admission issued a Store load that the Store could not
-                    # satisfy (evicted data, node loss, short read). Degrade
-                    # instead of crashing the scheduler process: complete the
-                    # ops locally so the scheduler unpins the destination
-                    # blocks, and invalidate the hashes so future probes
-                    # recompute instead of re-attempting the load. The request
-                    # admitted this round still runs over the unprepared
-                    # pages; a recompute fallback needs scheduler support.
-                    dropped_store_op_ids = {
-                        int(op_id)
+                    submit_error = str(exc)
+                    write_hashes = {
+                        str(value)
                         for op in l3_plan.cache
-                        if isinstance(op, Cache.StoreLoadOp)
-                        for op_id in op.op_ids
+                        if isinstance(op, Cache.WriteBackOp)
+                        for values in (getattr(op, "content_hashes", None) or [])
+                        for value in values
+                        if value
                     }
-                    logger.warning(
-                        "L3 Store load failed for op_ids=%s (%s); invalidating "
-                        "their store-index entries and completing the ops locally",
-                        sorted(dropped_store_op_ids),
-                        exc,
-                    )
-                    if dropped_store_op_ids:
-                        try:
-                            completion = ExecutionEvent()
-                            for op_id in dropped_store_op_ids:
-                                event = Cache.StoreLoadDoneEvent()
-                                event.op_id = op_id
-                                completion.add_event(event)
-                            self.scheduler.advance(completion)
-                        except Exception as adv_exc:
-                            logger.debug(
-                                "L3 store-load local completion failed: %s",
-                                adv_exc,
-                            )
-                    try:
-                        failed_hashes = list(
-                            dict.fromkeys(
-                                str(hash_value)
-                                for op in l3_plan.cache
-                                if isinstance(op, Cache.StoreLoadOp)
-                                for hashes in getattr(op, "content_hashes", None) or []
-                                for hash_value in hashes
-                                if hash_value
-                            )
+                    if write_hashes:
+                        self.l3_cache_executor.record_store_index_outcomes(
+                            {value: False for value in write_hashes}
                         )
-                        if failed_hashes:
-                            self.scheduler.update_store_index(
-                                failed_hashes, [False] * len(failed_hashes)
-                            )
-                    except Exception as invalidation_exc:
-                        logger.debug(
-                            "L3 store-index invalidation failed: %s",
-                            invalidation_exc,
+                    if not store_op_ids:
+                        logger.warning(
+                            "L3 background Store write submission failed: %s", exc
                         )
-            # Publish successful Store puts to the scheduler's store index.
-            # L3 writes are synchronous; only fully-succeeded base hashes are reported.
-            try:
-                ready_hashes = self.l3_cache_executor.take_store_index_updates()
-            except Exception as exc:
-                logger.debug("L3 take_store_index_updates failed: %s", exc)
-                ready_hashes = []
-            if ready_hashes:
-                try:
-                    self.scheduler.update_store_index(
-                        ready_hashes, [True] * len(ready_hashes)
-                    )
-                except Exception as exc:
-                    logger.debug(
-                        "update_store_index failed for %s hashes: %s",
-                        len(ready_hashes),
-                        exc,
-                    )
         for op in execution_plan.cache:
             if isinstance(op, Cache.WriteBackOp):
                 self._num_inflight_cache_ops += len(op.op_ids)
             elif isinstance(op, Cache.LoadBackOp):
                 self._num_inflight_cache_ops += len(op.op_ids)
             elif isinstance(op, Cache.StoreLoadOp):
-                if any(int(op_id) in dropped_store_op_ids for op_id in op.op_ids):
-                    continue
-                self._num_inflight_cache_ops += len(op.op_ids)
+                # Count the load only after every TP rank has prepared it. A
+                # failed preparation emits StoreLoadFailed instead of Done.
+                pass
             else:
                 raise ValueError(f"unsupported cache op kind: {type(op).__name__}")
+        return store_op_ids, submit_error
+
+    @staticmethod
+    def _store_load_hashes(execution_plan) -> list[str]:
+        return list(
+            dict.fromkeys(
+                str(value)
+                for op in execution_plan.cache
+                if isinstance(op, Cache.StoreLoadOp)
+                for values in (getattr(op, "content_hashes", None) or [])
+                for value in values
+                if value
+            )
+        )
+
+    def _refresh_l3_store_index(self) -> bool:
+        """Discover external Store entries before scheduler admission."""
+        if self.l3_cache_executor is None:
+            return True
+        hashes = [str(value) for value in self.scheduler.store_probe_hashes()]
+        if not hashes:
+            return True
+        status, local_outcome, error = self.l3_cache_executor.probe_store_presence(
+            hashes
+        )
+        local = {"status": status, "outcome": local_outcome, "error": error}
+        if self.attn_tp_size == 1:
+            gathered = [local]
+        else:
+            gathered = [None] * self.attn_tp_size
+            dist.all_gather_object(gathered, local, group=self.attn_tp_cpu_group)
+        if any(item["status"] == "pending" for item in gathered):
+            return False
+        present = [
+            all(bool(item["outcome"].get(value, False)) for item in gathered)
+            for value in hashes
+        ]
+        self.scheduler.update_store_index(hashes, present)
+        return True
+
+    def _resolve_deferred_store_load(self):
+        op_ids = self._deferred_store_op_ids
+        if not op_ids:
+            return self._deferred_execution_plan, self._deferred_cache_zero_event
+        if self._deferred_store_submit_error is not None:
+            local = {
+                "status": "failed",
+                "hashes": self._store_load_hashes(self._deferred_execution_plan),
+                "error": self._deferred_store_submit_error,
+            }
+        else:
+            status, hashes, error = self.l3_cache_executor.load_submission_status(
+                op_ids
+            )
+            local = {"status": status, "hashes": hashes, "error": error}
+        if self.attn_tp_size == 1:
+            gathered = [local]
+        else:
+            gathered = [None] * self.attn_tp_size
+            dist.all_gather_object(gathered, local, group=self.attn_tp_cpu_group)
+        if any(item["status"] == "failed" for item in gathered):
+            failed_hashes = list(
+                dict.fromkeys(
+                    value for item in gathered for value in item["hashes"] if value
+                )
+            )
+            zero_event = self._deferred_cache_zero_event
+            try:
+                self.l3_cache_executor.abort_load_submission(op_ids)
+            finally:
+                if zero_event is not None:
+                    zero_event.synchronize()
+            if failed_hashes:
+                self.l3_cache_executor.record_presence(failed_hashes, present=False)
+                self.scheduler.update_store_index(
+                    failed_hashes, [False] * len(failed_hashes)
+                )
+            failure = ExecutionEvent()
+            for op_id in op_ids:
+                event = Cache.StoreLoadFailedEvent()
+                event.op_id = op_id
+                failure.add_event(event)
+            self.scheduler.advance(failure)
+            self._publish_scheduler_kv_events()
+            if self.attn_tp_rank == 0:
+                errors = [item["error"] for item in gathered if item["error"]]
+                logger.warning(
+                    "L3 Store load failed for op_ids=%s; requeued for recompute: %s",
+                    op_ids,
+                    "; ".join(errors) or "unknown Store error",
+                )
+            self._clear_deferred_store_load()
+            return None
+        if any(item["status"] == "pending" for item in gathered):
+            return None
+        plan = self._deferred_execution_plan
+        zero_event = self._deferred_cache_zero_event
+        self.l3_cache_executor.acknowledge_load_submission(op_ids)
+        self._num_inflight_cache_ops += len(op_ids)
+        self._clear_deferred_store_load()
+        return plan, zero_event
+
+    def _clear_deferred_store_load(self) -> None:
+        self._deferred_execution_plan = None
+        self._deferred_cache_zero_event = None
+        self._deferred_store_op_ids = ()
+        self._deferred_store_submit_error = None
+
+    def _next_ready_execution_plan(self):
+        if self._deferred_execution_plan is not None:
+            return self._resolve_deferred_store_load()
+        if not self._refresh_l3_store_index():
+            return None
+        execution_plan = self.scheduler.next_execution_plan()
+        self._publish_scheduler_kv_events()
+        cache_zero_event = self.model_executor.zero_cache_pages(
+            execution_plan.pages_to_zero
+        )
+        op_ids, error = self._submit_cache_ops(execution_plan, cache_zero_event)
+        if op_ids:
+            self._deferred_execution_plan = execution_plan
+            self._deferred_cache_zero_event = cache_zero_event
+            self._deferred_store_op_ids = op_ids
+            self._deferred_store_submit_error = error
+            return None
+        return execution_plan, cache_zero_event
 
     # ------------------------------------------------------------------
     # Helpers
@@ -1763,12 +1892,19 @@ class EventLoop:
             if self._pause.forward_blocked:
                 self._paused_idle_step()
                 continue
-            execution_plan = self.scheduler.next_execution_plan()
-            self._publish_scheduler_kv_events()
-            cache_zero_event = self.model_executor.zero_cache_pages(
-                execution_plan.pages_to_zero
-            )
-            self._submit_cache_ops(execution_plan)
+            ready_plan = self._next_ready_execution_plan()
+            if ready_plan is None:
+                if self.has_dp:
+                    dp_metadata = self._dp_sync_and_check(None)
+                    if dp_metadata.need_idle_forward:
+                        self.model_executor.execute_idle_forward(
+                            dp_metadata.global_num_tokens,
+                            dp_metadata.global_batch_size,
+                            dp_metadata.all_decode_or_idle,
+                        )
+                time.sleep(0.0005)
+                continue
+            execution_plan, cache_zero_event = ready_plan
 
             forward_op = self._get_forward_op(execution_plan)
             stats = self._get_scheduler_stats()
@@ -1915,13 +2051,27 @@ class EventLoop:
                 prev_results = None
                 prev_forward_op = None
                 continue
-            execution_plan = self.scheduler.next_execution_plan()
-            self._publish_scheduler_kv_events()
-
-            cache_zero_event = self.model_executor.zero_cache_pages(
-                execution_plan.pages_to_zero
-            )
-            self._submit_cache_ops(execution_plan)
+            ready_plan = self._next_ready_execution_plan()
+            if ready_plan is None:
+                if prev_results is not None:
+                    request_changes = self._commit_forward_results(
+                        prev_forward_op, prev_results
+                    )
+                    advance_forward(self.scheduler, request_changes)
+                    self._publish_scheduler_kv_events()
+                    prev_results = None
+                    prev_forward_op = None
+                if self.has_dp:
+                    dp_metadata = self._dp_sync_and_check(None)
+                    if dp_metadata.need_idle_forward:
+                        self.model_executor.execute_idle_forward(
+                            dp_metadata.global_num_tokens,
+                            dp_metadata.global_batch_size,
+                            dp_metadata.all_decode_or_idle,
+                        )
+                time.sleep(0.0005)
+                continue
+            execution_plan, cache_zero_event = ready_plan
 
             forward_op = self._get_forward_op(execution_plan)
             stats = self._get_scheduler_stats()

@@ -53,6 +53,8 @@ if hasattr(Cache, "LoadBackDoneEvent"):
     _CACHE_EVENT_TYPES["LoadBackDoneEvent"] = Cache.LoadBackDoneEvent
 if hasattr(Cache, "StoreLoadDoneEvent"):
     _CACHE_EVENT_TYPES["StoreLoadDoneEvent"] = Cache.StoreLoadDoneEvent
+if hasattr(Cache, "StoreLoadFailedEvent"):
+    _CACHE_EVENT_TYPES["StoreLoadFailedEvent"] = Cache.StoreLoadFailedEvent
 _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 
 # Pool-spec string -> scheduler enum (pool_to_paged_cache_groups).

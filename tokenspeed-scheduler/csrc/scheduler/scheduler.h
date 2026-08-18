@@ -82,6 +82,7 @@ public:
     std::int32_t StoreHitTokens(const std::vector<std::string>& page_hashes) const {
         return coordinator_.StoreHitTokens(page_hashes);
     }
+    std::vector<std::string> StoreProbeHashes() const;
 
     bool PdTransferPinned(const std::string& request_id) const { return pd_transfer_pins_.contains(request_id); }
     std::int32_t PoolFreeBlocks() const { return coordinator_.NumAvailableLcmBlocks(); }
@@ -153,6 +154,7 @@ private:
     void handleEvent(const cache::WriteBackDone& event);
     void handleEvent(const cache::LoadBackDone& event);
     void handleEvent(const cache::StoreLoadDone& event);
+    void handleEvent(const cache::StoreLoadFailed& event);
     void handleEvent(const pd::BootstrappedEvent& event);
     void handleEvent(const pd::FailedEvent& event);
     void handleEvent(const pd::SucceededEvent& event);

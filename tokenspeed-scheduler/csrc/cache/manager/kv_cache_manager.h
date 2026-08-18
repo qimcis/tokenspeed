@@ -381,6 +381,23 @@ public:
         return key;
     }
 
+    // Remove a cache lookup immediately even while another owner still pins
+    // the physical block. Used for failed external restores whose bytes must
+    // never be matched by another request.
+    std::optional<CacheKey> InvalidateCachedBlock(const BlockPool& pool, CacheBlockLocation location) {
+        CacheEntries* cache_index = findCacheEntries(pool);
+        if (cache_index == nullptr) {
+            return std::nullopt;
+        }
+        CacheEntryIterator entry_it = findEntry(*cache_index, location);
+        if (entry_it == cache_index->entries.end()) {
+            return std::nullopt;
+        }
+        CacheKey key = entry_it->key;
+        eraseEntry(*cache_index, entry_it);
+        return key;
+    }
+
     bool ParentIsFullyEvictable(const BlockPool& pool, std::int32_t lcm_block_id) const {
         if (pool.OccupiedCount(lcm_block_id) == 0) {
             return false;

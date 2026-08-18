@@ -319,7 +319,8 @@ KvCacheCoordinator::PrefixProbe KvCacheCoordinator::ProbePrefix(std::span<const 
             const std::int32_t blocks_per_hash = cache_block_tokens_ / g_tokens;
             const std::int32_t total_blocks = num_cache_blocks * blocks_per_hash;
             out.store.per_group[gi].hits.assign(static_cast<std::size_t>(total_blocks), 0);
-            for (std::int32_t page = floor_tokens / cache_block_tokens_; page < floor_tokens / cache_block_tokens_ + hit_pages; ++page) {
+            for (std::int32_t page = floor_tokens / cache_block_tokens_;
+                 page < floor_tokens / cache_block_tokens_ + hit_pages; ++page) {
                 for (std::int32_t off = 0; off < blocks_per_hash; ++off) {
                     out.store.per_group[gi].hits[static_cast<std::size_t>(page * blocks_per_hash + off)] = 1;
                 }
@@ -714,6 +715,22 @@ void KvCacheCoordinator::Free(std::span<BlockTable> tables) {
     _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         groups_[i].Manager().Free(tables[i]);
+    }
+}
+
+void KvCacheCoordinator::DiscardDeviceCachedBlocks(
+    std::span<const std::pair<std::uint32_t, CacheBlockLocation>> blocks) {
+    for (const auto& [group_id, location] : blocks) {
+        _assert(group_id < groups_.size(), "failed Store load has invalid cache group");
+        KvCacheManager& manager = groups_[group_id].Manager();
+        if (!manager.ContainsCachedBlock(pool_, location)) {
+            continue;
+        }
+        const std::optional<CacheKey> removed = manager.InvalidateCachedBlock(pool_, location);
+        _assert(removed.has_value(), "failed Store destination disappeared during rollback");
+        if (cache_mutation_sink_) {
+            cache_mutation_sink_(*removed, CacheMutation::kRemoved);
+        }
     }
 }
 

@@ -120,7 +120,8 @@ void TierTransferManager::CompleteLoadBack(std::uint32_t op_id) {
     load_backs_.erase(op_id);
 }
 
-StoreLoadOperation TierTransferManager::StartStoreLoad(std::vector<KvCacheCoordinator::StoreTransfer> store_transfers) {
+StoreLoadOperation TierTransferManager::StartStoreLoad(std::string request_id,
+                                                       std::vector<KvCacheCoordinator::StoreTransfer> store_transfers) {
     _assert(!store_transfers.empty(), "store load requires at least one transfer");
     std::vector<CacheTransfer> transfers;
     transfers.reserve(store_transfers.size());
@@ -135,13 +136,27 @@ StoreLoadOperation TierTransferManager::StartStoreLoad(std::vector<KvCacheCoordi
         });
     }
     const std::uint32_t op_id = nextOpId();
-    const bool inserted = store_loads_.emplace(op_id, std::move(store_transfers)).second;
+    const bool inserted = store_loads_.emplace(op_id, StoreLoadTicket{request_id, std::move(store_transfers)}).second;
     _assert(inserted, "duplicate store-load op id");
-    return StoreLoadOperation{op_id, std::move(transfers)};
+    return StoreLoadOperation{op_id, std::move(request_id), std::move(transfers)};
 }
 
 void TierTransferManager::CompleteStoreLoad(std::uint32_t op_id) {
     store_loads_.erase(op_id);
+}
+
+std::optional<TierTransferManager::FailedStoreLoad> TierTransferManager::FailStoreLoad(std::uint32_t op_id) {
+    const auto it = store_loads_.find(op_id);
+    if (it == store_loads_.end()) {
+        return std::nullopt;
+    }
+    FailedStoreLoad failure{.request_id = it->second.request_id};
+    failure.destinations.reserve(it->second.transfers.size());
+    for (const KvCacheCoordinator::StoreTransfer& transfer : it->second.transfers) {
+        failure.destinations.emplace_back(transfer.group_id, transfer.destination->Location());
+    }
+    store_loads_.erase(it);
+    return failure;
 }
 
 std::vector<CacheTransfer> TierTransferManager::resolveTransfers(std::span<const BlockTransfer> block_transfers) const {
@@ -159,7 +174,7 @@ std::vector<CacheTransfer> TierTransferManager::resolveTransfers(std::span<const
                 content_hash = meta->key.content_hash;
                 cache_block_offset = meta->key.cache_block_offset;
             } else if (auto dmeta = coordinator_.CachedBlockMetadataForDevice(block_transfer.source->Location(),
-                                                                               block_transfer.group_id)) {
+                                                                              block_transfer.group_id)) {
                 content_hash = dmeta->key.content_hash;
                 cache_block_offset = dmeta->key.cache_block_offset;
             }

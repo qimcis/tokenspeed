@@ -136,6 +136,9 @@ public:
     void ReclaimExpired(std::span<BlockTable> tables, std::int32_t num_computed_tokens);
     void ConsumeReservedTokens(std::span<BlockTable> tables, std::int32_t num_tokens);
     void Free(std::span<BlockTable> tables);
+    // Remove Device cache entries backed by a failed external restore. The
+    // caller must first release every request/transfer owner of these blocks.
+    void DiscardDeviceCachedBlocks(std::span<const std::pair<std::uint32_t, CacheBlockLocation>> blocks);
     // Clears only the Device prefix index. Returns false without mutation when
     // any cached block still has an owner outside its Manager.
     bool ClearDeviceCache();
@@ -165,10 +168,10 @@ public:
     void CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& key);
     // Lookup cached block metadata by location, trying Host then Device tier.
     // Used by TierTransferManager to propagate content hashes to the runtime.
-    std::optional<KvCacheManager::CachedBlockMetadata> CachedBlockMetadataForHost(
-        CacheBlockLocation location, std::uint32_t group_id) const;
-    std::optional<KvCacheManager::CachedBlockMetadata> CachedBlockMetadataForDevice(
-        CacheBlockLocation location, std::uint32_t group_id) const;
+    std::optional<KvCacheManager::CachedBlockMetadata> CachedBlockMetadataForHost(CacheBlockLocation location,
+                                                                                  std::uint32_t group_id) const;
+    std::optional<KvCacheManager::CachedBlockMetadata> CachedBlockMetadataForDevice(CacheBlockLocation location,
+                                                                                    std::uint32_t group_id) const;
 
     // Reports real device-cache entry insertions and removals. The scheduler
     // folds the per-group mutations into one externally visible prefix event.

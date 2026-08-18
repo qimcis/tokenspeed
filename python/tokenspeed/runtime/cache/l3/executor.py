@@ -23,9 +23,15 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
+import threading
+import time
 from collections.abc import Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, NamedTuple
 
 import torch
@@ -56,7 +62,81 @@ class _StashSlot:
 class _Ack(NamedTuple):
     finish_event: object
     op_ids: list[int]
-    stash_slot: _StashSlot
+    stash_slot: _StashSlot | None
+
+
+@dataclass
+class _PendingLoadSubmission:
+    op_ids: tuple[int, ...]
+    content_hashes: tuple[str, ...]
+    future: Future
+    status: str = "pending"
+    error: str | None = None
+
+
+@dataclass
+class _PendingStoreSubmission:
+    content_hashes: tuple[str, ...]
+    future: Future
+
+
+@dataclass
+class _PresenceProbe:
+    hashes: tuple[str, ...]
+    future: Future
+
+
+class _StorePriorityGate:
+    """Serialize a Store client while allowing queued loads to pass writes."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._active = False
+        self._waiting_reads = 0
+
+    @contextmanager
+    def call(self, *, read: bool):
+        with self._condition:
+            if read:
+                self._waiting_reads += 1
+            try:
+                while self._active or (not read and self._waiting_reads):
+                    self._condition.wait()
+                self._active = True
+            finally:
+                if read:
+                    self._waiting_reads -= 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._active = False
+                self._condition.notify_all()
+
+
+class _ReadPriorityState:
+    """Let background writers yield while one or more loads are pending."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._pending_reads = 0
+
+    def begin_read(self) -> None:
+        with self._condition:
+            self._pending_reads += 1
+
+    def end_read(self) -> None:
+        with self._condition:
+            self._pending_reads -= 1
+            if self._pending_reads < 0:
+                raise RuntimeError("L3 read-priority counter underflow")
+            if self._pending_reads == 0:
+                self._condition.notify_all()
+
+    def wait_for_idle(self) -> None:
+        with self._condition:
+            while self._pending_reads:
+                self._condition.wait()
 
 
 def _cache_stream_priorities() -> tuple[int | None, int | None]:
@@ -88,17 +168,12 @@ def _build_store_namespace(
     *,
     model_id: str | None,
     model_revision: str | None,
+    model_fingerprint: str | None,
     cache_abi_fingerprint: str | None,
     extra_tag: str | None,
 ) -> str:
-    if extra_tag is not None and extra_tag.strip():
-        return _sanitize_namespace_component(extra_tag.strip())
     if model_id is None or not str(model_id).strip():
-        raise ValueError(
-            "L3 Store namespace requires a model identifier: set "
-            '--kvstore-storage-backend-extra-config \'{"extra_backend_tag": "<ns>"}\' '
-            "or ensure the model path/revision is available"
-        )
+        raise ValueError("L3 Store namespace requires a model identifier")
     model_component = _sanitize_namespace_component(str(model_id))
     revision_component = (
         _sanitize_namespace_component(str(model_revision))
@@ -110,9 +185,63 @@ def _build_store_namespace(
         if cache_abi_fingerprint
         else "unknown-abi"
     )
-    raw = f"{model_component}@{revision_component}:{abi_component}"
+    fingerprint_component = (
+        _sanitize_namespace_component(model_fingerprint)
+        if model_fingerprint
+        else "unknown-model"
+    )
+    tag_component = _sanitize_namespace_component(extra_tag) if extra_tag else "default"
+    raw = (
+        f"{model_component}@{revision_component}:{fingerprint_component}:"
+        f"{abi_component}:{tag_component}"
+    )
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
-    return f"{_sanitize_namespace_component(model_component)}_{digest}"
+    return f"{tag_component}_{_sanitize_namespace_component(model_component)}_{digest}"
+
+
+def _fingerprint_model_artifacts(model_id: str | None) -> str | None:
+    """Cheaply version a local checkpoint without hashing every weight byte.
+
+    Hugging Face snapshots normally expose immutable blob paths. For mutable
+    local directories, include file identity plus samples from each weight so
+    replacing a checkpoint at the same path changes the L3 namespace.
+    """
+    if not model_id:
+        return None
+    root = Path(model_id)
+    if not root.is_dir():
+        return None
+    candidates: list[Path] = []
+    for pattern in (
+        "config.json",
+        "*.safetensors.index.json",
+        "*.bin.index.json",
+        "*.safetensors",
+        "*.bin",
+        "*.pt",
+    ):
+        candidates.extend(root.glob(pattern))
+    candidates = sorted(set(candidates), key=lambda path: path.name)
+    if not candidates:
+        return None
+    digest = hashlib.sha256()
+    sample_bytes = 1024 * 1024
+    for path in candidates:
+        try:
+            stat = path.stat()
+            digest.update(path.name.encode("utf-8"))
+            digest.update(f":{stat.st_size}:{stat.st_mtime_ns}:".encode("ascii"))
+            with path.open("rb") as handle:
+                if stat.st_size <= sample_bytes * 2:
+                    digest.update(handle.read())
+                else:
+                    digest.update(handle.read(sample_bytes))
+                    handle.seek(-sample_bytes, os.SEEK_END)
+                    digest.update(handle.read(sample_bytes))
+        except OSError as exc:
+            logger.warning("L3 namespace could not fingerprint %s: %s", path, exc)
+            return None
+    return digest.hexdigest()[:16]
 
 
 def _fingerprint_cache_layout(layout: Any) -> str:
@@ -170,6 +299,12 @@ class L3CacheExecutor:
         model_revision: str | None = None,
         cache_abi_fingerprint: str | None = None,
         store_namespace: str | None = None,
+        max_stash_bytes: int = 4 * 1024**3,
+        store_probe_ttl: float = 1.0,
+        io_workers: int = 2,
+        direct_gpu: str = "auto",
+        direct_gpu_chunk_objects: int = 2,
+        host_pipeline_chunk_pages: int = 2,
     ) -> None:
         if store is None:
             raise ValueError("L3 requires an initialized Store backend")
@@ -188,6 +323,18 @@ class L3CacheExecutor:
         self._model_id = model_id
         self._model_revision = model_revision
         self._cache_abi_fingerprint = cache_abi_fingerprint
+        if max_stash_bytes <= 0:
+            raise ValueError("L3 max_stash_bytes must be positive")
+        if store_probe_ttl < 0:
+            raise ValueError("L3 store_probe_ttl must be non-negative")
+        if io_workers <= 0:
+            raise ValueError("L3 io_workers must be positive")
+        if direct_gpu not in ("auto", "on", "off"):
+            raise ValueError("L3 direct_gpu must be one of: auto, on, off")
+        if direct_gpu_chunk_objects <= 0:
+            raise ValueError("L3 direct_gpu_chunk_objects must be positive")
+        if host_pipeline_chunk_pages <= 0:
+            raise ValueError("L3 host_pipeline_chunk_pages must be positive")
 
         target_layout = device_pool.cache_transfer_layout()
         draft_layout = (
@@ -208,7 +355,34 @@ class L3CacheExecutor:
 
         self._stash_slots: list[_StashSlot] = []
         self._registered_ptrs: set[int] = set()
+        self._stash_total_bytes = 0
+        self._max_stash_bytes = int(max_stash_bytes)
+        self._stash_condition = threading.Condition()
+        self._store_lock = threading.RLock()
+        self._store_gate = _StorePriorityGate()
+        self._write_store_gate = _StorePriorityGate()
+        self._read_priority = _ReadPriorityState()
+        self._write_store = store
+        self._load_acks_lock = threading.Lock()
         self._closed = False
+        # Reads/probes and writes have separate pools so background eviction
+        # writes cannot occupy every worker needed by a TTFT-critical load.
+        self._io_pool = ThreadPoolExecutor(
+            max_workers=io_workers, thread_name_prefix="tokenspeed-l3-io"
+        )
+        self._write_pool = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="tokenspeed-l3-write"
+        )
+        self._pending_load_submissions: dict[
+            tuple[int, ...], _PendingLoadSubmission
+        ] = {}
+        self._pending_store_submissions: list[_PendingStoreSubmission] = []
+        self._store_index_outcomes: dict[str, bool] = {}
+        self._presence_cache: dict[str, tuple[bool, float]] = {}
+        self._presence_probe: _PresenceProbe | None = None
+        self._store_probe_ttl = float(store_probe_ttl)
+        self._direct_gpu_chunk_objects = int(direct_gpu_chunk_objects)
+        self._host_pipeline_chunk_pages = int(host_pipeline_chunk_pages)
 
         pool_layouts = [(device_pool, target_layout)]
         if draft_pool is not None and self.layout is not target_layout:
@@ -223,40 +397,87 @@ class L3CacheExecutor:
         self.write_stream = _new_cache_stream(write_priority)
         self.load_stream = _new_cache_stream(load_priority)
 
-        self._load_acks: list[_Ack] = []
-        self._ready_store_hashes: list[str] = []
+        self._direct_gpu_io = self._configure_direct_gpu_io(direct_gpu)
 
-        if self._explicit_namespace is not None:
-            self._store_namespace = _sanitize_namespace_component(
-                self._explicit_namespace
-            )
-        else:
-            abi = self._cache_abi_fingerprint or _fingerprint_cache_layout(self.layout)
-            # Include TP size in ABI so different sharding doesn't collide.
-            if self.tp_size is not None and self.tp_size > 1:
-                abi = f"{abi}_tp{self.tp_size}"
-            self._store_namespace = _build_store_namespace(
-                model_id=self._model_id,
-                model_revision=self._model_revision,
-                cache_abi_fingerprint=abi,
-                extra_tag=getattr(store, "extra_backend_tag", None),
-            )
+        self._load_acks: list[_Ack] = []
+
+        abi = self._cache_abi_fingerprint or _fingerprint_cache_layout(self.layout)
+        # Include TP size in ABI so different sharding doesn't collide.
+        if self.tp_size is not None and self.tp_size > 1:
+            abi = f"{abi}_tp{self.tp_size}"
+        self._store_namespace = _build_store_namespace(
+            model_id=self._model_id,
+            model_revision=self._model_revision,
+            model_fingerprint=_fingerprint_model_artifacts(self._model_id),
+            cache_abi_fingerprint=abi,
+            extra_tag=(
+                self._explicit_namespace or getattr(store, "extra_backend_tag", None)
+            ),
+        )
         # L3 executor owns namespacing via key prefix; disable backend's
         # extra_backend_tag prefix to avoid double-namespacing (e.g.
         # "ns:ns:key"). The executor's namespace already incorporates
         # extra_backend_tag when explicitly provided.
         try:
-            if getattr(store, "extra_backend_tag", None) is not None:
-                store.extra_backend_tag = None  # type: ignore[attr-defined]
+            for backend in {store, self._write_store}:
+                if getattr(backend, "extra_backend_tag", None) is not None:
+                    backend.extra_backend_tag = None  # type: ignore[attr-defined]
         except Exception:
             pass
 
         logger.info(
-            "L3 Store: enabled backend=%s groups=%s namespace=%s",
+            "L3 Store: enabled backend=%s groups=%s namespace=%s direct_gpu=%s",
             type(store).__name__,
             scheduler_group_ids,
             self._store_namespace,
+            self._direct_gpu_io,
         )
+
+    def _configure_direct_gpu_io(self, mode: str) -> bool:
+        if mode == "off":
+            return False
+        if not bool(getattr(self.store, "supports_device_memory", False)):
+            if mode == "on":
+                raise RuntimeError("L3 Store does not support direct GPU buffers")
+            return False
+        try:
+            for buffer in self.layout.buffers:
+                if not isinstance(buffer, torch.Tensor) or not buffer.is_cuda:
+                    raise RuntimeError(
+                        "cache transfer layout contains a non-CUDA buffer"
+                    )
+                if not self._ensure_registered(buffer):
+                    raise RuntimeError("Store rejected a CUDA cache buffer")
+        except Exception as exc:
+            if mode == "on":
+                raise RuntimeError("L3 direct GPU registration failed") from exc
+            logger.warning(
+                "L3 direct GPU I/O unavailable; using pinned-host pipeline: %s", exc
+            )
+            return False
+        return True
+
+    def _ensure_store_gate(self) -> None:
+        if not hasattr(self, "_store_gate"):
+            self._store_gate = _StorePriorityGate()
+        if not hasattr(self, "_write_store_gate"):
+            self._write_store_gate = _StorePriorityGate()
+
+    def _store_call(self, *, read: bool):
+        self._ensure_store_gate()
+        gate = (
+            self._write_store_gate
+            if not read and self._write_store is not self.store
+            else self._store_gate
+        )
+        return gate.call(read=read)
+
+    def _registered_stores(self) -> tuple[BaseKVStore, ...]:
+        stores = [self.store]
+        write_store = getattr(self, "_write_store", None)
+        if write_store is not None and write_store is not self.store:
+            stores.append(write_store)
+        return tuple(store for store in stores if store is not None)
 
     def _ensure_registered(self, buffer: torch.Tensor) -> bool:
         if self.store is None:
@@ -266,18 +487,25 @@ class L3CacheExecutor:
             return True
         size = int(buffer.numel() * buffer.element_size())
         try:
-            result = self.store.register_buffer(ptr, size)
+            with self._store_lock:
+                results = [
+                    backend.register_buffer(ptr, size)
+                    for backend in self._registered_stores()
+                ]
         except Exception as exc:
             logger.warning(
                 "L3: register_buffer failed ptr=%s size=%s: %s", ptr, size, exc
             )
             return False
-        if result is not None and int(result) != 0:
+        failed = [
+            result for result in results if result is not None and int(result) != 0
+        ]
+        if failed:
             logger.warning(
-                "L3: register_buffer failed ptr=%s size=%s ret=%s",
+                "L3: register_buffer failed ptr=%s size=%s results=%s",
                 ptr,
                 size,
-                result,
+                results,
             )
             return False
         self._registered_ptrs.add(ptr)
@@ -289,33 +517,65 @@ class L3CacheExecutor:
         # MooncakeHostMemAllocator) can never satisfy, and _ensure_registered
         # already exposes the same memory to the Store backend for zero-copy
         # put/get.
-        buffer = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
-        slot = _StashSlot(buffer=buffer, capacity=nbytes, busy=True)
-        self._stash_slots.append(slot)
-        if not self._ensure_registered(buffer):
-            slot.busy = False
-            raise RuntimeError(f"failed to register L3 host buffer ({nbytes} bytes)")
-        return slot
+        self._ensure_stash_state()
+        with self._stash_condition:
+            if self._stash_total_bytes + nbytes > self._max_stash_bytes:
+                raise RuntimeError(
+                    "L3 pinned stash limit exceeded: "
+                    f"requested={nbytes} retained={self._stash_total_bytes} "
+                    f"limit={self._max_stash_bytes}"
+                )
+            buffer = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+            slot = _StashSlot(buffer=buffer, capacity=nbytes, busy=True)
+            self._stash_slots.append(slot)
+            self._stash_total_bytes += nbytes
+            if not self._ensure_registered(buffer):
+                slot.busy = False
+                self._stash_slots.pop()
+                self._stash_total_bytes -= nbytes
+                raise RuntimeError(
+                    f"failed to register L3 host buffer ({nbytes} bytes)"
+                )
+            return slot
+
+    def _ensure_stash_state(self) -> None:
+        # A few focused unit tests instantiate the executor via __new__.
+        if not hasattr(self, "_stash_condition"):
+            self._stash_condition = threading.Condition()
+        if not hasattr(self, "_stash_total_bytes"):
+            self._stash_total_bytes = sum(
+                int(slot.capacity) for slot in getattr(self, "_stash_slots", ())
+            )
+        if not hasattr(self, "_max_stash_bytes"):
+            self._max_stash_bytes = 1 << 62
+        if not hasattr(self, "_store_lock"):
+            self._store_lock = threading.RLock()
 
     def _acquire_stash(self, nbytes: int) -> tuple[_StashSlot, torch.Tensor]:
-        for slot in self._stash_slots:
-            if not slot.busy and slot.capacity >= nbytes:
-                slot.busy = True
-                return slot, slot.buffer[:nbytes]
+        self._ensure_stash_state()
+        with self._stash_condition:
+            for slot in self._stash_slots:
+                if not slot.busy and slot.capacity >= nbytes:
+                    slot.busy = True
+                    return slot, slot.buffer[:nbytes]
         slot = self._allocate_stash(nbytes)
         return slot, slot.buffer[:nbytes]
 
-    @staticmethod
-    def _release_stash(slot: _StashSlot) -> None:
-        slot.busy = False
+    def _release_stash(self, slot: _StashSlot) -> None:
+        self._ensure_stash_state()
+        with self._stash_condition:
+            slot.busy = False
+            self._stash_condition.notify()
 
     def _transfer_ranges(
         self,
         transfers: Sequence[tuple[int, int, int]],
         field_ids: set[str] | None = None,
+        *,
+        host_base_offset: int = 0,
     ) -> list[tuple[int, int, int, int]]:
         ranges: list[tuple[int, int, int, int]] = []
-        host_offset = 0
+        host_offset = host_base_offset
         for group_index, device_block_id, _host_block_id in transfers:
             group = self.layout.groups[group_index]
             for field in group.fields:
@@ -338,6 +598,34 @@ class L3CacheExecutor:
                 )
                 host_offset += field.payload_bytes
         return ranges
+
+    def _device_transfer_buffers(
+        self, transfers: Sequence[tuple[int, int, int]]
+    ) -> tuple[list[list[int]], list[list[int]]]:
+        """Build key-major scatter/gather vectors over cache fields."""
+        all_ptrs: list[list[int]] = []
+        all_sizes: list[list[int]] = []
+        for group_index, device_block_id, _host_block_id in transfers:
+            ptrs: list[int] = []
+            sizes: list[int] = []
+            for field in self.layout.groups[group_index].fields:
+                buffer = self.layout.buffers[field.device_buffer_index]
+                offset = (
+                    field.device_block_zero_offset_bytes
+                    + device_block_id * field.block_stride_bytes
+                )
+                size = field.payload_bytes
+                capacity = int(buffer.numel() * buffer.element_size())
+                if offset < 0 or offset + size > capacity:
+                    raise RuntimeError(
+                        "L3 direct GPU range exceeds cache allocation: "
+                        f"offset={offset} size={size} capacity={capacity}"
+                    )
+                ptrs.append(int(buffer.data_ptr()) + offset)
+                sizes.append(size)
+            all_ptrs.append(ptrs)
+            all_sizes.append(sizes)
+        return all_ptrs, all_sizes
 
     @staticmethod
     def _operation_metadata(
@@ -366,7 +654,9 @@ class L3CacheExecutor:
             offsets.extend([0] * (transfer_count - len(offsets)))
         return hashes[:transfer_count], offsets[:transfer_count]
 
-    def submit_plan(self, plan: Any) -> None:
+    def submit_plan(
+        self, plan: Any, *, cache_zero_event: object | None = None
+    ) -> tuple[int, ...]:
         write_op_ids: list[int] = []
         write_transfers: list[tuple[int, int, int]] = []
         write_hashes: list[str] = []
@@ -418,27 +708,97 @@ class L3CacheExecutor:
             else:
                 raise TypeError(f"unsupported cache op {type(operation).__name__}")
 
-        load_error: Exception | None = None
-        load_index: int | None = None
+        load_key = tuple(_ordered_unique(store_op_ids))
+        if load_key:
+            if load_key in self._pending_load_submissions:
+                raise RuntimeError(f"duplicate L3 load submission {load_key}")
+            self._read_priority.begin_read()
+            try:
+                future = self._io_pool.submit(
+                    self._run_store_get,
+                    load_key,
+                    tuple(store_transfers),
+                    tuple(store_hashes),
+                    tuple(store_offsets),
+                    cache_zero_event,
+                )
+            except Exception:
+                self._read_priority.end_read()
+                raise
+            self._pending_load_submissions[load_key] = _PendingLoadSubmission(
+                op_ids=load_key,
+                content_hashes=tuple(store_hashes),
+                future=future,
+            )
+        if write_op_ids and write_transfers:
+            hashes = tuple(hash_value for hash_value in write_hashes if hash_value)
+            ready_event = torch.cuda.Event()
+            ready_event.record()
+            future = self._write_pool.submit(
+                self._run_store_put,
+                tuple(write_transfers),
+                tuple(write_hashes),
+                tuple(write_offsets),
+                ready_event,
+            )
+            self._pending_store_submissions.append(
+                _PendingStoreSubmission(content_hashes=hashes, future=future)
+            )
+        return load_key
+
+    def _run_store_get(
+        self,
+        op_ids: tuple[int, ...],
+        transfers: tuple[tuple[int, int, int], ...],
+        content_hashes: tuple[str, ...],
+        cache_block_offsets: tuple[int, ...],
+        cache_zero_event: object | None,
+    ) -> int:
         try:
+            # Page sanitization is launched asynchronously by the scheduler.
+            # Order the H2D Store restore after it without blocking the event loop.
+            if cache_zero_event is not None:
+                cache_zero_event.synchronize()
             load_index = self._start_loading(
-                store_op_ids,
-                store_transfers,
-                content_hashes=store_hashes or None,
-                cache_block_offsets=store_offsets or None,
+                op_ids,
+                transfers,
+                content_hashes=content_hashes,
+                cache_block_offsets=cache_block_offsets,
+            )
+            if load_index is None:
+                raise RuntimeError("L3 Store load produced no load index")
+            for tracker, _ in self._load_trackers:
+                tracker.set_consumers(load_index)
+            return load_index
+        except Exception:
+            for tracker, _ in self._load_trackers:
+                tracker.set_consumers(-1)
+            raise
+        finally:
+            self._read_priority.end_read()
+
+    def _run_store_put(
+        self,
+        transfers: tuple[tuple[int, int, int], ...],
+        content_hashes: tuple[str, ...],
+        cache_block_offsets: tuple[int, ...],
+        ready_event: object | None = None,
+    ) -> dict[str, bool]:
+        requested = tuple(dict.fromkeys(value for value in content_hashes if value))
+        try:
+            if ready_event is not None:
+                ready_event.synchronize()
+            completed = set(
+                self._do_store_put(
+                    transfers,
+                    content_hashes,
+                    cache_block_offsets,
+                )
             )
         except Exception as exc:
-            load_error = exc
-        for tracker, _ in self._load_trackers:
-            tracker.set_consumers(load_index if load_index is not None else -1)
-        self._start_writing(
-            write_op_ids,
-            write_transfers,
-            content_hashes=write_hashes or None,
-            cache_block_offsets=write_offsets or None,
-        )
-        if load_error is not None:
-            raise load_error
+            logger.warning("L3 put failed: %s", exc)
+            completed = set()
+        return {hash_value: hash_value in completed for hash_value in requested}
 
     @staticmethod
     def _append_transfers(
@@ -476,16 +836,12 @@ class L3CacheExecutor:
     ) -> None:
         if not op_ids or not transfers:
             return
-        try:
-            completed_hashes = self._do_store_put(
-                transfers, content_hashes, cache_block_offsets
-            )
-        except Exception as exc:
-            logger.warning(
-                "L3 put failed (op_ids=%s): %s", _ordered_unique(op_ids), exc
-            )
-            return
-        self._ready_store_hashes.extend(completed_hashes)
+        outcome = self._run_store_put(
+            tuple(transfers),
+            tuple(content_hashes or ()),
+            tuple(cache_block_offsets or ()),
+        )
+        self._store_index_outcomes.update(outcome)
 
     def _do_store_put(
         self,
@@ -530,7 +886,9 @@ class L3CacheExecutor:
 
         keys = [record[2] for record in records]
         try:
-            exists = self.store.batch_exists(keys)
+            self._read_priority.wait_for_idle()
+            with self._store_call(read=False):
+                exists = self._write_store.batch_exists(keys)
             if len(exists) != len(keys):
                 raise RuntimeError(
                     f"L3 batch_exists length mismatch {len(exists)} != {len(keys)}"
@@ -543,6 +901,34 @@ class L3CacheExecutor:
         missing_record_indices = [
             index for index, value in enumerate(succeeded) if not value
         ]
+        if missing_record_indices:
+            missing_transfers = [
+                transfers[records[index][0]] for index in missing_record_indices
+            ]
+            missing_keys = [keys[index] for index in missing_record_indices]
+            if getattr(self, "_direct_gpu_io", False):
+                ptrs, sizes = self._device_transfer_buffers(missing_transfers)
+                results = []
+                chunk_size = self._direct_gpu_chunk_objects
+                for begin in range(0, len(missing_keys), chunk_size):
+                    end = min(begin + chunk_size, len(missing_keys))
+                    self._read_priority.wait_for_idle()
+                    with self._store_call(read=False):
+                        results.extend(
+                            self._write_store.batch_put_from(
+                                missing_keys[begin:end],
+                                ptrs[begin:end],
+                                sizes[begin:end],
+                            )
+                        )
+                if len(results) != len(missing_keys):
+                    raise RuntimeError(
+                        "L3 direct batch_put_from length mismatch "
+                        f"{len(results)} != {len(missing_keys)}"
+                    )
+                for record_index, result in zip(missing_record_indices, results):
+                    succeeded[record_index] = result == 0
+                missing_record_indices = []
         if missing_record_indices:
             missing_transfers = [
                 transfers[records[index][0]] for index in missing_record_indices
@@ -578,7 +964,19 @@ class L3CacheExecutor:
                     sizes.append(nbytes)
                     offset += nbytes
                 missing_keys = [keys[index] for index in missing_record_indices]
-                results = self.store.batch_put_from(missing_keys, ptrs, sizes)
+                results = []
+                chunk_size = self._host_pipeline_chunk_pages
+                for begin in range(0, len(missing_keys), chunk_size):
+                    end = min(begin + chunk_size, len(missing_keys))
+                    self._read_priority.wait_for_idle()
+                    with self._store_call(read=False):
+                        results.extend(
+                            self._write_store.batch_put_from(
+                                missing_keys[begin:end],
+                                ptrs[begin:end],
+                                sizes[begin:end],
+                            )
+                        )
                 if len(results) != len(missing_keys):
                     raise RuntimeError(
                         "L3 batch_put_from length mismatch "
@@ -629,8 +1027,6 @@ class L3CacheExecutor:
     ) -> int:
         if self.store is None:
             raise RuntimeError("L3 Store is closed")
-        from tokenspeed_kernel.ops.kvcache.host_transfer import transfer_cache_ranges
-
         if content_hashes is None or len(content_hashes) != len(transfers):
             raise RuntimeError("Store load is missing content hashes")
         keys: list[str] = []
@@ -660,86 +1056,386 @@ class L3CacheExecutor:
         total_bytes = sum(sizes)
         if total_bytes <= 0:
             raise RuntimeError("Store load requested zero bytes")
+        if getattr(self, "_direct_gpu_io", False):
+            return self._do_direct_store_get(op_ids, transfers, keys, sizes)
+        return self._do_pipelined_host_store_get(
+            op_ids, transfers, keys, sizes, total_bytes
+        )
+
+    @staticmethod
+    def _validate_store_reads(
+        keys: Sequence[str], results: Sequence[int], sizes: Sequence[int]
+    ) -> None:
+        if len(results) != len(keys):
+            raise RuntimeError(
+                f"L3 batch_get_into length mismatch {len(results)} != {len(keys)}"
+            )
+        short_reads = [
+            (key, result, requested)
+            for key, result, requested in zip(keys, results, sizes)
+            if result is None or int(result) != requested
+        ]
+        if short_reads:
+            details = ", ".join(
+                f"{key}: got {result}, expected {requested}"
+                for key, result, requested in short_reads
+            )
+            raise RuntimeError(f"incomplete L3 Store read ({details})")
+
+    def _begin_load_tracking(self):
+        load_index = None
+        tracked = []
+        consumer_offset = 0
+        for tracker, consumer_count in self._load_trackers:
+            current_load_index = tracker.begin_load()
+            if load_index is None:
+                load_index = current_load_index
+            elif current_load_index != load_index:
+                raise RuntimeError("target and draft Store-load trackers diverged")
+            load_events = tracker.event_sets[current_load_index]
+            load_events.start_event.record()
+            load_events.start_event.wait(self.load_stream)
+            tracked.append((load_events, consumer_offset, consumer_count))
+            consumer_offset += consumer_count
+        if load_index is None or not tracked:
+            raise RuntimeError("cache transfer layout has no layer consumers")
+        return load_index, tracked
+
+    def _do_direct_store_get(
+        self,
+        op_ids: Sequence[int],
+        transfers: Sequence[tuple[int, int, int]],
+        keys: Sequence[str],
+        sizes: Sequence[int],
+    ) -> int:
+        if self.store is None:
+            raise RuntimeError("L3 Store is closed")
+        ptrs, field_sizes = self._device_transfer_buffers(transfers)
+        started = time.perf_counter()
+        chunk_size = self._direct_gpu_chunk_objects
+        results: list[int] = []
+        for begin in range(0, len(keys), chunk_size):
+            end = min(begin + chunk_size, len(keys))
+            chunk_keys = list(keys[begin:end])
+            chunk_sizes = list(sizes[begin:end])
+            with self._store_call(read=True):
+                chunk_results = self.store.batch_get_into(
+                    chunk_keys,
+                    ptrs[begin:end],
+                    field_sizes[begin:end],
+                )
+            # Validate each completed chunk before issuing another one. A short
+            # read raises through the single load-submission future, so the
+            # scheduler observes one failed load and requeues/recomputes every
+            # admitted request even if earlier chunks populated some pages.
+            self._validate_store_reads(chunk_keys, chunk_results, chunk_sizes)
+            results.extend(chunk_results)
+        store_ms = (time.perf_counter() - started) * 1000
+        # Keep one aggregate outcome for the scheduler-facing StoreLoadOp.
+        self._validate_store_reads(keys, results, sizes)
+
+        load_index, tracked = self._begin_load_tracking()
+        finish = None
+        for load_events, _consumer_offset, consumer_count in tracked:
+            for layer_index in range(consumer_count):
+                finish = torch.cuda.Event()
+                finish.record(self.load_stream)
+                load_events.layer_done_events[layer_index] = finish
+        if finish is None:
+            raise RuntimeError("cache transfer layout has no layer consumers")
+        with self._load_acks_lock:
+            self._load_acks.append(_Ack(finish, list(op_ids), None))
+        logger.info(
+            "L3 load direct_gpu objects=%s bytes=%s chunks=%s store_ms=%.3f",
+            len(keys),
+            sum(sizes),
+            (len(keys) + chunk_size - 1) // chunk_size,
+            store_ms,
+        )
+        return load_index
+
+    def _do_pipelined_host_store_get(
+        self,
+        op_ids: Sequence[int],
+        transfers: Sequence[tuple[int, int, int]],
+        keys: Sequence[str],
+        sizes: Sequence[int],
+        total_bytes: int,
+    ) -> int:
+        if self.store is None:
+            raise RuntimeError("L3 Store is closed")
+        from tokenspeed_kernel.ops.kvcache.host_transfer import transfer_cache_ranges
+
         slot, stash = self._acquire_stash(total_bytes)
         retained_for_async_copy = False
         try:
             ptr_base = int(stash.data_ptr())
-            ptrs: list[int] = []
+            byte_offsets: list[int] = []
             offset = 0
             for nbytes in sizes:
-                ptrs.append(ptr_base + offset)
+                byte_offsets.append(offset)
                 offset += nbytes
-            results = self.store.batch_get_into(keys, ptrs, sizes)
-            if len(results) != len(keys):
-                raise RuntimeError(
-                    f"L3 batch_get_into length mismatch {len(results)} != {len(keys)}"
-                )
-            short_reads = [
-                (key, result, requested)
-                for key, result, requested in zip(keys, results, sizes)
-                if result is None or int(result) != requested
-            ]
-            if short_reads:
-                details = ", ".join(
-                    f"{key}: got {result}, expected {requested}"
-                    for key, result, requested in short_reads
-                )
-                raise RuntimeError(f"incomplete L3 Store read ({details})")
-
-            load_index = None
-            consumer_offset = 0
+            load_index, tracked = self._begin_load_tracking()
             finish = None
-            for tracker, consumer_count in self._load_trackers:
-                current_load_index = tracker.begin_load()
-                if load_index is None:
-                    load_index = current_load_index
-                elif current_load_index != load_index:
-                    raise RuntimeError("target and draft Store-load trackers diverged")
-                load_events = tracker.event_sets[current_load_index]
-                load_events.start_event.record()
-                load_events.start_event.wait(self.load_stream)
-                for layer_index in range(consumer_count):
-                    consumer = self.layout.consumers[consumer_offset + layer_index]
-                    transfer_cache_ranges(
-                        "h2d",
-                        self.layout.buffers,
-                        stash,
-                        self._transfer_ranges(transfers, set(consumer)),
-                        self.load_stream,
-                        backend=self.transfer_backend,
+            store_seconds = 0.0
+            enqueue_seconds = 0.0
+            chunk_size = self._host_pipeline_chunk_pages
+            for begin in range(0, len(keys), chunk_size):
+                end = min(begin + chunk_size, len(keys))
+                chunk_keys = list(keys[begin:end])
+                chunk_sizes = list(sizes[begin:end])
+                chunk_ptrs = [ptr_base + value for value in byte_offsets[begin:end]]
+                started = time.perf_counter()
+                with self._store_call(read=True):
+                    results = self.store.batch_get_into(
+                        chunk_keys, chunk_ptrs, chunk_sizes
                     )
-                    finish = torch.cuda.Event()
-                    finish.record(self.load_stream)
-                    load_events.layer_done_events[layer_index] = finish
-                consumer_offset += consumer_count
-            if load_index is None or finish is None:
+                store_seconds += time.perf_counter() - started
+                self._validate_store_reads(chunk_keys, results, chunk_sizes)
+
+                started = time.perf_counter()
+                chunk_transfers = transfers[begin:end]
+                for load_events, consumer_offset, consumer_count in tracked:
+                    for layer_index in range(consumer_count):
+                        consumer = self.layout.consumers[consumer_offset + layer_index]
+                        transfer_cache_ranges(
+                            "h2d",
+                            self.layout.buffers,
+                            stash,
+                            self._transfer_ranges(
+                                chunk_transfers,
+                                set(consumer),
+                                host_base_offset=byte_offsets[begin],
+                            ),
+                            self.load_stream,
+                            backend=self.transfer_backend,
+                        )
+                        finish = torch.cuda.Event()
+                        finish.record(self.load_stream)
+                        load_events.layer_done_events[layer_index] = finish
+                enqueue_seconds += time.perf_counter() - started
+            if finish is None:
                 raise RuntimeError("cache transfer layout has no layer consumers")
-            self._load_acks.append(_Ack(finish, list(op_ids), slot))
+            with self._load_acks_lock:
+                self._load_acks.append(_Ack(finish, list(op_ids), slot))
             retained_for_async_copy = True
+            logger.info(
+                "L3 load host_pipeline objects=%s bytes=%s chunks=%s "
+                "store_ms=%.3f enqueue_ms=%.3f",
+                len(keys),
+                total_bytes,
+                (len(keys) + chunk_size - 1) // chunk_size,
+                store_seconds * 1000,
+                enqueue_seconds * 1000,
+            )
             return load_index
         finally:
             if not retained_for_async_copy:
                 self._release_stash(slot)
 
     def poll_results(self) -> list:
+        self._poll_store_submissions()
         results: list = []
-        self._load_acks[:] = self._drain_loads(self._load_acks, results)
+        with self._load_acks_lock:
+            self._load_acks[:] = self._drain_loads(self._load_acks, results)
         return results
+
+    def _poll_store_submissions(self) -> None:
+        pending: list[_PendingStoreSubmission] = []
+        now = time.monotonic()
+        for submission in self._pending_store_submissions:
+            if not submission.future.done():
+                pending.append(submission)
+                continue
+            try:
+                outcome = submission.future.result()
+            except Exception as exc:
+                logger.warning("L3 background put failed: %s", exc)
+                outcome = {
+                    hash_value: False for hash_value in submission.content_hashes
+                }
+            self._store_index_outcomes.update(outcome)
+            for hash_value, present in outcome.items():
+                self._presence_cache[hash_value] = (
+                    bool(present),
+                    now + self._store_probe_ttl,
+                )
+        self._pending_store_submissions = pending
+
+    def load_submission_status(
+        self, op_ids: Sequence[int]
+    ) -> tuple[str, list[str], str | None]:
+        key = tuple(_ordered_unique(op_ids))
+        submission = self._pending_load_submissions.get(key)
+        if submission is None:
+            return "failed", [], f"unknown L3 load submission {key}"
+        if submission.status == "pending" and submission.future.done():
+            try:
+                submission.future.result()
+                submission.status = "succeeded"
+                self.record_presence(submission.content_hashes, present=True)
+            except Exception as exc:
+                submission.status = "failed"
+                submission.error = str(exc)
+        failed_hashes = (
+            list(dict.fromkeys(submission.content_hashes))
+            if submission.status == "failed"
+            else []
+        )
+        return submission.status, failed_hashes, submission.error
+
+    def acknowledge_load_submission(self, op_ids: Sequence[int]) -> None:
+        self._pending_load_submissions.pop(tuple(_ordered_unique(op_ids)), None)
+
+    def abort_load_submission(self, op_ids: Sequence[int]) -> None:
+        key = tuple(_ordered_unique(op_ids))
+        submission = self._pending_load_submissions.pop(key, None)
+        if submission is not None:
+            if submission.future.cancel():
+                self._read_priority.end_read()
+            else:
+                try:
+                    submission.future.result()
+                except Exception:
+                    pass
+        try:
+            self.load_stream.synchronize()
+        except Exception:
+            pass
+        with self._load_acks_lock:
+            retained: list[_Ack] = []
+            for ack in self._load_acks:
+                if any(op_id in key for op_id in ack.op_ids):
+                    if ack.stash_slot is not None:
+                        self._release_stash(ack.stash_slot)
+                else:
+                    retained.append(ack)
+            self._load_acks[:] = retained
+        for tracker, _ in self._load_trackers:
+            tracker.reset()
+
+    def probe_store_presence(
+        self, content_hashes: Sequence[str]
+    ) -> tuple[str, dict[str, bool], str | None]:
+        hashes = tuple(dict.fromkeys(value for value in content_hashes if value))
+        if not hashes:
+            return "ready", {}, None
+        now = time.monotonic()
+        probe_error: str | None = None
+        if self._presence_probe is not None:
+            if not self._presence_probe.future.done():
+                known = {
+                    hash_value: self._presence_cache[hash_value][0]
+                    for hash_value in hashes
+                    if hash_value in self._presence_cache
+                    and self._presence_cache[hash_value][0]
+                }
+                if len(known) == len(hashes):
+                    return "ready", known, None
+                return "pending", {}, None
+            probe = self._presence_probe
+            self._presence_probe = None
+            try:
+                outcome = probe.future.result()
+                error = None
+            except Exception as exc:
+                logger.warning("L3 Store existence probe failed: %s", exc)
+                outcome = {hash_value: False for hash_value in probe.hashes}
+                error = str(exc)
+            for hash_value, present in outcome.items():
+                self._presence_cache[hash_value] = (
+                    bool(present),
+                    now + self._store_probe_ttl,
+                )
+            probe_error = error
+        # Positive entries are optimistic after their TTL. A failed direct get
+        # is now safe and invalidates/requeues the admission, so paying a
+        # blocking existence RPC before every known-key hit only adds TTFT.
+        # Unknown and previously-missing entries are still probed, preserving
+        # cross-process discovery and eventual discovery after a new put.
+        missing = [
+            hash_value
+            for hash_value in hashes
+            if hash_value not in self._presence_cache
+            or (
+                not self._presence_cache[hash_value][0]
+                and self._presence_cache[hash_value][1] <= now
+            )
+        ]
+        if missing:
+            future = self._io_pool.submit(self._do_probe_store_presence, tuple(missing))
+            self._presence_probe = _PresenceProbe(tuple(missing), future)
+            return "pending", {}, None
+        return (
+            "ready",
+            {hash_value: self._presence_cache[hash_value][0] for hash_value in hashes},
+            probe_error,
+        )
+
+    def _do_probe_store_presence(
+        self, content_hashes: tuple[str, ...]
+    ) -> dict[str, bool]:
+        if self.store is None:
+            raise RuntimeError("L3 Store is closed")
+        keys: list[str] = []
+        owners: list[str] = []
+        for content_hash in content_hashes:
+            for group in self.layout.groups:
+                for offset in range(group.cache_blocks_per_lcm_block):
+                    keys.append(
+                        _tp_aware_store_key(
+                            content_hash,
+                            group.group_id,
+                            offset,
+                            tp_rank=self.tp_rank,
+                            namespace=self._store_namespace,
+                        )
+                    )
+                    owners.append(content_hash)
+        with self._store_call(read=True):
+            exists = self.store.batch_exists(keys)
+        if len(exists) != len(keys):
+            raise RuntimeError(
+                f"L3 batch_exists length mismatch {len(exists)} != {len(keys)}"
+            )
+        result = {hash_value: True for hash_value in content_hashes}
+        for owner, present in zip(owners, exists):
+            result[owner] = result[owner] and int(present) == 1
+        return result
+
+    def invalidate_presence(self, content_hashes: Sequence[str]) -> None:
+        for hash_value in content_hashes:
+            self._presence_cache.pop(hash_value, None)
+
+    def record_presence(self, content_hashes: Sequence[str], *, present: bool) -> None:
+        expiry = time.monotonic() + self._store_probe_ttl
+        for hash_value in content_hashes:
+            if hash_value:
+                self._presence_cache[str(hash_value)] = (bool(present), expiry)
 
     def _drain_loads(self, queue: list[_Ack], results: list) -> list[_Ack]:
         pending: list[_Ack] = []
         for ack in queue:
             if ack.finish_event.query():
                 results.extend(self._load_done(op_id) for op_id in ack.op_ids)
-                self._release_stash(ack.stash_slot)
+                if ack.stash_slot is not None:
+                    self._release_stash(ack.stash_slot)
             else:
                 pending.append(ack)
         return pending
 
-    def take_store_index_updates(self) -> list[str]:
-        hashes = list(dict.fromkeys(self._ready_store_hashes))
-        self._ready_store_hashes.clear()
-        return hashes
+    def peek_store_index_outcomes(self) -> dict[str, bool]:
+        self._poll_store_submissions()
+        return dict(self._store_index_outcomes)
+
+    def acknowledge_store_index_outcomes(self, content_hashes: Sequence[str]) -> None:
+        for hash_value in content_hashes:
+            self._store_index_outcomes.pop(hash_value, None)
+
+    def record_store_index_outcomes(self, outcomes: dict[str, bool]) -> None:
+        self._store_index_outcomes.update(
+            {str(value): bool(present) for value, present in outcomes.items() if value}
+        )
 
     @staticmethod
     def _load_done(op_id: int):
@@ -758,26 +1454,58 @@ class L3CacheExecutor:
             self.load_stream.synchronize()
         except Exception:
             pass
-        for ack in self._load_acks:
-            self._release_stash(ack.stash_slot)
-        self._load_acks.clear()
+        with self._load_acks_lock:
+            for ack in self._load_acks:
+                if ack.stash_slot is not None:
+                    self._release_stash(ack.stash_slot)
+            self._load_acks.clear()
+
+    def _wait_for_io(self) -> None:
+        futures = [item.future for item in self._pending_load_submissions.values()]
+        futures.extend(item.future for item in self._pending_store_submissions)
+        if self._presence_probe is not None:
+            futures.append(self._presence_probe.future)
+        for future in futures:
+            try:
+                future.result()
+            except Exception:
+                pass
+        self._poll_store_submissions()
 
     def shutdown(self) -> None:
         if self._closed:
             return
+        self._wait_for_io()
+        self._io_pool.shutdown(wait=True, cancel_futures=False)
+        self._write_pool.shutdown(wait=True, cancel_futures=False)
         self._synchronize()
         store, self.store = self.store, None
-        if store is not None:
+        write_store, self._write_store = getattr(self, "_write_store", None), None
+        for backend in dict.fromkeys((write_store, store)):
+            if backend is None:
+                continue
             try:
-                store.close()
+                with self._store_lock:
+                    backend.close()
             except Exception as exc:
                 logger.warning("L3 Store close failed: %s", exc)
         self._stash_slots.clear()
+        self._stash_total_bytes = 0
         self._registered_ptrs.clear()
+        self._pending_load_submissions.clear()
+        self._pending_store_submissions.clear()
+        self._store_index_outcomes.clear()
+        self._presence_cache.clear()
+        self._presence_probe = None
         self._closed = True
 
     def reset(self) -> None:
+        self._wait_for_io()
         self._synchronize()
-        self._ready_store_hashes.clear()
+        self._pending_load_submissions.clear()
+        self._pending_store_submissions.clear()
+        self._store_index_outcomes.clear()
+        self._presence_cache.clear()
+        self._presence_probe = None
         for tracker, _ in self._load_trackers:
             tracker.reset()

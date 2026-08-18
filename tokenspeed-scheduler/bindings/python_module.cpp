@@ -204,6 +204,10 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def(nb::init<>())
         .def_rw("op_id", &tokenspeed::cache::StoreLoadDone::op_id);
 
+    nb::class_<tokenspeed::cache::StoreLoadFailed>(cache, "StoreLoadFailedEvent")
+        .def(nb::init<>())
+        .def_rw("op_id", &tokenspeed::cache::StoreLoadFailed::op_id);
+
     nb::class_<tokenspeed::pd::BootstrappedEvent>(pd, "BootstrappedEvent")
         .def(nb::init<std::string>(), nb::arg("request_id"))
         .def_ro("request_id", &tokenspeed::pd::BootstrappedEvent::request_id);
@@ -318,7 +322,13 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("pages_to_zero", &tokenspeed::ExecutionPlan::pages_to_zero);
 
     nb::class_<tokenspeed::Scheduler>(m, "Scheduler")
-        .def(nb::init<tokenspeed::SchedulerConfig>(), nb::arg("config") = tokenspeed::SchedulerConfig{})
+        // SchedulerConfig{} is not a valid runnable configuration, and exposing
+        // it as a Python default argument leaves one bound SchedulerConfig
+        // instance rooted in the function metadata during interpreter teardown.
+        // That instance keeps SchedulerConfig, Role, Scheduler, and their bound
+        // functions alive long enough for nanobind to report false-positive
+        // shutdown leaks. Require the already-mandatory explicit config instead.
+        .def(nb::init<tokenspeed::SchedulerConfig>(), nb::arg("config"))
         .def("submit_requests",
              nb::overload_cast<const std::vector<tokenspeed::RequestSpec>&>(&tokenspeed::Scheduler::SubmitRequests),
              nb::arg("request_specs"))
@@ -342,16 +352,17 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("max_single_request_tokens", &tokenspeed::Scheduler::MaxSingleRequestTokens)
         .def("clear_l1_cache", &tokenspeed::Scheduler::ClearL1Cache)
         .def("clear_cache", &tokenspeed::Scheduler::ClearCache)
-        .def("update_store_index",
-             [](tokenspeed::Scheduler& s, std::vector<std::string> hashes, std::vector<bool> present) {
-                 s.UpdateStoreIndex(hashes, present);
-             },
-             nb::arg("page_hashes"), nb::arg("present"))
-        .def("store_hit_tokens",
-             [](tokenspeed::Scheduler& s, std::vector<std::string> hashes) {
-                 return s.StoreHitTokens(hashes);
-             },
-             nb::arg("page_hashes"))
+        .def(
+            "update_store_index",
+            [](tokenspeed::Scheduler& s, std::vector<std::string> hashes, std::vector<bool> present) {
+                s.UpdateStoreIndex(hashes, present);
+            },
+            nb::arg("page_hashes"), nb::arg("present"))
+        .def(
+            "store_hit_tokens",
+            [](tokenspeed::Scheduler& s, std::vector<std::string> hashes) { return s.StoreHitTokens(hashes); },
+            nb::arg("page_hashes"))
+        .def("store_probe_hashes", &tokenspeed::Scheduler::StoreProbeHashes)
         .def("paged_cache_group_total_pages", &tokenspeed::Scheduler::PagedCacheGroupTotalPages, nb::arg("group_id"))
         .def("paged_cache_group_available_pages", &tokenspeed::Scheduler::PagedCacheGroupAvailablePages,
              nb::arg("group_id"));

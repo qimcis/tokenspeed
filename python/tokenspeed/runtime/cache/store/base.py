@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import importlib
 import json
+from pathlib import Path
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
@@ -32,6 +33,11 @@ from typing import Any
 class BaseKVStore(ABC):
 
     extra_backend_tag: str | None = None
+
+    @property
+    def supports_device_memory(self) -> bool:
+        """Whether registered CUDA pointers are valid Store I/O buffers."""
+        return False
 
     @abstractmethod
     def batch_exists(self, keys: list[str]) -> list[int]:
@@ -87,6 +93,20 @@ class MooncakeStoreConfig:
 def _parse_extra_config(raw: str | None) -> dict[str, Any] | None:
     if not raw:
         return None
+    raw = raw.strip()
+    if raw.startswith("@"):
+        config_path = Path(raw[1:]).expanduser()
+        try:
+            raw = config_path.read_text()
+        except OSError as exc:
+            raise ValueError(
+                f"cannot read KVStore config {config_path}: {exc}"
+            ) from exc
+    # Launchers and process supervisors sometimes preserve the shell's matching
+    # quote characters as part of argv. Accept that harmless representation,
+    # while still requiring strict JSON for the actual payload.
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ("'", '"'):
+        raw = raw[1:-1].strip()
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as exc:

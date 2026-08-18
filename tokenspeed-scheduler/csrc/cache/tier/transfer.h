@@ -38,7 +38,7 @@ struct CacheTransfer {
     std::uint32_t group_id{0};
     std::int32_t source_page{-1};
     std::int32_t destination_page{-1};
-    std::string content_hash{};  // page content hash (SHA-256 hex, 64 chars); empty if unavailable
+    std::string content_hash{};          // page content hash (SHA-256 hex, 64 chars); empty if unavailable
     std::int32_t cache_block_offset{0};  // offset within P-token page (for fused groups)
 
     bool operator==(const CacheTransfer&) const = default;
@@ -108,6 +108,7 @@ struct LoadBackOperation {
 
 struct StoreLoadOperation {
     std::uint32_t op_id{0};
+    std::string request_id;
     std::vector<CacheTransfer> transfers;  // STORE→DEVICE (source_page=-1, content_hash set).
 };
 

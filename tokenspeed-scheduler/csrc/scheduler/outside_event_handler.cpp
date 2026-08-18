@@ -155,4 +155,31 @@ void Scheduler::handleEvent(const cache::StoreLoadDone& event) {
     tier_transfers_.CompleteStoreLoad(event.op_id);
 }
 
+void Scheduler::handleEvent(const cache::StoreLoadFailed& event) {
+    std::optional<TierTransferManager::FailedStoreLoad> failure = tier_transfers_.FailStoreLoad(event.op_id);
+    if (!failure) {
+        return;
+    }
+    pending_forward_results_.erase(failure->request_id);
+    pd_transfer_pins_.erase(failure->request_id);
+    Request* request = findRequest(failure->request_id);
+    if (request == nullptr || request->Is<fsm::Finished>()) {
+        coordinator_.DiscardDeviceCachedBlocks(failure->destinations);
+        return;
+    }
+    if (request->Is<fsm::Prefilling>() || request->Is<fsm::PrefillDone>() || request->Is<fsm::Decoding>()) {
+        request->Apply(fsm::RetractEvent{&coordinator_});
+        coordinator_.DiscardDeviceCachedBlocks(failure->destinations);
+        // A failed external restore invalidates the admission's prefix as a
+        // whole. Drop every unpinned local-tier index before retrying so the
+        // request cannot fall through to a stale alias of the same bytes.
+        // Active unrelated requests may keep their pinned entries; the exact
+        // failed destinations above are invalidated regardless of pinning.
+        if (!coordinator_.ClearCache()) {
+            spdlog::warn("[Scheduler] L3 rollback retained unrelated pinned cache entries");
+        }
+        spdlog::warn("[Scheduler] L3 load failed: requeued request {} for local recompute", failure->request_id);
+    }
+}
+
 }  // namespace tokenspeed

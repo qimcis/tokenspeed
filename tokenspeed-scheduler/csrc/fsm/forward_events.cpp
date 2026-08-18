@@ -190,6 +190,10 @@ Submitted RetractEvent::operator()(PrefillDone&& state) {
     return retract(std::move(state));
 }
 
+Submitted RetractEvent::operator()(Prefilling&& state) {
+    return retract(std::move(state));
+}
+
 Submitted RetractEvent::operator()(Decoding&& state) {
     return retract(std::move(state));
 }

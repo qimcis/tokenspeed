@@ -229,6 +229,13 @@ class ServerArgs:
     kvstore_mem_layout: str = "layer_first"
     kvstore_storage_backend: str | None = None
     kvstore_storage_backend_extra_config: str | None = None
+    kvstore_storage_allow_degraded: bool = False
+    kvstore_l3_max_stash_size_mb: int = 4096
+    kvstore_l3_store_probe_ttl: float = 1.0
+    kvstore_l3_io_workers: int = 2
+    kvstore_l3_direct_gpu: Literal["auto", "on", "off"] = "auto"
+    kvstore_l3_direct_gpu_chunk_objects: int = 2
+    kvstore_l3_host_pipeline_chunk_pages: int = 2
 
     # Multi-node distributed serving. ``None`` means "not given by the user",
     # which is what lets the launcher environment fill them in.
@@ -795,6 +802,49 @@ class ServerArgs:
             self.enable_kvstore = True
 
         if self.kvstore_storage_backend == "mooncake":
+            if self.kvstore_storage_allow_degraded and self.mapping.attn.tp_size > 1:
+                raise ValueError(
+                    "--kvstore-storage-allow-degraded is only supported with TP=1; "
+                    "TP ranks must agree on whether L3 is enabled"
+                )
+            if self.kvstore_l3_max_stash_size_mb <= 0:
+                raise ValueError("--kvstore-l3-max-stash-size-mb must be positive")
+            if self.kvstore_l3_store_probe_ttl < 0:
+                raise ValueError("--kvstore-l3-store-probe-ttl must be non-negative")
+            if self.kvstore_l3_io_workers <= 0:
+                raise ValueError("--kvstore-l3-io-workers must be positive")
+            if self.kvstore_l3_direct_gpu not in ("auto", "on", "off"):
+                raise ValueError(
+                    "--kvstore-l3-direct-gpu must be one of: auto, on, off"
+                )
+            if self.kvstore_l3_direct_gpu_chunk_objects <= 0:
+                raise ValueError(
+                    "--kvstore-l3-direct-gpu-chunk-objects must be positive"
+                )
+            if self.kvstore_l3_host_pipeline_chunk_pages <= 0:
+                raise ValueError(
+                    "--kvstore-l3-host-pipeline-chunk-pages must be positive"
+                )
+            raw_config = self.kvstore_storage_backend_extra_config
+            if raw_config:
+                raw_config = raw_config.strip()
+                if (
+                    len(raw_config) >= 2
+                    and raw_config[0] == raw_config[-1]
+                    and raw_config[0] in ("'", '"')
+                ):
+                    raw_config = raw_config[1:-1].strip()
+                if not raw_config.startswith("@"):
+                    try:
+                        raw_config = json.dumps(
+                            json.loads(raw_config), separators=(",", ":")
+                        )
+                    except json.JSONDecodeError as exc:
+                        raise ValueError(
+                            "--kvstore-storage-backend-extra-config must be valid JSON "
+                            "or @/path/to/config.json"
+                        ) from exc
+                self.kvstore_storage_backend_extra_config = raw_config
             if self.kvstore_mem_layout == "layer_first":
                 self.kvstore_mem_layout = "page_first"
                 logger.warning(
@@ -1177,6 +1227,57 @@ class ServerArgs:
             type=str,
             default=ServerArgs.kvstore_storage_backend_extra_config,
             help="A dictionary in JSON string format containing extra configuration for the storage backend.",
+        )
+        parser.add_argument(
+            "--kvstore-storage-allow-degraded",
+            action="store_true",
+            default=ServerArgs.kvstore_storage_allow_degraded,
+            help="Continue with L2-only cache if the explicitly configured L3 backend fails to initialize.",
+        )
+        parser.add_argument(
+            "--kvstore-l3-max-stash-size-mb",
+            type=int,
+            default=ServerArgs.kvstore_l3_max_stash_size_mb,
+            help="Maximum total pinned host memory retained by L3 staging buffers.",
+        )
+        parser.add_argument(
+            "--kvstore-l3-store-probe-ttl",
+            type=float,
+            default=ServerArgs.kvstore_l3_store_probe_ttl,
+            help="Seconds before an L3 existence result is refreshed from the Store.",
+        )
+        parser.add_argument(
+            "--kvstore-l3-io-workers",
+            type=int,
+            default=ServerArgs.kvstore_l3_io_workers,
+            help="Number of background workers used for Mooncake existence/get/put calls.",
+        )
+        parser.add_argument(
+            "--kvstore-l3-direct-gpu",
+            choices=["auto", "on", "off"],
+            default=ServerArgs.kvstore_l3_direct_gpu,
+            help=(
+                "Use registered GPU cache buffers directly for L3 Store I/O. "
+                "Auto enables it when the backend accepts CUDA pointers."
+            ),
+        )
+        parser.add_argument(
+            "--kvstore-l3-direct-gpu-chunk-objects",
+            type=int,
+            default=ServerArgs.kvstore_l3_direct_gpu_chunk_objects,
+            help=(
+                "Maximum logical cache objects per direct-GPU Store call. "
+                "Bounding the scatter/gather vector prevents backend tail-latency stalls."
+            ),
+        )
+        parser.add_argument(
+            "--kvstore-l3-host-pipeline-chunk-pages",
+            type=int,
+            default=ServerArgs.kvstore_l3_host_pipeline_chunk_pages,
+            help=(
+                "Number of Store objects fetched before enqueueing H2D copies "
+                "when direct GPU I/O is unavailable."
+            ),
         )
         # Mamba Cache
         parser.add_argument(

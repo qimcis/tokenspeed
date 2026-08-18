@@ -30,6 +30,8 @@
 #include <string>
 #include <tuple>
 #include <type_traits>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -210,6 +212,36 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
     return match;
 }
 
+std::vector<std::string> Scheduler::StoreProbeHashes() const {
+    if (!config_.enable_l3_storage) {
+        return {};
+    }
+    std::vector<std::string> result;
+    std::unordered_set<std::string> seen;
+    const std::int32_t page_tokens = coordinator_.CacheBlockTokens();
+    const std::int32_t replay_tokens = std::max(config_.prefix_replay_tokens, 1);
+    for (const auto& [_, request] : requests_) {
+        if (!(request->Is<fsm::Submitted>() || request->Is<fsm::Retracted>())) {
+            continue;
+        }
+        if (config_.disable_prefix_cache && !request->Is<fsm::Retracted>()) {
+            continue;
+        }
+        const std::int32_t probe_pages = std::max(request->PrefillSize() - replay_tokens, 0) / page_tokens;
+        if (probe_pages == 0) {
+            continue;
+        }
+        std::vector<std::span<const std::int32_t>> paged_tokens = request->FullPagedTokens(false);
+        paged_tokens.resize(std::min(paged_tokens.size(), static_cast<std::size_t>(probe_pages)));
+        for (std::string& hash : ComputePagedHashes(paged_tokens, "")) {
+            if (seen.insert(hash).second) {
+                result.push_back(std::move(hash));
+            }
+        }
+    }
+    return result;
+}
+
 std::optional<KvCacheCoordinator::AdmissionResult> Scheduler::admit(PlanBuildContext& context,
                                                                     KvCacheCoordinator::PrefixProbe&& prefix,
                                                                     std::span<const GroupDemand> demands,
@@ -258,8 +290,8 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     }
 
     AdmissionMatch match = matchPrefixAtAdmission(request);
-    const std::int32_t hit_tokens =
-        std::max({match.probe.device.num_common_tokens, match.probe.host.num_common_tokens, match.probe.store.num_common_tokens});
+    const std::int32_t hit_tokens = std::max({match.probe.device.num_common_tokens, match.probe.host.num_common_tokens,
+                                              match.probe.store.num_common_tokens});
     const std::int32_t promotion_boundary_tokens = coordinator_.PromotionBoundaryTokens(match.probe);
     _assert(promotion_boundary_tokens == 0 ||
                 (promotion_boundary_tokens % coordinator_.CacheBlockTokens() == 0 &&
@@ -418,7 +450,7 @@ PrefillOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::S
     }
     auto store_pairs = event.TakeStoreLoadPairs();
     if (!store_pairs.empty()) {
-        store_load_operations.push_back(tier_transfers_.StartStoreLoad(std::move(store_pairs)));
+        store_load_operations.push_back(tier_transfers_.StartStoreLoad(request->Id(), std::move(store_pairs)));
     }
     return operation;
 }
@@ -533,7 +565,32 @@ Scheduler::buildForwardOperations(ExecutionPlan& plan, std::vector<Request*> can
             recovery_barrier_.reset();
         }
     }
-    const auto priority = [this](const Request* request) {
+    std::unordered_set<std::string> store_load_first;
+    std::unordered_map<std::string, std::unordered_set<std::string>> store_load_hashes;
+    if (config_.enable_l3_storage) {
+        for (Request* request : candidates) {
+            if (!(request->Is<fsm::Submitted>() || request->Is<fsm::Retracted>())) {
+                continue;
+            }
+            AdmissionMatch match = matchPrefixAtAdmission(request);
+            const std::int32_t local_tokens =
+                std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
+            if (match.probe.store.num_common_tokens > local_tokens) {
+                store_load_first.insert(request->Id());
+                const std::int32_t cache_block_tokens = coordinator_.CacheBlockTokens();
+                const std::size_t local_pages = static_cast<std::size_t>(local_tokens / cache_block_tokens);
+                const std::size_t store_pages =
+                    static_cast<std::size_t>(match.probe.store.num_common_tokens / cache_block_tokens);
+                auto& hashes = store_load_hashes[request->Id()];
+                hashes.insert(match.candidate_page_hashes.begin() + local_pages,
+                              match.candidate_page_hashes.begin() + store_pages);
+            }
+        }
+    }
+    const auto priority = [this, &store_load_first](const Request* request) {
+        if (store_load_first.contains(request->Id())) {
+            return -1;
+        }
         const bool recovery_front = !recovery_queue_.empty() && request->Id() == recovery_queue_.front();
         const bool local_decode_prefill =
             request->Is<fsm::Prefilling>() && request->PrefillSource() == fsm::PrefillSource::kLocal;
@@ -583,6 +640,7 @@ Scheduler::buildForwardOperations(ExecutionPlan& plan, std::vector<Request*> can
     std::int32_t token_budget = config_.max_scheduled_tokens;
     bool pushed_prefill = false;
     bool pushed_decode = false;
+    std::unordered_set<std::string> batched_store_hashes;
     auto push_operation = [&](auto operation) {
         if (recovery_barrier_ && operation.request_id == *recovery_barrier_) {
             recovery_barrier_.reset();
@@ -611,6 +669,17 @@ Scheduler::buildForwardOperations(ExecutionPlan& plan, std::vector<Request*> can
     for (Request* request : candidates) {
         if (token_budget <= 0 || operations.size() == static_cast<std::size_t>(config_.max_batch_size)) {
             break;
+        }
+        if (!store_load_operations.empty()) {
+            const auto hashes = store_load_hashes.find(request->Id());
+            if (hashes == store_load_hashes.end() || std::ranges::any_of(hashes->second, [&](const std::string& hash) {
+                    return batched_store_hashes.contains(hash);
+                })) {
+                // Keep the rollback boundary Store-only. Independent requests
+                // can share one batch_get, while requests that would share a
+                // tentative destination wait for the next plan.
+                break;
+            }
         }
 
         if (request->Is<fsm::Prefilling>() &&
@@ -650,8 +719,18 @@ Scheduler::buildForwardOperations(ExecutionPlan& plan, std::vector<Request*> can
                 break;
             }
             if (auto event = schedulePrefillFirstChunk(context, request, token_budget, config_.decode_input_tokens)) {
-                push_operation(applyEventAndBuildOperation(request, std::move(*event), load_back_operations, store_load_operations));
+                const std::size_t store_loads_before = store_load_operations.size();
+                push_operation(applyEventAndBuildOperation(request, std::move(*event), load_back_operations,
+                                                           store_load_operations));
                 trackPendingForwardResult(request);
+                if (store_load_operations.size() != store_loads_before) {
+                    const auto& hashes = store_load_hashes.at(request->Id());
+                    batched_store_hashes.insert(hashes.begin(), hashes.end());
+                    if (config_.role == Role::kD || request->Is<fsm::Prefilling>()) {
+                        break;
+                    }
+                    continue;
+                }
                 if (config_.role == Role::kD || request->Is<fsm::Prefilling>()) {
                     // Keep a Decode-side recovery batch local-only.
                     break;
@@ -668,11 +747,21 @@ Scheduler::buildForwardOperations(ExecutionPlan& plan, std::vector<Request*> can
             const std::int32_t decode_input_tokens = config_.role == Role::kP ? 0 : config_.decode_input_tokens;
             const std::int32_t prefill_budget = config_.role == Role::kD ? request->PrefillSize() : token_budget;
             if (auto event = schedulePrefillFirstChunk(context, request, prefill_budget, decode_input_tokens)) {
-                push_operation(applyEventAndBuildOperation(request, std::move(*event), load_back_operations, store_load_operations));
+                const std::size_t store_loads_before = store_load_operations.size();
+                push_operation(applyEventAndBuildOperation(request, std::move(*event), load_back_operations,
+                                                           store_load_operations));
                 if (config_.enable_pd_cache) {
                     pd_transfer_pins_.insert(request->Id());
                 }
                 trackPendingForwardResult(request);
+                if (store_load_operations.size() != store_loads_before) {
+                    const auto& hashes = store_load_hashes.at(request->Id());
+                    batched_store_hashes.insert(hashes.begin(), hashes.end());
+                    if (request->Is<fsm::Prefilling>()) {
+                        break;
+                    }
+                    continue;
+                }
                 if (request->Is<fsm::Prefilling>()) {
                     break;
                 }

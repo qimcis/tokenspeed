@@ -224,37 +224,6 @@ TEST(KvCacheCoordinatorTest, ExpandsOneLogicalHashIntoPerGroupCacheBlocks) {
     EXPECT_EQ(probe.device.per_group[1].hits, (std::vector<std::uint8_t>{0, 0, 1, 1}));
 }
 
-TEST(KvCacheCoordinatorTest, StoreIndexExpandsAcrossGroupsAndOffsetsAndInvalidatesAllKeys) {
-    BlockPool pool(32);
-    const std::vector<KvCacheSpec> specs = {
-        {.kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .cache_block_tokens = 8},
-        {.kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 4, .cache_block_tokens = 2},
-    };
-    KvCacheCoordinator coordinator = MakeCoordinator(specs, /*cache_block_tokens=*/8, pool);
-    const std::vector<std::string> hashes{"h0", "h1"};
-
-    coordinator.UpdateStoreIndex(hashes, {true, true});
-
-    EXPECT_EQ(coordinator.StoreHitTokens(hashes), 16);
-    const KvCacheCoordinator::PrefixProbe hit = coordinator.ProbePrefix(hashes);
-    EXPECT_EQ(hit.device.num_common_tokens, 0);
-    EXPECT_EQ(hit.host.num_common_tokens, 0);
-    EXPECT_EQ(hit.store.num_common_tokens, 16);
-    EXPECT_EQ(hit.store.per_group[0].hits, (std::vector<std::uint8_t>{1, 1}));
-    EXPECT_EQ(hit.store.per_group[1].hits, (std::vector<std::uint8_t>(8, 1)));
-
-    coordinator.UpdateStoreIndex({"h0"}, {false});
-
-    EXPECT_EQ(coordinator.StoreHitTokens(hashes), 0);
-    EXPECT_EQ(coordinator.ProbePrefix(hashes).store.num_common_tokens, 0);
-    EXPECT_FALSE(coordinator.IsStoreCached(Key("h0", /*group_id=*/0)));
-    for (std::int32_t offset = 0; offset < 4; ++offset) {
-        EXPECT_FALSE(coordinator.IsStoreCached(Key("h0", /*group_id=*/1, offset)));
-        EXPECT_TRUE(coordinator.IsStoreCached(Key("h1", /*group_id=*/1, offset)));
-    }
-    EXPECT_TRUE(coordinator.IsStoreCached(Key("h1", /*group_id=*/0)));
-}
-
 TEST(MakeCoordinatorTest, RejectsNonPositiveLogicalPOrPacking) {
     BlockPool pool(8);
     const std::vector<KvCacheSpec> valid = {

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -43,18 +44,37 @@ _WARMUP_RETRIES = 10
 
 def _parse_global_segment_size(value: Any) -> int:
     if isinstance(value, int):
-        return value
-    if isinstance(value, str):
+        parsed = value
+    elif isinstance(value, str):
         s = value.strip().lower()
-        if s.endswith("gb"):
-            num = s[:-2].strip()
-            if not num:
-                raise ValueError(
-                    "Invalid global_segment_size: missing number before 'gb'"
-                )
-            return int(num) * 1024 * 1024 * 1024
-        return int(s)
-    return int(value)
+        match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*([kmgt]?i?b)?", s)
+        if match is None:
+            raise ValueError(
+                "Invalid global_segment_size; use bytes or a size such as "
+                "'512mb', '4gb', or '1.5gib'"
+            )
+        number, unit = match.groups()
+        multipliers = {
+            None: 1,
+            "b": 1,
+            "kb": 1024,
+            "kib": 1024,
+            "mb": 1024**2,
+            "mib": 1024**2,
+            "gb": 1024**3,
+            "gib": 1024**3,
+            "tb": 1024**4,
+            "tib": 1024**4,
+        }
+        converted = float(number) * multipliers[unit]
+        if converted <= 0 or not converted.is_integer():
+            raise ValueError(f"Invalid global_segment_size {value!r}")
+        parsed = int(converted)
+    else:
+        parsed = int(value)
+    if parsed <= 0:
+        raise ValueError("global_segment_size must be positive")
+    return parsed
 
 
 class InMemoryStore(BaseKVStore):
@@ -100,6 +120,12 @@ class InMemoryStore(BaseKVStore):
 
 class MooncakeStore(BaseKVStore):
     """``mooncake.store.MooncakeDistributedStore`` wrapper."""
+
+    @property
+    def supports_device_memory(self) -> bool:
+        # Mooncake's registered-buffer batch APIs accept host or CUDA pointers.
+        # The executor still capability-checks each actual device allocation.
+        return True
 
     def __init__(self, config: MooncakeStoreConfig) -> None:
         self.config = config
