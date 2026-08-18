@@ -343,10 +343,6 @@ class EventLoop:
         # rank has anything pending. Lets us skip the TP collective in
         # _commit_cache_results entirely when nothing is in flight.
         self._num_inflight_cache_ops = 0
-        self._deferred_execution_plan = None
-        self._deferred_cache_zero_event = None
-        self._deferred_store_op_ids: tuple[int, ...] = ()
-        self._deferred_store_submit_error: str | None = None
         self.dp_rank = dp_rank
         self.dp_size = mapping.attn.dp_size
         self.has_dp = mapping.has_attn_dp
@@ -376,8 +372,17 @@ class EventLoop:
                     "--kvstore-storage-backend requires --enable-kvstore "
                     "(L3 is a spill tier on top of L2)"
                 )
+            from tokenspeed.runtime.cache.l3.errors import (
+                L3BackendError,
+                L3SubmissionError,
+                L3TransferError,
+            )
             from tokenspeed.runtime.cache.l3.executor import L3CacheExecutor
             from tokenspeed.runtime.cache.store.base import create_kv_store
+            from tokenspeed.runtime.cache.store.errors import (
+                KVStoreBackendError,
+                KVStoreShutdownError,
+            )
 
             kv_store = None
             try:
@@ -385,7 +390,11 @@ class EventLoop:
                     server_args.kvstore_storage_backend,
                     server_args.kvstore_storage_backend_extra_config,
                 )
-            except Exception as exc:
+            except (
+                ImportError,
+                KVStoreBackendError,
+                ValueError,
+            ) as exc:
                 if not server_args.kvstore_storage_allow_degraded:
                     raise RuntimeError("L3 Store initialization failed") from exc
                 logger.warning("L3 Store init failed — running without L3: %s", exc)
@@ -409,17 +418,13 @@ class EventLoop:
                         or getattr(server_args, "revision", None)
                         or getattr(self.model_config.hf_config, "_commit_hash", None)
                     )
-                    abi_for_ns = None
-                    try:
-                        from tokenspeed.runtime.cache.l3.executor import (
-                            _fingerprint_cache_layout,
-                        )
+                    from tokenspeed.runtime.cache.l3.namespace import (
+                        fingerprint_cache_layout,
+                    )
 
-                        abi_for_ns = _fingerprint_cache_layout(
-                            token_to_kv_pool.cache_transfer_layout()
-                        )
-                    except Exception:
-                        abi_for_ns = None
+                    abi_for_ns = fingerprint_cache_layout(
+                        token_to_kv_pool.cache_transfer_layout()
+                    )
                     self.l3_cache_executor = L3CacheExecutor(
                         store=kv_store,
                         device_pool=token_to_kv_pool,
@@ -445,11 +450,20 @@ class EventLoop:
                             server_args.kvstore_l3_host_pipeline_chunk_pages
                         ),
                     )
-                except Exception as exc:
+                except (
+                    L3BackendError,
+                    L3SubmissionError,
+                    L3TransferError,
+                    KVStoreBackendError,
+                    ValueError,
+                ) as exc:
                     try:
                         kv_store.close()
-                    except Exception:
-                        pass
+                    except (KVStoreShutdownError, OSError, RuntimeError) as close_exc:
+                        logger.warning(
+                            "L3 Store cleanup after initialization failure failed: %s",
+                            close_exc,
+                        )
                     if not server_args.kvstore_storage_allow_degraded:
                         raise RuntimeError("L3 executor initialization failed") from exc
                     logger.warning(
@@ -568,6 +582,19 @@ class EventLoop:
             )
         else:
             self.kv_event_publisher = NullEventPublisher(attn_dp_rank=dp_rank)
+
+        self.l3_load_coordinator = None
+        if self.l3_cache_executor is not None:
+            from tokenspeed.runtime.cache.l3.coordinator import L3LoadCoordinator
+
+            self.l3_load_coordinator = L3LoadCoordinator(
+                executor=self.l3_cache_executor,
+                scheduler=self.scheduler,
+                tp_rank=self.attn_tp_rank,
+                tp_size=self.attn_tp_size,
+                cpu_group=self.attn_tp_cpu_group,
+                publish_kv_events=self._publish_scheduler_kv_events,
+            )
 
         self._init_interprocess_comm()
 
@@ -830,11 +857,13 @@ class EventLoop:
         if self.l2_cache_executor is not None:
             cache_results.extend(self.l2_cache_executor.poll_results())
         if self.l3_cache_executor is not None:
+            from tokenspeed.runtime.cache.l3.errors import L3Error
+
             try:
                 cache_results.extend(self.l3_cache_executor.poll_results())
-            except Exception as exc:
+            except L3Error as exc:
                 logger.debug("L3 poll failed: %s", exc)
-            self._commit_l3_store_index_outcomes()
+            self.l3_load_coordinator.commit_store_index_outcomes()
         self._num_inflight_cache_ops -= len(cache_results)
         for event in cache_results:
             payload = cache_event_to_payload(event)
@@ -906,34 +935,6 @@ class EventLoop:
         flag = torch.tensor([1 if local_has_work else 0], dtype=torch.int32)
         dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=self.attn_tp_cpu_group)
         return bool(flag.item())
-
-    def _commit_l3_store_index_outcomes(self) -> None:
-        """Publish only Store writes that reached the same result on every TP rank."""
-        if self.l3_cache_executor is None:
-            return
-        local = self.l3_cache_executor.peek_store_index_outcomes()
-        if not self._cache_group_has_work(bool(local)):
-            return
-        if self.attn_tp_size == 1:
-            gathered = [local]
-        else:
-            gathered = [None] * self.attn_tp_size
-            dist.all_gather_object(gathered, local, group=self.attn_tp_cpu_group)
-        common = set(gathered[0])
-        for rank_outcome in gathered[1:]:
-            common.intersection_update(rank_outcome)
-        if not common:
-            return
-        hashes = sorted(common)
-        present = [
-            all(bool(rank_outcome[value]) for rank_outcome in gathered)
-            for value in hashes
-        ]
-        self.scheduler.update_store_index(hashes, present)
-        self.l3_cache_executor.acknowledge_store_index_outcomes(hashes)
-        failed = [value for value, ok in zip(hashes, present) if not ok]
-        if failed:
-            self.l3_cache_executor.record_presence(failed, present=False)
 
     def _pop_ready_cache_event_payloads(self) -> list[dict]:
         local_payloads = list(self._pending_cache_event_payloads.values())
@@ -1112,202 +1113,43 @@ class EventLoop:
             extend_seq_lens=list(forward_op.input_lengths[:num_extends]),
         )
 
-    def _submit_cache_ops(
-        self, execution_plan, cache_zero_event=None
-    ) -> tuple[tuple[int, ...], str | None]:
-        if self.l2_cache_executor is None and self.l3_cache_executor is None:
-            return (), None
-        # L2 only understands WriteBack/LoadBack; StoreLoad must not be routed there.
-        if self.l2_cache_executor is not None:
-            l2_plan = SimpleNamespace(
-                cache=[
-                    op
-                    for op in execution_plan.cache
-                    if isinstance(op, (Cache.WriteBackOp, Cache.LoadBackOp))
-                ]
-            )
-            if l2_plan.cache:
-                self.l2_cache_executor.submit_plan(l2_plan)
-        store_op_ids = tuple(
-            dict.fromkeys(
-                int(op_id)
-                for op in execution_plan.cache
-                if isinstance(op, Cache.StoreLoadOp)
-                for op_id in op.op_ids
-            )
-        )
-        submit_error = None
-        if self.l3_cache_executor is not None:
-            l3_plan = SimpleNamespace(
-                cache=[
-                    op
-                    for op in execution_plan.cache
-                    if isinstance(op, (Cache.WriteBackOp, Cache.StoreLoadOp))
-                ]
-            )
-            if l3_plan.cache:
-                try:
-                    submitted = self.l3_cache_executor.submit_plan(
-                        l3_plan, cache_zero_event=cache_zero_event
-                    )
-                    if tuple(submitted) != store_op_ids:
-                        raise RuntimeError(
-                            "L3 executor returned mismatched Store load op ids: "
-                            f"expected={store_op_ids} submitted={tuple(submitted)}"
-                        )
-                except Exception as exc:
-                    submit_error = str(exc)
-                    write_hashes = {
-                        str(value)
-                        for op in l3_plan.cache
-                        if isinstance(op, Cache.WriteBackOp)
-                        for values in (getattr(op, "content_hashes", None) or [])
-                        for value in values
-                        if value
-                    }
-                    if write_hashes:
-                        self.l3_cache_executor.record_store_index_outcomes(
-                            {value: False for value in write_hashes}
-                        )
-                    if not store_op_ids:
-                        logger.warning(
-                            "L3 background Store write submission failed: %s", exc
-                        )
-        for op in execution_plan.cache:
-            if isinstance(op, Cache.WriteBackOp):
-                self._num_inflight_cache_ops += len(op.op_ids)
-            elif isinstance(op, Cache.LoadBackOp):
-                self._num_inflight_cache_ops += len(op.op_ids)
-            elif isinstance(op, Cache.StoreLoadOp):
-                # Count the load only after every TP rank has prepared it. A
-                # failed preparation emits StoreLoadFailed instead of Done.
-                pass
-            else:
-                raise ValueError(f"unsupported cache op kind: {type(op).__name__}")
-        return store_op_ids, submit_error
-
-    @staticmethod
-    def _store_load_hashes(execution_plan) -> list[str]:
-        return list(
-            dict.fromkeys(
-                str(value)
-                for op in execution_plan.cache
-                if isinstance(op, Cache.StoreLoadOp)
-                for values in (getattr(op, "content_hashes", None) or [])
-                for value in values
-                if value
-            )
-        )
-
-    def _refresh_l3_store_index(self) -> bool:
-        """Discover external Store entries before scheduler admission."""
-        if self.l3_cache_executor is None:
-            return True
-        hashes = [str(value) for value in self.scheduler.store_probe_hashes()]
-        if not hashes:
-            return True
-        status, local_outcome, error = self.l3_cache_executor.probe_store_presence(
-            hashes
-        )
-        local = {"status": status, "outcome": local_outcome, "error": error}
-        if self.attn_tp_size == 1:
-            gathered = [local]
-        else:
-            gathered = [None] * self.attn_tp_size
-            dist.all_gather_object(gathered, local, group=self.attn_tp_cpu_group)
-        if any(item["status"] == "pending" for item in gathered):
-            return False
-        present = [
-            all(bool(item["outcome"].get(value, False)) for item in gathered)
-            for value in hashes
+    def _submit_l2_cache_ops(self, execution_plan) -> None:
+        if self.l2_cache_executor is None:
+            return
+        operations = [
+            op
+            for op in execution_plan.cache
+            if isinstance(op, (Cache.WriteBackOp, Cache.LoadBackOp))
         ]
-        self.scheduler.update_store_index(hashes, present)
-        return True
-
-    def _resolve_deferred_store_load(self):
-        op_ids = self._deferred_store_op_ids
-        if not op_ids:
-            return self._deferred_execution_plan, self._deferred_cache_zero_event
-        if self._deferred_store_submit_error is not None:
-            local = {
-                "status": "failed",
-                "hashes": self._store_load_hashes(self._deferred_execution_plan),
-                "error": self._deferred_store_submit_error,
-            }
-        else:
-            status, hashes, error = self.l3_cache_executor.load_submission_status(
-                op_ids
-            )
-            local = {"status": status, "hashes": hashes, "error": error}
-        if self.attn_tp_size == 1:
-            gathered = [local]
-        else:
-            gathered = [None] * self.attn_tp_size
-            dist.all_gather_object(gathered, local, group=self.attn_tp_cpu_group)
-        if any(item["status"] == "failed" for item in gathered):
-            failed_hashes = list(
-                dict.fromkeys(
-                    value for item in gathered for value in item["hashes"] if value
-                )
-            )
-            zero_event = self._deferred_cache_zero_event
-            try:
-                self.l3_cache_executor.abort_load_submission(op_ids)
-            finally:
-                if zero_event is not None:
-                    zero_event.synchronize()
-            if failed_hashes:
-                self.l3_cache_executor.record_presence(failed_hashes, present=False)
-                self.scheduler.update_store_index(
-                    failed_hashes, [False] * len(failed_hashes)
-                )
-            failure = ExecutionEvent()
-            for op_id in op_ids:
-                event = Cache.StoreLoadFailedEvent()
-                event.op_id = op_id
-                failure.add_event(event)
-            self.scheduler.advance(failure)
-            self._publish_scheduler_kv_events()
-            if self.attn_tp_rank == 0:
-                errors = [item["error"] for item in gathered if item["error"]]
-                logger.warning(
-                    "L3 Store load failed for op_ids=%s; requeued for recompute: %s",
-                    op_ids,
-                    "; ".join(errors) or "unknown Store error",
-                )
-            self._clear_deferred_store_load()
-            return None
-        if any(item["status"] == "pending" for item in gathered):
-            return None
-        plan = self._deferred_execution_plan
-        zero_event = self._deferred_cache_zero_event
-        self.l3_cache_executor.acknowledge_load_submission(op_ids)
-        self._num_inflight_cache_ops += len(op_ids)
-        self._clear_deferred_store_load()
-        return plan, zero_event
-
-    def _clear_deferred_store_load(self) -> None:
-        self._deferred_execution_plan = None
-        self._deferred_cache_zero_event = None
-        self._deferred_store_op_ids = ()
-        self._deferred_store_submit_error = None
+        if operations:
+            self.l2_cache_executor.submit_plan(SimpleNamespace(cache=operations))
+        self._num_inflight_cache_ops += sum(len(op.op_ids) for op in operations)
 
     def _next_ready_execution_plan(self):
-        if self._deferred_execution_plan is not None:
-            return self._resolve_deferred_store_load()
-        if not self._refresh_l3_store_index():
+        if (
+            self.l3_load_coordinator is not None
+            and self.l3_load_coordinator.has_deferred_load
+        ):
+            ready = self.l3_load_coordinator.resolve_deferred()
+            if ready is None:
+                return None
+            plan, zero_event, admitted_ops = ready
+            self._num_inflight_cache_ops += admitted_ops
+            return plan, zero_event
+        if (
+            self.l3_load_coordinator is not None
+            and not self.l3_load_coordinator.refresh_store_index()
+        ):
             return None
         execution_plan = self.scheduler.next_execution_plan()
         self._publish_scheduler_kv_events()
         cache_zero_event = self.model_executor.zero_cache_pages(
             execution_plan.pages_to_zero
         )
-        op_ids, error = self._submit_cache_ops(execution_plan, cache_zero_event)
-        if op_ids:
-            self._deferred_execution_plan = execution_plan
-            self._deferred_cache_zero_event = cache_zero_event
-            self._deferred_store_op_ids = op_ids
-            self._deferred_store_submit_error = error
+        self._submit_l2_cache_ops(execution_plan)
+        if self.l3_load_coordinator is not None and self.l3_load_coordinator.submit(
+            execution_plan, cache_zero_event
+        ):
             return None
         return execution_plan, cache_zero_event
 
@@ -2190,13 +2032,18 @@ class EventLoop:
                 close_transfer()
             except Exception:
                 pass
-        for executor in (self.l2_cache_executor, self.l3_cache_executor):
-            shutdown = getattr(executor, "shutdown", None)
-            if callable(shutdown):
-                try:
-                    shutdown()
-                except Exception:
-                    pass
+        if self.l2_cache_executor is not None:
+            try:
+                self.l2_cache_executor.shutdown()
+            except RuntimeError:
+                pass
+        if self.l3_cache_executor is not None:
+            from tokenspeed.runtime.cache.l3.errors import L3ShutdownError
+
+            try:
+                self.l3_cache_executor.shutdown()
+            except L3ShutdownError as exc:
+                logger.warning("L3 shutdown failed: %s", exc)
 
 
 def run_event_loop(

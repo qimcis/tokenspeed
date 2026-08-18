@@ -23,16 +23,16 @@
 from __future__ import annotations
 
 import ctypes
-import logging
 import re
 import time
 import uuid
-from dataclasses import dataclass
 from typing import Any
 
-import torch
-
 from tokenspeed.runtime.cache.store.base import BaseKVStore, MooncakeStoreConfig
+from tokenspeed.runtime.cache.store.errors import (
+    KVStoreBackendError,
+    KVStoreShutdownError,
+)
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
@@ -142,9 +142,12 @@ class MooncakeStore(BaseKVStore):
             ) from exc
 
         self._StoreClass = MooncakeDistributedStore
-        self.store = MooncakeDistributedStore()
-        self._setup_store()
-        self._warmup()
+        try:
+            self.store = MooncakeDistributedStore()
+            self._setup_store()
+            self._warmup()
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            raise KVStoreBackendError("Mooncake Store initialization failed") from exc
 
     def _setup_store(self) -> None:
         cfg = self.config
@@ -167,8 +170,8 @@ class MooncakeStore(BaseKVStore):
                 client_hostname = shared.get_session_id()
                 transfer_engine = shared.get_engine()
                 logger.info("MooncakeStore: reusing shared TransferEngine %s", shared)
-        except Exception:
-            pass
+        except (ImportError, RuntimeError, AttributeError) as exc:
+            logger.debug("MooncakeStore: shared TransferEngine unavailable: %s", exc)
 
         setup_kwargs: dict[str, Any] = {}
         if cfg.enable_ssd_offload:
@@ -256,8 +259,8 @@ class MooncakeStore(BaseKVStore):
             raise RuntimeError(
                 f"MooncakeStore warmup put failed after {_WARMUP_RETRIES} attempts ret={last_ret}"
             )
-        assert self.store.is_exist(key) == 1
-        assert self.store.get(key) == val
+        if self.store.is_exist(key) != 1 or self.store.get(key) != val:
+            raise KVStoreBackendError("Mooncake Store warmup verification failed")
         logger.info("MooncakeStore: warmup ok")
 
     def _tag(self, keys: list[str]) -> list[str]:
@@ -266,7 +269,10 @@ class MooncakeStore(BaseKVStore):
         return [f"{self.extra_backend_tag}_{k}" for k in keys]
 
     def batch_exists(self, keys: list[str]) -> list[int]:
-        return self.store.batch_is_exist(self._tag(keys))
+        try:
+            return self.store.batch_is_exist(self._tag(keys))
+        except RuntimeError as exc:
+            raise KVStoreBackendError("Mooncake batch_exists failed") from exc
 
     def batch_get_into(
         self,
@@ -275,11 +281,14 @@ class MooncakeStore(BaseKVStore):
         buffer_sizes: list[int],
     ) -> list[int]:
         tagged = self._tag(keys)
-        if self._uses_multi_buffer(buffer_ptrs):
-            return self.store.batch_get_into_multi_buffers(
-                tagged, buffer_ptrs, buffer_sizes
-            )
-        return self.store.batch_get_into(tagged, buffer_ptrs, buffer_sizes)
+        try:
+            if self._uses_multi_buffer(buffer_ptrs):
+                return self.store.batch_get_into_multi_buffers(
+                    tagged, buffer_ptrs, buffer_sizes
+                )
+            return self.store.batch_get_into(tagged, buffer_ptrs, buffer_sizes)
+        except RuntimeError as exc:
+            raise KVStoreBackendError("Mooncake batch_get_into failed") from exc
 
     def batch_put_from(
         self,
@@ -288,14 +297,20 @@ class MooncakeStore(BaseKVStore):
         buffer_sizes: list[int],
     ) -> list[int]:
         tagged = self._tag(keys)
-        if self._uses_multi_buffer(buffer_ptrs):
-            return self.store.batch_put_from_multi_buffers(
-                tagged, buffer_ptrs, buffer_sizes
-            )
-        return self.store.batch_put_from(tagged, buffer_ptrs, buffer_sizes)
+        try:
+            if self._uses_multi_buffer(buffer_ptrs):
+                return self.store.batch_put_from_multi_buffers(
+                    tagged, buffer_ptrs, buffer_sizes
+                )
+            return self.store.batch_put_from(tagged, buffer_ptrs, buffer_sizes)
+        except RuntimeError as exc:
+            raise KVStoreBackendError("Mooncake batch_put_from failed") from exc
 
     def register_buffer(self, ptr: int, size: int) -> int:
-        return self.store.register_buffer(ptr, size)
+        try:
+            return self.store.register_buffer(ptr, size)
+        except RuntimeError as exc:
+            raise KVStoreBackendError("Mooncake buffer registration failed") from exc
 
     def close(self) -> None:
         for method_name in ("close", "teardown", "destroy"):
@@ -303,8 +318,10 @@ class MooncakeStore(BaseKVStore):
             if callable(method):
                 try:
                     method()
-                except Exception:
-                    pass
+                except (RuntimeError, OSError) as exc:
+                    raise KVStoreShutdownError(
+                        f"Mooncake {method_name} failed"
+                    ) from exc
                 break
 
     @staticmethod

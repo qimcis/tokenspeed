@@ -24,10 +24,12 @@ from __future__ import annotations
 
 import importlib
 import json
-from pathlib import Path
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+
+from tokenspeed.runtime.cache.store.errors import KVStoreBackendError
 
 
 class BaseKVStore(ABC):
@@ -159,8 +161,8 @@ def load_mooncake_store_config(
         try:
             with open(cfg_path) as f:
                 cfg = json.load(f)
-        except Exception as exc:
-            raise RuntimeError(
+        except (OSError, json.JSONDecodeError) as exc:
+            raise KVStoreBackendError(
                 f"Failed to load Mooncake config from {cfg_path}: {exc}"
             ) from exc
         if not isinstance(cfg, dict):
@@ -220,14 +222,20 @@ def _load_custom_backend(extra_config_raw: str | None) -> BaseKVStore | None:
     try:
         mod = importlib.import_module(module_path)
         cls = getattr(mod, class_name)
-    except Exception as exc:
-        raise ImportError(
+    except (ImportError, AttributeError, OSError, RuntimeError) as exc:
+        raise KVStoreBackendError(
             f"Failed to load custom KVStore backend {module_path}:{class_name}: {exc}"
         ) from exc
     try:
-        return cls(extra)  # type: ignore[call-arg]
-    except TypeError:
-        return cls()  # type: ignore[call-arg]
+        try:
+            return cls(extra)  # type: ignore[call-arg]
+        except TypeError:
+            return cls()  # type: ignore[call-arg]
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise KVStoreBackendError(
+            f"Failed to initialize custom KVStore backend "
+            f"{module_path}:{class_name}: {exc}"
+        ) from exc
 
 
 def create_kv_store(

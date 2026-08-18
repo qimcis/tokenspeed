@@ -27,6 +27,11 @@ from tokenspeed.runtime.cache.store.base import (
     create_kv_store,
     load_mooncake_store_config,
 )
+from tokenspeed.runtime.cache.store.errors import (
+    KVStoreBackendError,
+    KVStoreError,
+    KVStoreShutdownError,
+)
 from tokenspeed.runtime.cache.store.mooncake_store import (
     InMemoryStore,
     MooncakeStore,
@@ -36,6 +41,9 @@ from tokenspeed.runtime.cache.store.mooncake_store import (
 __all__ = [
     "BaseKVStore",
     "InMemoryStore",
+    "KVStoreBackendError",
+    "KVStoreError",
+    "KVStoreShutdownError",
     "MooncakeStore",
     "MooncakeStoreConfig",
     "create_kv_store",
