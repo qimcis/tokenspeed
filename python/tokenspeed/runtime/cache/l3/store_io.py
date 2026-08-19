@@ -35,24 +35,65 @@ class TransferChunk:
     sizes: list[Any]
 
 
+@dataclass(frozen=True)
+class TransferLimits:
+    max_objects: int
+    max_bytes: int
+    max_fragments: int
+
+
+@dataclass
+class WriteSnapshot:
+    slot: StashSlot
+    buffer: torch.Tensor
+    ready_event: object
+    transfers: tuple[tuple[int, int, int], ...]
+    ptrs: tuple[int, ...]
+    sizes: tuple[int, ...]
+    nbytes: int
+
+
 class _PriorityGate:
-    def __init__(self) -> None:
+    def __init__(self, *, max_read_burst: int = 8) -> None:
         self._condition = threading.Condition()
         self._active = False
         self._waiting_reads = 0
+        self._waiting_writes = 0
+        self._consecutive_reads = 0
+        self._max_read_burst = max_read_burst
 
     @contextmanager
     def call(self, *, read: bool):
         with self._condition:
             if read:
                 self._waiting_reads += 1
+            else:
+                self._waiting_writes += 1
             try:
-                while self._active or (not read and self._waiting_reads):
+                while (
+                    self._active
+                    or (
+                        read
+                        and self._waiting_writes
+                        and self._consecutive_reads >= self._max_read_burst
+                    )
+                    or (
+                        not read
+                        and self._waiting_reads
+                        and self._consecutive_reads < self._max_read_burst
+                    )
+                ):
                     self._condition.wait()
                 self._active = True
+                if read:
+                    self._consecutive_reads += 1
+                else:
+                    self._consecutive_reads = 0
             finally:
                 if read:
                     self._waiting_reads -= 1
+                else:
+                    self._waiting_writes -= 1
         try:
             yield
         finally:
@@ -71,39 +112,56 @@ class StoreBatcher:
         self._write_gate = (
             self._read_gate if read_store is write_store else _PriorityGate()
         )
-        self._read_condition = threading.Condition()
-        self._pending_reads = 0
-
-    def begin_read(self) -> None:
-        with self._read_condition:
-            self._pending_reads += 1
-
-    def end_read(self) -> None:
-        with self._read_condition:
-            self._pending_reads -= 1
-            if self._pending_reads < 0:
-                raise L3TransferError("L3 read-priority counter underflow")
-            if self._pending_reads == 0:
-                self._read_condition.notify_all()
-
-    def _wait_for_reads(self) -> None:
-        with self._read_condition:
-            while self._pending_reads:
-                self._read_condition.wait()
 
     @staticmethod
     def chunks(
         keys: Sequence[str],
         ptrs: Sequence[Any],
         sizes: Sequence[Any],
-        limit: int,
+        limits: TransferLimits,
     ) -> Iterator[TransferChunk]:
         if not (len(keys) == len(ptrs) == len(sizes)):
             raise L3TransferError(
                 f"Store vectors are ragged: keys={len(keys)} ptrs={len(ptrs)} sizes={len(sizes)}"
             )
-        for begin in range(0, len(keys), limit):
-            end = min(begin + limit, len(keys))
+        begin = 0
+        while begin < len(keys):
+            end = begin
+            chunk_bytes = 0
+            chunk_fragments = 0
+            while end < len(keys):
+                item_sizes = sizes[end]
+                if isinstance(item_sizes, (list, tuple)):
+                    item_bytes = sum(int(value) for value in item_sizes)
+                    item_fragments = len(item_sizes)
+                else:
+                    item_bytes = int(item_sizes)
+                    item_fragments = 1
+                if item_bytes <= 0 or item_fragments <= 0:
+                    raise L3TransferError(
+                        f"Store object {end} has an empty transfer payload"
+                    )
+                if (
+                    item_bytes > limits.max_bytes
+                    or item_fragments > limits.max_fragments
+                ):
+                    raise L3TransferError(
+                        "Store object exceeds one-call transfer limits: "
+                        f"object={end} bytes={item_bytes}/{limits.max_bytes} "
+                        f"fragments={item_fragments}/{limits.max_fragments}"
+                    )
+                exceeds = end > begin and (
+                    end - begin >= limits.max_objects
+                    or chunk_bytes + item_bytes > limits.max_bytes
+                    or chunk_fragments + item_fragments > limits.max_fragments
+                )
+                if exceeds:
+                    break
+                chunk_bytes += item_bytes
+                chunk_fragments += item_fragments
+                end += 1
+                if end - begin >= limits.max_objects:
+                    break
             yield TransferChunk(
                 begin,
                 end,
@@ -111,6 +169,7 @@ class StoreBatcher:
                 list(ptrs[begin:end]),
                 list(sizes[begin:end]),
             )
+            begin = end
 
     def get_chunk(self, chunk: TransferChunk) -> list[int]:
         try:
@@ -132,11 +191,11 @@ class StoreBatcher:
         keys: Sequence[str],
         ptrs: Sequence[Any],
         sizes: Sequence[Any],
-        limit: int,
+        limits: TransferLimits,
     ) -> tuple[list[int], int]:
         results: list[int] = []
         chunks = 0
-        for chunk in self.chunks(keys, ptrs, sizes, limit):
+        for chunk in self.chunks(keys, ptrs, sizes, limits):
             results.extend(self.get_chunk(chunk))
             chunks += 1
         return results, chunks
@@ -146,11 +205,10 @@ class StoreBatcher:
         keys: Sequence[str],
         ptrs: Sequence[Any],
         sizes: Sequence[Any],
-        limit: int,
+        limits: TransferLimits,
     ) -> list[int]:
         results: list[int] = []
-        for chunk in self.chunks(keys, ptrs, sizes, limit):
-            self._wait_for_reads()
+        for chunk in self.chunks(keys, ptrs, sizes, limits):
             try:
                 with self._write_gate.call(read=False):
                     results.extend(
@@ -169,8 +227,6 @@ class StoreBatcher:
         return results
 
     def exists(self, keys: Sequence[str], *, write: bool = False) -> list[int]:
-        if write:
-            self._wait_for_reads()
         store = self.write_store if write else self.read_store
         gate = self._write_gate if write else self._read_gate
         try:
@@ -232,6 +288,8 @@ class L3StoreIO:
         direct_gpu: str,
         direct_chunk_objects: int,
         host_chunk_objects: int,
+        transfer_chunk_bytes: int,
+        transfer_chunk_fragments: int,
         cache_blocks_per_hash: Sequence[int],
     ) -> None:
         self.store = store
@@ -242,8 +300,16 @@ class L3StoreIO:
         self.transfer_backend = transfer_backend
         self.tp_rank = tp_rank
         self.namespace = namespace
-        self.direct_chunk_objects = direct_chunk_objects
-        self.host_chunk_objects = host_chunk_objects
+        self.direct_limits = TransferLimits(
+            direct_chunk_objects,
+            transfer_chunk_bytes,
+            transfer_chunk_fragments,
+        )
+        self.host_limits = TransferLimits(
+            host_chunk_objects,
+            transfer_chunk_bytes,
+            transfer_chunk_fragments,
+        )
         self.cache_blocks_per_hash = tuple(
             int(value) for value in cache_blocks_per_hash
         )
@@ -315,12 +381,105 @@ class L3StoreIO:
             )
             raise L3BackendError(f"incomplete L3 Store read ({details})")
 
-    def put(
+    def snapshot_write(
         self,
         transfers: Sequence[tuple[int, int, int]],
+    ) -> WriteSnapshot:
+        """Enqueue a bounded D2H copy before scheduler source pages are released."""
+        from tokenspeed_kernel.ops.kvcache.host_transfer import transfer_cache_ranges
+
+        stable_transfers = tuple(transfers)
+        object_sizes = [
+            sum(field.payload_bytes for field in self.layout.groups[group_index].fields)
+            for group_index, _device, _host in stable_transfers
+        ]
+        # Validate singleton object limits before allocating or copying.
+        list(
+            self.batcher.chunks(
+                [""] * len(stable_transfers),
+                [0] * len(stable_transfers),
+                object_sizes,
+                self.host_limits,
+            )
+        )
+        ranges = self.buffers.transfer_ranges(stable_transfers)
+        total_bytes = sum(byte_count for *_prefix, byte_count in ranges)
+        if total_bytes <= 0:
+            raise L3TransferError("L3 write snapshot has no payload")
+        slot, stash = self.buffers.acquire_stash(total_bytes)
+        retained = False
+        try:
+            start = torch.cuda.Event()
+            start.record()
+            start.wait(self.write_stream)
+            transfer_cache_ranges(
+                "d2h",
+                self.layout.buffers,
+                stash,
+                ranges,
+                self.write_stream,
+                backend=self.transfer_backend,
+            )
+            ready = torch.cuda.Event()
+            ready.record(self.write_stream)
+            ptr_base = int(stash.data_ptr())
+            ptrs: list[int] = []
+            sizes: list[int] = []
+            offset = 0
+            for group_index, _device, _host in stable_transfers:
+                nbytes = sum(
+                    field.payload_bytes
+                    for field in self.layout.groups[group_index].fields
+                )
+                ptrs.append(ptr_base + offset)
+                sizes.append(nbytes)
+                offset += nbytes
+            retained = True
+            return WriteSnapshot(
+                slot=slot,
+                buffer=stash,
+                ready_event=ready,
+                transfers=stable_transfers,
+                ptrs=tuple(ptrs),
+                sizes=tuple(sizes),
+                nbytes=total_bytes,
+            )
+        except RuntimeError as exc:
+            try:
+                self.write_stream.synchronize()
+            except RuntimeError as sync_exc:
+                raise L3TransferError(
+                    "L3 write stream failed while abandoning a snapshot"
+                ) from sync_exc
+            raise L3TransferError("L3 device-to-host snapshot failed") from exc
+        finally:
+            if not retained:
+                self.buffers.release_stash(slot)
+
+    def write_nbytes(self, transfers: Sequence[tuple[int, int, int]]) -> int:
+        return sum(
+            field.payload_bytes
+            for group_index, _device, _host in transfers
+            for field in self.layout.groups[group_index].fields
+        )
+
+    def release_write_snapshot(self, snapshot: WriteSnapshot) -> None:
+        self.buffers.release_stash(snapshot.slot)
+
+    def discard_write_snapshot(self, snapshot: WriteSnapshot) -> None:
+        try:
+            snapshot.ready_event.synchronize()
+        except RuntimeError as exc:
+            raise L3TransferError("failed to discard L3 write snapshot") from exc
+        self.release_write_snapshot(snapshot)
+
+    def put_snapshot(
+        self,
+        snapshot: WriteSnapshot,
         content_hashes: Sequence[str],
         offsets: Sequence[int],
     ) -> dict[StoreObjectKey, bool]:
+        transfers = snapshot.transfers
         records = [
             (index, content_hash, self._key(content_hash, group, offsets[index]))
             for index, (group, _device, _host) in enumerate(transfers)
@@ -340,24 +499,20 @@ class L3StoreIO:
             exists = [0] * len(keys)
         succeeded = [value == 1 for value in exists]
         missing = [index for index, present in enumerate(succeeded) if not present]
-        if missing and self.direct_gpu:
-            selected = [transfers[records[index][0]] for index in missing]
-            ptrs, sizes = self.buffers.device_vectors(selected)
+        if missing:
+            selected_indices = [records[index][0] for index in missing]
             results = self.batcher.put_all(
                 [keys[index] for index in missing],
-                ptrs,
-                sizes,
-                self.direct_chunk_objects,
+                [snapshot.ptrs[index] for index in selected_indices],
+                [snapshot.sizes[index] for index in selected_indices],
+                self.host_limits,
             )
             if len(results) != len(missing):
                 raise L3BackendError(
-                    f"L3 direct batch_put_from length mismatch {len(results)} != {len(missing)}"
+                    f"L3 batch_put_from length mismatch {len(results)} != {len(missing)}"
                 )
             for record_index, result in zip(missing, results):
                 succeeded[record_index] = result == 0
-            missing = []
-        if missing:
-            self._put_staged(transfers, records, keys, succeeded, missing)
         return {
             (
                 int(transfers[index][0]),
@@ -366,58 +521,6 @@ class L3StoreIO:
             ): bool(success)
             for (index, content_hash, _key), success in zip(records, succeeded)
         }
-
-    def _put_staged(self, transfers, records, keys, succeeded, missing) -> None:
-        from tokenspeed_kernel.ops.kvcache.host_transfer import transfer_cache_ranges
-
-        selected = [transfers[records[index][0]] for index in missing]
-        ranges = self.buffers.transfer_ranges(selected)
-        total_bytes = sum(byte_count for *_prefix, byte_count in ranges)
-        if total_bytes <= 0:
-            return
-        slot, stash = self.buffers.acquire_stash(total_bytes)
-        try:
-            try:
-                start = torch.cuda.Event()
-                start.record()
-                start.wait(self.write_stream)
-                transfer_cache_ranges(
-                    "d2h",
-                    self.layout.buffers,
-                    stash,
-                    ranges,
-                    self.write_stream,
-                    backend=self.transfer_backend,
-                )
-                self.write_stream.synchronize()
-            except RuntimeError as exc:
-                raise L3TransferError("L3 device-to-host staging failed") from exc
-            ptr_base = int(stash.data_ptr())
-            ptrs: list[int] = []
-            sizes: list[int] = []
-            offset = 0
-            for group_index, _device, _host in selected:
-                nbytes = sum(
-                    field.payload_bytes
-                    for field in self.layout.groups[group_index].fields
-                )
-                ptrs.append(ptr_base + offset)
-                sizes.append(nbytes)
-                offset += nbytes
-            results = self.batcher.put_all(
-                [keys[index] for index in missing],
-                ptrs,
-                sizes,
-                self.host_chunk_objects,
-            )
-            if len(results) != len(missing):
-                raise L3BackendError(
-                    f"L3 batch_put_from length mismatch {len(results)} != {len(missing)}"
-                )
-            for record_index, result in zip(missing, results):
-                succeeded[record_index] = result == 0
-        finally:
-            self.buffers.release_stash(slot)
 
     def load(
         self,
@@ -471,9 +574,7 @@ class L3StoreIO:
         started = time.perf_counter()
         results: list[int] = []
         chunks = 0
-        for chunk in self.batcher.chunks(
-            keys, ptrs, field_sizes, self.direct_chunk_objects
-        ):
+        for chunk in self.batcher.chunks(keys, ptrs, field_sizes, self.direct_limits):
             chunk_results = self.batcher.get_chunk(chunk)
             self._validate_reads(
                 chunk.keys, chunk_results, sizes[chunk.begin : chunk.end]
@@ -497,24 +598,37 @@ class L3StoreIO:
         from tokenspeed_kernel.ops.kvcache.host_transfer import transfer_cache_ranges
 
         total_bytes = sum(sizes)
-        slot, stash = self.buffers.acquire_stash(total_bytes)
-        retained = False
-        try:
-            ptr_base = int(stash.data_ptr())
-            byte_offsets: list[int] = []
-            offset = 0
-            for nbytes in sizes:
-                byte_offsets.append(offset)
-                offset += nbytes
-            load_index, tracked = self._begin_load()
-            finish = None
-            store_seconds = 0.0
-            enqueue_seconds = 0.0
-            chunks = 0
-            ptrs = [ptr_base + value for value in byte_offsets]
-            for chunk in self.batcher.chunks(
-                keys, ptrs, sizes, self.host_chunk_objects
-            ):
+        load_index, tracked = self._begin_load()
+        finish = None
+        store_seconds = 0.0
+        enqueue_seconds = 0.0
+        chunks = 0
+        chunk_plan = self.batcher.chunks(
+            keys,
+            [0] * len(keys),
+            sizes,
+            self.host_limits,
+        )
+        for planned in chunk_plan:
+            chunk_sizes = [int(value) for value in planned.sizes]
+            chunk_bytes = sum(chunk_sizes)
+            slot, stash = self.buffers.acquire_stash(chunk_bytes)
+            copy_enqueued = False
+            copy_complete = False
+            try:
+                ptr_base = int(stash.data_ptr())
+                byte_offsets: list[int] = []
+                offset = 0
+                for nbytes in chunk_sizes:
+                    byte_offsets.append(offset)
+                    offset += nbytes
+                chunk = TransferChunk(
+                    begin=planned.begin,
+                    end=planned.end,
+                    keys=planned.keys,
+                    ptrs=[ptr_base + value for value in byte_offsets],
+                    sizes=chunk_sizes,
+                )
                 started = time.perf_counter()
                 results = self.batcher.get_chunk(chunk)
                 store_seconds += time.perf_counter() - started
@@ -531,11 +645,11 @@ class L3StoreIO:
                                 self.buffers.transfer_ranges(
                                     transfers[chunk.begin : chunk.end],
                                     set(consumer),
-                                    host_base_offset=byte_offsets[chunk.begin],
                                 ),
                                 self.load_stream,
                                 backend=self.transfer_backend,
                             )
+                            copy_enqueued = True
                             finish = torch.cuda.Event()
                             finish.record(self.load_stream)
                         except RuntimeError as exc:
@@ -544,24 +658,40 @@ class L3StoreIO:
                             ) from exc
                         events.layer_done_events[layer_index] = finish
                 enqueue_seconds += time.perf_counter() - started
+                if finish is None:
+                    raise L3TransferError(
+                        "cache transfer layout has no layer consumers"
+                    )
+                try:
+                    finish.synchronize()
+                except RuntimeError as exc:
+                    raise L3TransferError(
+                        "L3 host-to-device chunk completion failed"
+                    ) from exc
+                copy_complete = True
                 chunks += 1
-            if finish is None:
-                raise L3TransferError("cache transfer layout has no layer consumers")
-            self._append_ack(finish, op_ids, slot)
-            retained = True
-            logger.info(
-                "L3 load host_pipeline objects=%s bytes=%s chunks=%s "
-                "store_ms=%.3f enqueue_ms=%.3f",
-                len(keys),
-                total_bytes,
-                chunks,
-                store_seconds * 1000,
-                enqueue_seconds * 1000,
-            )
-            return load_index
-        finally:
-            if not retained:
+            finally:
+                if copy_enqueued and not copy_complete:
+                    try:
+                        self.load_stream.synchronize()
+                    except RuntimeError as exc:
+                        raise L3TransferError(
+                            "failed to drain L3 load stream before releasing staging"
+                        ) from exc
                 self.buffers.release_stash(slot)
+        if finish is None:
+            raise L3TransferError("cache transfer layout has no layer consumers")
+        self._append_ack(finish, op_ids, None)
+        logger.info(
+            "L3 load host_pipeline objects=%s bytes=%s chunks=%s "
+            "store_ms=%.3f enqueue_ms=%.3f",
+            len(keys),
+            total_bytes,
+            chunks,
+            store_seconds * 1000,
+            enqueue_seconds * 1000,
+        )
+        return load_index
 
     def _record_layer_events(self, tracked) -> object:
         finish = None

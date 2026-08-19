@@ -33,12 +33,15 @@ from tokenspeed.runtime.cache.store.errors import KVStoreBackendError
 
 
 class BaseKVStore(ABC):
-
     extra_backend_tag: str | None = None
 
     @property
     def supports_device_memory(self) -> bool:
         """Whether registered CUDA pointers are valid Store I/O buffers."""
+        return False
+
+    @property
+    def supports_buffer_unregistration(self) -> bool:
         return False
 
     @abstractmethod
@@ -49,8 +52,8 @@ class BaseKVStore(ABC):
     def batch_get_into(
         self,
         keys: list[str],
-        buffer_ptrs: list[int],
-        buffer_sizes: list[int],
+        buffer_ptrs: list[Any],
+        buffer_sizes: list[Any],
     ) -> list[int]:
         """Zero-copy get into host buffers. Returns bytes per key or -1."""
 
@@ -58,8 +61,8 @@ class BaseKVStore(ABC):
     def batch_put_from(
         self,
         keys: list[str],
-        buffer_ptrs: list[int],
-        buffer_sizes: list[int],
+        buffer_ptrs: list[Any],
+        buffer_sizes: list[Any],
     ) -> list[int]:
         """Zero-copy put from host buffers. Returns 0 on success, -1 on error."""
 
@@ -70,13 +73,16 @@ class BaseKVStore(ABC):
         """Register a host buffer with the Store client. Returns 0 on success."""
         return 0
 
+    def unregister_buffer(self, ptr: int) -> int:
+        """Unregister a previously registered Store I/O buffer."""
+        return 0
+
     def close(self) -> None:
         pass
 
 
 @dataclass(frozen=True)
 class MooncakeStoreConfig:
-
     master_server_address: str | None = None
     client_server_address: str | None = None
     local_hostname: str = "localhost"
@@ -85,6 +91,7 @@ class MooncakeStoreConfig:
     protocol: str = "tcp"
     device_name: str = ""
     master_metrics_port: int = 9003
+    transfer_timeout_seconds: int = 30
     check_server: bool = False
     standalone_storage: bool = False
     enable_ssd_offload: bool = False
@@ -148,6 +155,7 @@ def load_mooncake_store_config(
             protocol=extra.get("protocol", "tcp"),
             device_name=extra.get("device_name", ""),
             master_metrics_port=int(extra.get("master_metrics_port", 9003)),
+            transfer_timeout_seconds=int(extra.get("transfer_timeout_seconds", 30)),
             check_server=bool(extra.get("check_server", False)),
             standalone_storage=bool(extra.get("standalone_storage", False)),
             enable_ssd_offload=bool(extra.get("enable_ssd_offload", False)),
@@ -183,6 +191,7 @@ def load_mooncake_store_config(
             protocol=cfg.get("protocol", "tcp"),
             device_name=cfg.get("device_name", ""),
             master_metrics_port=int(cfg.get("master_metrics_port", 9003)),
+            transfer_timeout_seconds=int(cfg.get("transfer_timeout_seconds", 30)),
             check_server=bool(cfg.get("check_server", False)),
             standalone_storage=bool(cfg.get("standalone_storage", False)),
             enable_ssd_offload=bool(cfg.get("enable_ssd_offload", False)),
@@ -204,6 +213,7 @@ def load_mooncake_store_config(
         protocol=os.getenv("MOONCAKE_PROTOCOL", "tcp"),
         device_name=os.getenv("MOONCAKE_DEVICE", ""),
         master_metrics_port=int(os.getenv("MOONCAKE_MASTER_METRICS_PORT", "9003")),
+        transfer_timeout_seconds=int(os.getenv("MC_TRANSFER_TIMEOUT", "30")),
         check_server=os.getenv("MOONCAKE_CHECK_SERVER", "false").lower()
         in ("1", "true", "yes"),
         standalone_storage=os.getenv("MOONCAKE_STANDALONE_STORAGE", "false").lower()

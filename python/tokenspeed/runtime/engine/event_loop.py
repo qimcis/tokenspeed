@@ -31,8 +31,6 @@ import setproctitle
 import torch
 import torch.distributed as dist
 import zmq
-from tokenspeed_scheduler import PD, Cache, ExecutionEvent, ForwardEvent, Scheduler
-
 from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.distributed.process_group_manager import (
@@ -97,6 +95,7 @@ from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.process import register_usr_signal
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from tokenspeed_scheduler import PD, Cache, ExecutionEvent, ForwardEvent, Scheduler
 
 logger = get_colorful_logger(__name__)
 
@@ -414,16 +413,9 @@ class EventLoop:
                         or server_args.model
                     )
                     model_rev_for_ns = (
-                        getattr(self.model_config, "revision", None)
+                        getattr(self.model_config.hf_config, "_commit_hash", None)
+                        or getattr(self.model_config, "revision", None)
                         or getattr(server_args, "revision", None)
-                        or getattr(self.model_config.hf_config, "_commit_hash", None)
-                    )
-                    from tokenspeed.runtime.cache.l3.namespace import (
-                        fingerprint_cache_layout,
-                    )
-
-                    abi_for_ns = fingerprint_cache_layout(
-                        token_to_kv_pool.cache_transfer_layout()
                     )
                     self.l3_cache_executor = L3CacheExecutor(
                         store=kv_store,
@@ -435,7 +427,6 @@ class EventLoop:
                         tp_size=self.attn_tp_size if self.attn_tp_size > 1 else None,
                         model_id=model_id_for_ns,
                         model_revision=model_rev_for_ns,
-                        cache_abi_fingerprint=abi_for_ns,
                         store_namespace=store_namespace,
                         max_stash_bytes=(
                             server_args.kvstore_l3_max_stash_size_mb * 1024 * 1024
@@ -449,6 +440,13 @@ class EventLoop:
                         host_pipeline_chunk_pages=(
                             server_args.kvstore_l3_host_pipeline_chunk_pages
                         ),
+                        transfer_chunk_bytes=(
+                            server_args.kvstore_l3_transfer_chunk_size_mb * 1024 * 1024
+                        ),
+                        transfer_chunk_fragments=(
+                            server_args.kvstore_l3_transfer_chunk_fragments
+                        ),
+                        max_pending_writes=(server_args.kvstore_l3_max_pending_writes),
                     )
                 except (
                     L3BackendError,
@@ -528,6 +526,9 @@ class EventLoop:
             prefix_replay_tokens=prefix_replay_tokens,
             paged_cache_groups=paged_cache_groups,
             enable_mixed_prefill_decode=server_args.enable_mixed_batch,
+            store_state_checkpoint_interval_pages=(
+                server_args.kvstore_l3_state_checkpoint_interval_pages
+            ),
         )
         scheduler_cfg.enable_pd_cache = self._pd_cache_enabled
         logger.info(
@@ -650,6 +651,7 @@ class EventLoop:
             pause_controller=self._pause,
             memory_controller=self._memory,
             model_runner=target,
+            cache_page_size=geometry.page_size,
         )
 
         self.output_processor = OutputProcesser(
@@ -1122,7 +1124,10 @@ class EventLoop:
             if isinstance(op, (Cache.WriteBackOp, Cache.LoadBackOp))
         ]
         if operations:
-            self.l2_cache_executor.submit_plan(SimpleNamespace(cache=operations))
+            self.l2_cache_executor.submit_plan(
+                SimpleNamespace(cache=operations),
+                hold_write_acks=self.l3_cache_executor is not None,
+            )
         self._num_inflight_cache_ops += sum(len(op.op_ids) for op in operations)
 
     def _next_ready_execution_plan(self):

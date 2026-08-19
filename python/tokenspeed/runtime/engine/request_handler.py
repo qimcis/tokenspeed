@@ -27,15 +27,6 @@ from typing import TYPE_CHECKING
 
 import torch
 import zmq
-from tokenspeed_kernel.profiling import (
-    ProfilingState,
-    profile_config_from_env,
-    proton_available,
-    start_profiling,
-    stop_profiling,
-)
-from viztracer import VizTracer
-
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -77,6 +68,14 @@ from tokenspeed.runtime.utils import broadcast_pyobj
 from tokenspeed.runtime.utils.dispatch import TypeBasedDispatcher
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.hf_transformers_utils import get_tokenizer
+from tokenspeed_kernel.profiling import (
+    ProfilingState,
+    profile_config_from_env,
+    proton_available,
+    start_profiling,
+    stop_profiling,
+)
+from viztracer import VizTracer
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.utils.server_args import ServerArgs
@@ -115,6 +114,7 @@ class RequestHandler:
         pause_controller=None,
         memory_controller=None,
         model_runner=None,
+        cache_page_size: int = 1,
     ) -> None:
 
         self.forward_ct = 0
@@ -127,6 +127,9 @@ class RequestHandler:
         # ModelRunner for in-place RL weight sync (NCCL group init + receive).
         # The scheduler worker passes it in; None elsewhere (e.g. unit tests).
         self.model_runner = model_runner
+        if cache_page_size <= 0:
+            raise ValueError("cache_page_size must be positive")
+        self.cache_page_size = int(cache_page_size)
 
         mapping = server_args.mapping
         self.attn_tp_size = mapping.attn.tp_size
@@ -269,9 +272,17 @@ class RequestHandler:
         if recv_req.bootstrap_port is None:
             recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
 
+        extra_keys_per_page = None
+        if recv_req.multimodal_inputs is not None:
+            extra_keys_per_page = recv_req.multimodal_inputs.cache_keys_per_page(
+                request_id=recv_req.rid,
+                num_tokens=len(recv_req.input_ids),
+                page_size=self.cache_page_size,
+            )
         req_spec = make_spec(
             rid=recv_req.rid,
             tokens=recv_req.input_ids,
+            extra_keys_per_page=extra_keys_per_page,
         )
         req_state = RequestState.from_recv_req(
             recv_req,

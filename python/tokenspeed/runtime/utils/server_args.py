@@ -28,11 +28,6 @@ import random
 import socket
 from typing import Literal
 
-from tokenspeed_kernel.ops.attention.triton.linear.chunk_delta_h import (
-    CHUNK_SIZE as FLA_CHUNK_SIZE,
-)
-from tokenspeed_kernel.platform import current_platform
-
 from tokenspeed.runtime.distributed.mapping import Mapping, _resolve_parallelism_sizes
 from tokenspeed.runtime.utils import (
     get_amdgpu_memory_capacity,
@@ -44,6 +39,10 @@ from tokenspeed.runtime.utils import (
 )
 from tokenspeed.runtime.utils.launcher import check_dist_init_port, detect_topology
 from tokenspeed.runtime.utils.network import is_port_available
+from tokenspeed_kernel.ops.attention.triton.linear.chunk_delta_h import (
+    CHUNK_SIZE as FLA_CHUNK_SIZE,
+)
+from tokenspeed_kernel.platform import current_platform
 
 logger = get_colorful_logger(__name__)
 
@@ -236,6 +235,10 @@ class ServerArgs:
     kvstore_l3_direct_gpu: Literal["auto", "on", "off"] = "auto"
     kvstore_l3_direct_gpu_chunk_objects: int = 2
     kvstore_l3_host_pipeline_chunk_pages: int = 2
+    kvstore_l3_transfer_chunk_size_mb: int = 64
+    kvstore_l3_transfer_chunk_fragments: int = 128
+    kvstore_l3_max_pending_writes: int = 64
+    kvstore_l3_state_checkpoint_interval_pages: int = 8
 
     # Multi-node distributed serving. ``None`` means "not given by the user",
     # which is what lets the launcher environment fill them in.
@@ -825,6 +828,18 @@ class ServerArgs:
                 raise ValueError(
                     "--kvstore-l3-host-pipeline-chunk-pages must be positive"
                 )
+            if self.kvstore_l3_transfer_chunk_size_mb <= 0:
+                raise ValueError("--kvstore-l3-transfer-chunk-size-mb must be positive")
+            if self.kvstore_l3_transfer_chunk_fragments <= 0:
+                raise ValueError(
+                    "--kvstore-l3-transfer-chunk-fragments must be positive"
+                )
+            if self.kvstore_l3_max_pending_writes <= 0:
+                raise ValueError("--kvstore-l3-max-pending-writes must be positive")
+            if self.kvstore_l3_state_checkpoint_interval_pages <= 0:
+                raise ValueError(
+                    "--kvstore-l3-state-checkpoint-interval-pages must be positive"
+                )
             raw_config = self.kvstore_storage_backend_extra_config
             if raw_config:
                 raw_config = raw_config.strip()
@@ -941,8 +956,7 @@ class ServerArgs:
             nargs="?",
             metavar="model",
             default=None,
-            help="The model name or path (positional argument). "
-            "Equivalent to --model.",
+            help="The model name or path (positional argument). Equivalent to --model.",
         )
         parser.add_argument(
             "--model",
@@ -1277,6 +1291,33 @@ class ServerArgs:
             help=(
                 "Number of Store objects fetched before enqueueing H2D copies "
                 "when direct GPU I/O is unavailable."
+            ),
+        )
+        parser.add_argument(
+            "--kvstore-l3-transfer-chunk-size-mb",
+            type=int,
+            default=ServerArgs.kvstore_l3_transfer_chunk_size_mb,
+            help="Maximum aggregate payload bytes per Mooncake batch call, in MiB.",
+        )
+        parser.add_argument(
+            "--kvstore-l3-transfer-chunk-fragments",
+            type=int,
+            default=ServerArgs.kvstore_l3_transfer_chunk_fragments,
+            help="Maximum registered buffer fragments per Mooncake batch call.",
+        )
+        parser.add_argument(
+            "--kvstore-l3-max-pending-writes",
+            type=int,
+            default=ServerArgs.kvstore_l3_max_pending_writes,
+            help="Maximum number of stable L3 write snapshots waiting for Mooncake.",
+        )
+        parser.add_argument(
+            "--kvstore-l3-state-checkpoint-interval-pages",
+            type=int,
+            default=ServerArgs.kvstore_l3_state_checkpoint_interval_pages,
+            help=(
+                "Persist recurrent-state chunk checkpoints every N scheduler "
+                "hash pages; endpoints and promoted boundaries are always persisted."
             ),
         )
         # Mamba Cache
@@ -1703,9 +1744,7 @@ class ServerArgs:
             "--deepseek-v4-prefill-chunk-size",
             type=int,
             default=ServerArgs.deepseek_v4_prefill_chunk_size,
-            help=(
-                "Maximum number of requests per DeepSeek V4 FlashMLA prefill " "chunk."
-            ),
+            help=("Maximum number of requests per DeepSeek V4 FlashMLA prefill chunk."),
         )
         parser.add_argument(
             "--grammar-backend",

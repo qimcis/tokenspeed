@@ -83,6 +83,8 @@ class CacheField:
     device_block_zero_offset_bytes: int
     block_stride_bytes: int
     payload_bytes: int
+    shape: tuple[int, ...] = ()
+    element_size: int = 1
 
     def __post_init__(self) -> None:
         if not self.field_id:
@@ -93,6 +95,9 @@ class CacheField:
             raise ValueError("device_block_zero_offset_bytes must be non-negative")
         _positive("block_stride_bytes", self.block_stride_bytes)
         _positive("payload_bytes", self.payload_bytes)
+        if any(value <= 0 for value in self.shape):
+            raise ValueError("cache field shape must be positive")
+        _positive("element_size", self.element_size)
         if self.payload_bytes > self.block_stride_bytes:
             raise ValueError("payload_bytes cannot exceed block_stride_bytes")
 
@@ -229,6 +234,8 @@ def layout_from_lcm_plan(
                     ),
                     block_stride_bytes=field.page_stride_bytes,
                     payload_bytes=field.payload_bytes,
+                    shape=field.shape,
+                    element_size=field.element_size,
                 )
             )
         groups.append(
@@ -314,6 +321,8 @@ def combine_cache_transfer_layouts(
             device_block_zero_offset_bytes=field.device_block_zero_offset_bytes,
             block_stride_bytes=field.block_stride_bytes,
             payload_bytes=field.payload_bytes,
+            shape=field.shape,
+            element_size=field.element_size,
         )
 
     groups = []

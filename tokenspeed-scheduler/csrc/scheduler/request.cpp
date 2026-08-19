@@ -20,6 +20,7 @@
 
 #include "scheduler/request.h"
 
+#include <algorithm>
 #include <stdexcept>
 
 #include "fsm/forward_events.h"
@@ -29,9 +30,21 @@ namespace tokenspeed {
 Request::Request(const RequestSpec& spec, std::int32_t page_size, Role role)
     : id_{spec.request_id},
       token_container_{spec.tokens},
+      extra_keys_per_page_{spec.extra_keys_per_page},
       page_size_{page_size},
       state_{role == Role::kFused ? fsm::State{fsm::Submitted{&token_container_, page_size}}
-                                  : fsm::State{fsm::Bootstrapping{&token_container_, page_size}}} {}
+                                  : fsm::State{fsm::Bootstrapping{&token_container_, page_size}}} {
+    const std::size_t max_pages = (spec.tokens.size() + static_cast<std::size_t>(page_size) - 1) /
+                                  static_cast<std::size_t>(page_size);
+    if (extra_keys_per_page_.size() > max_pages) {
+        throw std::invalid_argument("Request extra cache keys exceed prompt page count");
+    }
+    for (const auto& page : extra_keys_per_page_) {
+        if (std::ranges::any_of(page, [](const std::string& value) { return value.empty(); })) {
+            throw std::invalid_argument("Request extra cache keys must be non-empty");
+        }
+    }
+}
 
 PrefillInfo Request::CurrentPrefillInfo() const {
     return std::visit(

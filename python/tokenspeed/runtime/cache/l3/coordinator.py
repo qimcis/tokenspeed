@@ -82,6 +82,17 @@ class L3LoadCoordinator:
         )
 
     @staticmethod
+    def _write_op_ids(plan) -> tuple[int, ...]:
+        return tuple(
+            dict.fromkeys(
+                int(op_id)
+                for op in plan.cache
+                if isinstance(op, Cache.WriteBackOp)
+                for op_id in op.op_ids
+            )
+        )
+
+    @staticmethod
     def _load_hashes(plan) -> list[str]:
         return list(
             dict.fromkeys(
@@ -134,6 +145,7 @@ class L3LoadCoordinator:
             if isinstance(op, (Cache.WriteBackOp, Cache.StoreLoadOp))
         ]
         op_ids = self._load_op_ids(plan)
+        write_op_ids = self._write_op_ids(plan)
         submit_error = None
         if l3_ops:
             try:
@@ -147,6 +159,12 @@ class L3LoadCoordinator:
                     )
             except L3Error as exc:
                 submit_error = str(exc)
+                try:
+                    self.executor.release_held_write_acks(write_op_ids)
+                except L3Error as release_exc:
+                    raise L3SubmissionError(
+                        "L3 submission failed with unreleased L2 write ACKs"
+                    ) from release_exc
                 write_objects = self._write_objects(SimpleNamespace(cache=l3_ops))
                 if write_objects:
                     self.executor.record_store_index_outcomes(

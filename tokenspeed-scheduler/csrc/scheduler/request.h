@@ -59,6 +59,16 @@ public:
         return token_container_.FullPagedTokens(page_size_, except_last);
     }
 
+    std::vector<std::span<const std::string>> FullPagedExtraKeys(bool except_last) const {
+        const std::size_t page_count = FullPagedTokens(except_last).size();
+        std::vector<std::span<const std::string>> result(page_count);
+        const std::size_t covered = std::min(page_count, extra_keys_per_page_.size());
+        for (std::size_t i = 0; i < covered; ++i) {
+            result[i] = extra_keys_per_page_[i];
+        }
+        return result;
+    }
+
     std::int32_t TokenSize() const { return token_container_.Size(); }
     std::int32_t LastToken() const { return token_container_.LastToken(); }
     std::int32_t PrefillSize() const { return token_container_.PrefillSize(); }
@@ -127,6 +137,7 @@ private:
 
     std::string id_;
     TokenContainer token_container_;
+    std::vector<std::vector<std::string>> extra_keys_per_page_;
     std::int32_t page_size_{};
     fsm::State state_;
 };

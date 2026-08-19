@@ -28,6 +28,9 @@ from typing import Any
 
 import numpy as np
 import torch
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
+    require_positive_int,
+)
 from tokenspeed_scheduler import (
     Cache,
     ExecutionEvent,
@@ -38,10 +41,6 @@ from tokenspeed_scheduler import (
     PagedCacheTransferPolicy,
     RequestSpec,
     SchedulerConfig,
-)
-
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
-    require_positive_int,
 )
 
 _CACHE_EVENT_TYPES = {
@@ -191,11 +190,17 @@ def aligned_max_scheduled_tokens(
     return max_scheduled_tokens - max_scheduled_tokens % grain
 
 
-def make_spec(rid: str, tokens: list[int], max_new_tokens: int = 0) -> RequestSpec:
+def make_spec(
+    rid: str,
+    tokens: list[int],
+    max_new_tokens: int = 0,
+    extra_keys_per_page: list[list[str]] | None = None,
+) -> RequestSpec:
     spec = RequestSpec()
     spec.request_id = rid
     spec.tokens = tokens
     spec.max_new_tokens = max_new_tokens
+    spec.extra_keys_per_page = extra_keys_per_page or []
     return spec
 
 
@@ -215,6 +220,7 @@ def make_config(
     paged_cache_groups: Sequence["PagedCacheGroupConfig"] | None = None,
     enable_mixed_prefill_decode: bool = False,
     prefix_replay_tokens: int = 0,
+    store_state_checkpoint_interval_pages: int = 1,
 ) -> SchedulerConfig:
     if not 0 <= prefix_replay_tokens <= (1 << 31) - 1:
         raise ValueError(
@@ -241,6 +247,7 @@ def make_config(
     cfg.overlap_schedule_depth = overlap_schedule_depth
     cfg.disable_prefix_cache = disable_prefix_cache
     cfg.prefix_replay_tokens = prefix_replay_tokens
+    cfg.store_state_checkpoint_interval_pages = store_state_checkpoint_interval_pages
     cfg.disable_l2_cache = disable_l2_cache
 
     cfg.enable_mixed_prefill_decode = enable_mixed_prefill_decode

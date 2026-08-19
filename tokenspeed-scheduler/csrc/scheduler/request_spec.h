@@ -30,6 +30,7 @@ namespace tokenspeed {
 struct RequestSpec {
     std::string request_id;
     std::vector<std::int32_t> tokens;
+    std::vector<std::vector<std::string>> extra_keys_per_page;
     std::int32_t max_new_tokens{0};
 };
 

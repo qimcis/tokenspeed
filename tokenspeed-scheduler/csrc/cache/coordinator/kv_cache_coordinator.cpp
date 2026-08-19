@@ -488,12 +488,31 @@ void KvCacheCoordinator::CacheFullBlocks(std::span<BlockTable> tables, std::span
 }
 
 void KvCacheCoordinator::QueueCachedBlocksForStore(std::span<const std::string> page_hashes) {
-    if (host_pool_ == nullptr) {
+    queueCachedBlocksForStore(page_hashes, false);
+}
+
+void KvCacheCoordinator::QueueLatestStateBlocksForStore(std::span<const std::string> page_hashes) {
+    queueCachedBlocksForStore(page_hashes, true);
+}
+
+void KvCacheCoordinator::queueCachedBlocksForStore(std::span<const std::string> page_hashes, bool state_only) {
+    if (host_pool_ == nullptr || page_hashes.empty()) {
         return;
     }
     for (const CacheGroup& group : groups_) {
-        for (CacheKey& key : keysForGroup(page_hashes, group.Id())) {
-            if (group.Manager().ContainsCachedBlock(pool_, key)) {
+        const bool is_state = group.Spec().kind == AttnKind::kMambaState;
+        if (state_only && !is_state) {
+            continue;
+        }
+        std::vector<CacheKey> keys = keysForGroup(page_hashes, group.Id());
+        std::size_t begin = 0;
+        if (is_state) {
+            const std::size_t lookback = static_cast<std::size_t>(group.Manager().BoundaryLookbackBlocks());
+            begin = keys.size() > lookback ? keys.size() - lookback : 0;
+        }
+        for (std::size_t index = begin; index < keys.size(); ++index) {
+            CacheKey& key = keys[index];
+            if (!store_index_.contains(key) && group.Manager().ContainsCachedBlock(pool_, key)) {
                 pending_stores_.push_back(StoreCandidate{.key = std::move(key)});
             }
         }
@@ -590,7 +609,8 @@ void KvCacheCoordinator::CacheCompletedBlocks(std::span<BlockTable> tables, std:
 template <CacheTier Tier>
 void KvCacheCoordinator::cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table,
                                                  std::span<const CacheKey> keys, std::int32_t first_cache_block,
-                                                 std::uint64_t access_epoch, CacheBoundaryKind boundary_kind) {
+                                                 std::uint64_t access_epoch, CacheBoundaryKind boundary_kind,
+                                                 bool queue_store) {
     std::vector<std::pair<CacheKey, CacheBlockRef>> newly_cached;
     auto* inserted = [&]() -> std::vector<std::pair<CacheKey, CacheBlockRef>>* {
         if constexpr (Tier == CacheTier::kDevice) {
@@ -607,7 +627,7 @@ void KvCacheCoordinator::cacheFullBlocksForGroup(std::size_t group_index, BlockT
         if (cache_mutation_sink_) {
             cache_mutation_sink_(key, CacheMutation::kStored);
         }
-        if (!stream_device_cache_to_host_) {
+        if (!stream_device_cache_to_host_ || !queue_store || store_index_.contains(key)) {
             continue;
         }
         pending_stores_.push_back(StoreCandidate{
@@ -736,9 +756,14 @@ void KvCacheCoordinator::cacheCompletedBlocksForGroup(std::size_t group_index, c
     }
     const std::int32_t first_cache_block = boundary_cache_block - lookback;
     std::vector<CacheKey> keys = keysForGroup(demand.page_hashes, groups_[group_index].Id());
+    const bool queue_store = groups_[group_index].Spec().kind != AttnKind::kMambaState ||
+                             *demand.completed_boundary_kind != CacheBoundaryKind::kChunk ||
+                             static_cast<std::int32_t>(demand.page_hashes.size()) %
+                                     store_state_checkpoint_interval_pages_ ==
+                                 0;
     cacheFullBlocksForGroup<Tier>(group_index, *demand.table,
                                   std::span<const CacheKey>{keys}.subspan(static_cast<std::size_t>(first_cache_block)),
-                                  first_cache_block, access_epoch, *demand.completed_boundary_kind);
+                                  first_cache_block, access_epoch, *demand.completed_boundary_kind, queue_store);
 }
 
 void KvCacheCoordinator::cacheDeviceCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand,

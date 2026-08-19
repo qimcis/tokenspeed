@@ -58,6 +58,9 @@ struct SchedulerConfig {
     bool enable_l3_storage{false};
     bool enable_kv_cache_events{false};
     bool enable_mixed_prefill_decode{false};
+    // Persist recurrent-state chunk boundaries sparsely. Endpoints and
+    // promotion boundaries remain eligible regardless of this interval.
+    std::int32_t store_state_checkpoint_interval_pages{1};
 
     Role role{Role::kFused};
     bool enable_pd_cache{false};

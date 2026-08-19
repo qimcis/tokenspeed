@@ -104,18 +104,21 @@ void Scheduler::publishCompletedPages(Request& request) {
     const std::int32_t num_stable_pages = static_cast<std::int32_t>(stable_pages.size());
     _assert(first_new_page <= num_stable_pages, "cache progress exceeds completed request pages");
     if (first_new_page == num_stable_pages) {
+        coordinator_.QueueLatestStateBlocksForStore(progress.page_hashes);
         return;
     }
 
     const std::string previous_hash = progress.page_hashes.empty() ? std::string{} : progress.page_hashes.back();
+    const std::vector<std::span<const std::string>> extra_keys = request.FullPagedExtraKeys(true);
     std::vector<std::string> new_hashes =
-        AdvancePagedHashes(stable_pages, first_new_page, previous_hash, num_stable_pages);
+        AdvancePagedHashes(stable_pages, first_new_page, previous_hash, num_stable_pages, extra_keys);
     progress.page_hashes.insert(progress.page_hashes.end(), std::make_move_iterator(new_hashes.begin()),
                                 std::make_move_iterator(new_hashes.end()));
 
     std::vector<CacheKey> event_keys = registerKvEventPages(request, progress.page_hashes, first_new_page);
     coordinator_.CacheCompletedBlocks(request.BlockTablesRef(), progress.page_hashes, progress.access_epoch,
                                       first_new_page, request.TokenSize() - 1, CacheBoundaryKind::kEndpoint);
+    coordinator_.QueueLatestStateBlocksForStore(progress.page_hashes);
     discardUncachedKvEventPages(event_keys);
 }
 

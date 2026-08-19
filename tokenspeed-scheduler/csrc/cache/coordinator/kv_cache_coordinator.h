@@ -63,6 +63,10 @@ public:
 
     std::int32_t CacheBlockTokens() const noexcept { return cache_block_tokens_; }
     bool HasMambaStateGroup() const;
+    void SetStoreStateCheckpointInterval(std::int32_t pages) {
+        _assert(pages > 0, "Store state checkpoint interval must be positive");
+        store_state_checkpoint_interval_pages_ = pages;
+    }
 
     KvCacheManager& GroupManager(std::int32_t i) { return groups_[static_cast<std::size_t>(i)].Manager(); }
     const KvCacheManager& GroupManager(std::int32_t i) const { return groups_[static_cast<std::size_t>(i)].Manager(); }
@@ -152,6 +156,7 @@ public:
     // Retry ordinary D2H Store for already-published Device cache entries.
     // Missing keys and an absent Host tier are silently skipped.
     void QueueCachedBlocksForStore(std::span<const std::string> page_hashes);
+    void QueueLatestStateBlocksForStore(std::span<const std::string> page_hashes);
     std::vector<StoreCandidate> TakePendingStores() { return std::exchange(pending_stores_, {}); }
     bool IsStoreCached(const CacheKey& key) const;
     void UpdateStoreIndex(const std::vector<std::string>& page_hashes, const std::vector<bool>& present);
@@ -208,7 +213,8 @@ private:
     template <CacheTier Tier>
     void cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table, std::span<const CacheKey> keys,
                                  std::int32_t first_cache_block, std::uint64_t access_epoch,
-                                 CacheBoundaryKind boundary_kind);
+                                 CacheBoundaryKind boundary_kind, bool queue_store = true);
+    void queueCachedBlocksForStore(std::span<const std::string> page_hashes, bool state_only);
     template <CacheTier Tier>
     void cacheCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand, std::uint64_t access_epoch);
     void cacheDeviceCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand,
@@ -221,6 +227,7 @@ private:
     BlockPool* host_pool_{nullptr};
     bool stream_device_cache_to_host_{false};
     std::int32_t cache_block_tokens_{0};
+    std::int32_t store_state_checkpoint_interval_pages_{1};
     std::uint64_t next_access_epoch_{0};
     std::vector<StoreCandidate> pending_stores_;
     std::unordered_set<CacheKey, CacheKeyHash> store_index_;

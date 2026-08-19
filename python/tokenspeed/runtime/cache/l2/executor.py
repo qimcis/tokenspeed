@@ -23,13 +23,11 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
-from typing import NamedTuple
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 
 import psutil
 import torch
-from tokenspeed_kernel.ops.kvcache.host_transfer import transfer_cache_ranges
-from tokenspeed_scheduler import Cache
-
 from tokenspeed.runtime.cache.l2.layerwise_load import LayerwiseLoadTracker
 from tokenspeed.runtime.cache.l2.storage import (
     HostCacheStorage,
@@ -38,6 +36,8 @@ from tokenspeed.runtime.cache.l2.storage import (
 from tokenspeed.runtime.cache.transfer.layout import combine_cache_transfer_layouts
 from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
 from tokenspeed.runtime.utils import get_colorful_logger, get_device_module
+from tokenspeed_kernel.ops.kvcache.host_transfer import transfer_cache_ranges
+from tokenspeed_scheduler import Cache
 
 logger = get_colorful_logger(__name__)
 device_module = get_device_module()
@@ -68,9 +68,12 @@ def _ordered_unique(values: Iterable[int]) -> list[int]:
     return list(dict.fromkeys(int(value) for value in values))
 
 
-class _Ack(NamedTuple):
+@dataclass
+class _Ack:
     finish_event: object
     op_ids: list[int]
+    dependencies: list[object] = dataclass_field(default_factory=list)
+    deferred_op_ids: set[int] = dataclass_field(default_factory=set)
 
 
 def _num_host_lcm_blocks(
@@ -161,9 +164,10 @@ class L2CacheExecutor:
         self._write_acks: list[_Ack] = []
         self._load_acks: list[_Ack] = []
         self._ready_write_op_ids: list[int] = []
+        self._held_ready_write_op_ids: set[int] = set()
         self._ready_load_op_ids: list[int] = []
 
-    def submit_plan(self, plan) -> None:
+    def submit_plan(self, plan, *, hold_write_acks: bool = False) -> None:
         write_op_ids: list[int] = []
         write_transfers: list[tuple[int, int, int]] = []
         load_op_ids: list[int] = []
@@ -195,7 +199,34 @@ class L2CacheExecutor:
         load_index = self._start_loading(load_op_ids, load_transfers)
         for tracker, _ in self._load_trackers:
             tracker.set_consumers(load_index if load_index is not None else -1)
-        self._start_writing(write_op_ids, write_transfers)
+        self._start_writing(
+            write_op_ids,
+            write_transfers,
+            hold_ack=hold_write_acks,
+        )
+
+    def seal_write_ack(
+        self, op_ids: Sequence[int], dependency: object | None = None
+    ) -> None:
+        """Release an explicitly held write ACK, optionally after a dependency."""
+        pending = set(_ordered_unique(op_ids))
+        for ack in self._write_acks:
+            covered = pending.intersection(ack.op_ids)
+            if covered:
+                if dependency is not None:
+                    ack.dependencies.append(dependency)
+                ack.deferred_op_ids.difference_update(covered)
+                pending.difference_update(covered)
+        ready = pending.intersection(self._held_ready_write_op_ids)
+        if ready:
+            self._held_ready_write_op_ids.difference_update(ready)
+            self._ready_write_op_ids.extend(sorted(ready))
+            pending.difference_update(ready)
+        if pending:
+            raise RuntimeError(
+                "cannot seal unknown or already-completed L2 write ops: "
+                f"{sorted(pending)}"
+            )
 
     @staticmethod
     def _append_transfers(
@@ -252,12 +283,17 @@ class L2CacheExecutor:
         self,
         op_ids: Sequence[int],
         transfers: Sequence[tuple[int, int, int]],
+        *,
+        hold_ack: bool,
     ) -> None:
         if not op_ids:
             return
         op_ids = _ordered_unique(op_ids)
         if not transfers:
-            self._ready_write_op_ids.extend(op_ids)
+            if hold_ack:
+                self._held_ready_write_op_ids.update(op_ids)
+            else:
+                self._ready_write_op_ids.extend(op_ids)
             return
         logger.info(
             "[L2] writeback started: operations=%d blocks=%d",
@@ -280,7 +316,13 @@ class L2CacheExecutor:
         )
         finish = torch.cuda.Event()
         finish.record(self.write_stream)
-        self._write_acks.append(_Ack(finish, op_ids))
+        self._write_acks.append(
+            _Ack(
+                finish,
+                op_ids,
+                deferred_op_ids=set(op_ids) if hold_ack else set(),
+            )
+        )
 
     def _start_loading(
         self,
@@ -349,7 +391,11 @@ class L2CacheExecutor:
     def _drain(queue, done, results):
         pending = []
         for ack in queue:
-            if ack.finish_event.query():
+            if (
+                not ack.deferred_op_ids
+                and ack.finish_event.query()
+                and all(dependency.query() for dependency in ack.dependencies)
+            ):
                 results.extend(done(op_id) for op_id in ack.op_ids)
             else:
                 pending.append(ack)
@@ -376,6 +422,7 @@ class L2CacheExecutor:
         self._write_acks.clear()
         self._load_acks.clear()
         self._ready_write_op_ids.clear()
+        self._held_ready_write_op_ids.clear()
         self._ready_load_op_ids.clear()
         for tracker, _ in self._load_trackers:
             tracker.reset()

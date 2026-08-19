@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -136,14 +137,21 @@ inline std::vector<std::string> ComputePagedHashes(
 // Continues an existing hash chain and returns only [first_page, past_end_page).
 inline std::vector<std::string> AdvancePagedHashes(std::span<const std::span<const std::int32_t>> paged_tokens,
                                                    std::int32_t first_page, const std::string& prior,
-                                                   std::int32_t past_end_page) {
+                                                   std::int32_t past_end_page,
+                                                   std::span<const std::span<const std::string>>
+                                                       extra_keys_per_page = {}) {
     _assert(first_page >= 0, "first_page must be >= 0");
     _assert(past_end_page > first_page, "hash range must be non-empty");
     _assert(past_end_page <= static_cast<std::int32_t>(paged_tokens.size()),
             "hash range exceeds the available full pages");
-    return ComputePagedHashes(paged_tokens.subspan(static_cast<std::size_t>(first_page),
-                                                   static_cast<std::size_t>(past_end_page - first_page)),
-                              prior);
+    const std::size_t begin = static_cast<std::size_t>(first_page);
+    const std::size_t count = static_cast<std::size_t>(past_end_page - first_page);
+    std::span<const std::span<const std::string>> extras;
+    if (begin < extra_keys_per_page.size()) {
+        extras = extra_keys_per_page.subspan(
+            begin, std::min(count, extra_keys_per_page.size() - begin));
+    }
+    return ComputePagedHashes(paged_tokens.subspan(begin, count), prior, extras);
 }
 
 }  // namespace tokenspeed

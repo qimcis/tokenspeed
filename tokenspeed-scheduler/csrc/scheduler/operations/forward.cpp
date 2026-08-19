@@ -68,11 +68,13 @@ std::vector<GroupDemand> makeGroupDemands(std::vector<BlockTable>& tables, Group
 
 void appendCompletedPageHashes(std::vector<std::string>& page_hashes,
                                const std::vector<std::span<const std::int32_t>>& paged_tokens,
+                               const std::vector<std::span<const std::string>>& extra_keys_per_page,
                                std::int32_t filled_pages) {
     const std::int32_t first_new_page = static_cast<std::int32_t>(page_hashes.size());
     _assert(filled_pages > first_new_page, "caller must pre-check page-hash progress");
     const std::string previous_hash = page_hashes.empty() ? std::string{} : page_hashes.back();
-    std::vector<std::string> new_hashes = AdvancePagedHashes(paged_tokens, first_new_page, previous_hash, filled_pages);
+    std::vector<std::string> new_hashes =
+        AdvancePagedHashes(paged_tokens, first_new_page, previous_hash, filled_pages, extra_keys_per_page);
     page_hashes.insert(page_hashes.end(), std::make_move_iterator(new_hashes.begin()),
                        std::make_move_iterator(new_hashes.end()));
 }
@@ -115,7 +117,8 @@ CompletedCachePages updateCompletedPageHashes(Request& request, fsm::CacheProgre
     };
     const std::int32_t filled_pages = num_computed_tokens / cache_block_tokens;
     if (filled_pages > static_cast<std::int32_t>(cache_progress.page_hashes.size())) {
-        appendCompletedPageHashes(cache_progress.page_hashes, request.FullPagedTokens(false), filled_pages);
+        appendCompletedPageHashes(cache_progress.page_hashes, request.FullPagedTokens(false),
+                                  request.FullPagedExtraKeys(false), filled_pages);
     }
     if (completed.first_new_page < static_cast<std::int32_t>(cache_progress.page_hashes.size())) {
         completed.boundary_kind =
@@ -185,7 +188,9 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
     const std::int32_t candidate_pages = std::max((request->PrefillSize() - 1) / cache_block_tokens, 0);
     std::vector<std::span<const std::int32_t>> paged_tokens = request->FullPagedTokens(false);
     paged_tokens.resize(std::min(paged_tokens.size(), static_cast<std::size_t>(candidate_pages)));
-    std::vector<std::string> hashes = ComputePagedHashes(paged_tokens, "");
+    std::vector<std::span<const std::string>> extra_keys = request->FullPagedExtraKeys(false);
+    extra_keys.resize(paged_tokens.size());
+    std::vector<std::string> hashes = ComputePagedHashes(paged_tokens, "", extra_keys);
     const auto probe_hashes =
         std::span<const std::string>(hashes).first(std::min(hashes.size(), static_cast<std::size_t>(probe_pages)));
 
@@ -233,7 +238,9 @@ std::vector<std::string> Scheduler::StoreProbeHashes() const {
         }
         std::vector<std::span<const std::int32_t>> paged_tokens = request->FullPagedTokens(false);
         paged_tokens.resize(std::min(paged_tokens.size(), static_cast<std::size_t>(probe_pages)));
-        for (std::string& hash : ComputePagedHashes(paged_tokens, "")) {
+        std::vector<std::span<const std::string>> extra_keys = request->FullPagedExtraKeys(false);
+        extra_keys.resize(paged_tokens.size());
+        for (std::string& hash : ComputePagedHashes(paged_tokens, "", extra_keys)) {
             if (seen.insert(hash).second) {
                 result.push_back(std::move(hash));
             }

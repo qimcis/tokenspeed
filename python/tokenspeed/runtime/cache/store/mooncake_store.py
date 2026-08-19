@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import ctypes
+import os
 import re
 import time
 import uuid
@@ -83,14 +84,18 @@ class InMemoryStore(BaseKVStore):
     def __init__(self) -> None:
         self._store: dict[str, bytes] = {}
 
+    @property
+    def supports_buffer_unregistration(self) -> bool:
+        return True
+
     def batch_exists(self, keys: list[str]) -> list[int]:
         return [1 if k in self._store else 0 for k in keys]
 
     def batch_get_into(
         self,
         keys: list[str],
-        buffer_ptrs: list[int],
-        buffer_sizes: list[int],
+        buffer_ptrs: list[Any],
+        buffer_sizes: list[Any],
     ) -> list[int]:
         out: list[int] = []
         for k, ptr, size in zip(keys, buffer_ptrs, buffer_sizes):
@@ -98,23 +103,35 @@ class InMemoryStore(BaseKVStore):
             if v is None:
                 out.append(-1)
                 continue
-            n = min(
-                len(v), int(size[0]) if isinstance(size, (list, tuple)) else int(size)
-            )
-            # buffer_ptrs are host pointers; copy via ctypes
-            ctypes.memmove(ptr, v, n)
-            out.append(n)
+            ptr_list = ptr if isinstance(ptr, (list, tuple)) else (ptr,)
+            size_list = size if isinstance(size, (list, tuple)) else (size,)
+            requested = sum(int(fragment_size) for fragment_size in size_list)
+            if len(ptr_list) != len(size_list) or len(v) != requested:
+                out.append(-1)
+                continue
+            offset = 0
+            for fragment_ptr, fragment_size in zip(ptr_list, size_list):
+                nbytes = int(fragment_size)
+                ctypes.memmove(fragment_ptr, v[offset : offset + nbytes], nbytes)
+                offset += nbytes
+            out.append(requested)
         return out
 
     def batch_put_from(
         self,
         keys: list[str],
-        buffer_ptrs: list[int],
-        buffer_sizes: list[int],
+        buffer_ptrs: list[Any],
+        buffer_sizes: list[Any],
     ) -> list[int]:
         for k, ptr, size in zip(keys, buffer_ptrs, buffer_sizes):
-            n = int(size[0]) if isinstance(size, (list, tuple)) else int(size)
-            self._store[k] = ctypes.string_at(ptr, n)
+            ptr_list = ptr if isinstance(ptr, (list, tuple)) else (ptr,)
+            size_list = size if isinstance(size, (list, tuple)) else (size,)
+            if len(ptr_list) != len(size_list):
+                return [-1] * len(keys)
+            self._store[k] = b"".join(
+                ctypes.string_at(fragment_ptr, int(fragment_size))
+                for fragment_ptr, fragment_size in zip(ptr_list, size_list)
+            )
         return [0] * len(keys)
 
 
@@ -124,12 +141,19 @@ class MooncakeStore(BaseKVStore):
     @property
     def supports_device_memory(self) -> bool:
         # Mooncake's registered-buffer batch APIs accept host or CUDA pointers.
-        # The executor still capability-checks each actual device allocation.
-        return True
+        # Direct I/O is read-only: stable writes always use a host snapshot.
+        return self._supports_multi_buffer_get
+
+    @property
+    def supports_buffer_unregistration(self) -> bool:
+        return self._supports_buffer_unregistration
 
     def __init__(self, config: MooncakeStoreConfig) -> None:
         self.config = config
         self.extra_backend_tag: str | None = config.extra_backend_tag
+        if config.transfer_timeout_seconds <= 0:
+            raise KVStoreBackendError("Mooncake transfer timeout must be positive")
+        os.environ["MC_TRANSFER_TIMEOUT"] = str(config.transfer_timeout_seconds)
         try:
             from mooncake.store import (
                 MooncakeDistributedStore,  # type: ignore[import-not-found]
@@ -145,6 +169,12 @@ class MooncakeStore(BaseKVStore):
         try:
             self.store = MooncakeDistributedStore()
             self._setup_store()
+            self._supports_multi_buffer_get = callable(
+                getattr(self.store, "batch_get_into_multi_buffers", None)
+            )
+            self._supports_buffer_unregistration = callable(
+                getattr(self.store, "unregister_buffer", None)
+            )
             self._warmup()
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
             raise KVStoreBackendError("Mooncake Store initialization failed") from exc
@@ -311,6 +341,12 @@ class MooncakeStore(BaseKVStore):
             return self.store.register_buffer(ptr, size)
         except RuntimeError as exc:
             raise KVStoreBackendError("Mooncake buffer registration failed") from exc
+
+    def unregister_buffer(self, ptr: int) -> int:
+        try:
+            return self.store.unregister_buffer(ptr)
+        except RuntimeError as exc:
+            raise KVStoreBackendError("Mooncake buffer unregistration failed") from exc
 
     def close(self) -> None:
         for method_name in ("close", "teardown", "destroy"):

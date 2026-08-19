@@ -45,6 +45,10 @@ class L3BufferManager:
     def registration_lock(self) -> threading.RLock:
         return self._registration_lock
 
+    @property
+    def can_unregister(self) -> bool:
+        return all(store.supports_buffer_unregistration for store in self._stores)
+
     def register(self, buffer: torch.Tensor) -> None:
         ptr = int(buffer.data_ptr())
         if ptr in self._registered_ptrs:
@@ -82,13 +86,15 @@ class L3BufferManager:
 
     def acquire_stash(self, nbytes: int) -> tuple[StashSlot, torch.Tensor]:
         with self._condition:
-            for slot in self._stash_slots:
+            for slot in sorted(self._stash_slots, key=lambda value: value.capacity):
                 if not slot.busy and slot.capacity >= nbytes:
                     slot.busy = True
                     return slot, slot.buffer[:nbytes]
             if self._stash_total_bytes + nbytes > self._max_stash_bytes:
+                self._reclaim_idle_stash(nbytes)
+            if self._stash_total_bytes + nbytes > self._max_stash_bytes:
                 raise L3TransferError(
-                    "L3 pinned stash limit exceeded: "
+                    "L3 pinned stash limit exceeded by active transfers: "
                     f"requested={nbytes} retained={self._stash_total_bytes} "
                     f"limit={self._max_stash_bytes}"
                 )
@@ -110,8 +116,39 @@ class L3BufferManager:
             raise
         return slot, slot.buffer[:nbytes]
 
+    def _reclaim_idle_stash(self, requested: int) -> None:
+        if not self.can_unregister:
+            return
+        idle = sorted(
+            (slot for slot in self._stash_slots if not slot.busy),
+            key=lambda value: value.capacity,
+        )
+        for slot in idle:
+            ptr = int(slot.buffer.data_ptr())
+            try:
+                with self._registration_lock:
+                    results = [store.unregister_buffer(ptr) for store in self._stores]
+            except (KVStoreBackendError, RuntimeError, OSError) as exc:
+                raise L3BackendError(
+                    f"Store buffer unregistration failed ptr={ptr}: {exc}"
+                ) from exc
+            failed = [
+                result for result in results if result is not None and int(result) != 0
+            ]
+            if failed:
+                raise L3BackendError(
+                    f"Store rejected buffer unregistration ptr={ptr} results={results}"
+                )
+            self._registered_ptrs.discard(ptr)
+            self._stash_slots.remove(slot)
+            self._stash_total_bytes -= slot.capacity
+            if self._stash_total_bytes + requested <= self._max_stash_bytes:
+                return
+
     def release_stash(self, slot: StashSlot) -> None:
         with self._condition:
+            if not slot.busy:
+                raise L3TransferError("L3 staging slot was released more than once")
             slot.busy = False
             self._condition.notify()
 
@@ -168,7 +205,35 @@ class L3BufferManager:
             all_sizes.append(sizes)
         return all_ptrs, all_sizes
 
-    def clear(self) -> None:
+    def clear(self, *, unregister: bool = True) -> None:
+        with self._condition:
+            if any(slot.busy for slot in self._stash_slots):
+                raise L3TransferError("cannot clear L3 buffers while staging is active")
+            ptrs = tuple(self._registered_ptrs)
+        if unregister:
+            if not self.can_unregister:
+                raise L3BackendError(
+                    "Store backend cannot unregister buffers before release"
+                )
+            with self._registration_lock:
+                for ptr in ptrs:
+                    try:
+                        results = [
+                            store.unregister_buffer(ptr) for store in self._stores
+                        ]
+                    except (KVStoreBackendError, RuntimeError, OSError) as exc:
+                        raise L3BackendError(
+                            f"Store buffer unregistration failed ptr={ptr}: {exc}"
+                        ) from exc
+                    failed = [
+                        result
+                        for result in results
+                        if result is not None and int(result) != 0
+                    ]
+                    if failed:
+                        raise L3BackendError(
+                            f"Store rejected buffer unregistration ptr={ptr} results={results}"
+                        )
         self._stash_slots.clear()
         self._stash_total_bytes = 0
         self._registered_ptrs.clear()

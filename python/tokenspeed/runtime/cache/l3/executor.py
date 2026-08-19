@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -40,7 +41,11 @@ from tokenspeed.runtime.cache.l3.namespace import (
     fingerprint_model_artifacts,
     store_key,
 )
-from tokenspeed.runtime.cache.l3.store_io import L3StoreIO, StoreObjectKey
+from tokenspeed.runtime.cache.l3.store_io import (
+    L3StoreIO,
+    StoreObjectKey,
+    WriteSnapshot,
+)
 from tokenspeed.runtime.cache.l3.submissions import L3SubmissionTracker
 from tokenspeed.runtime.cache.store.base import BaseKVStore
 from tokenspeed.runtime.cache.store.errors import KVStoreShutdownError
@@ -58,6 +63,43 @@ _tp_aware_store_key = store_key
 
 def _ordered_unique(values: Sequence[int]) -> tuple[int, ...]:
     return tuple(dict.fromkeys(int(value) for value in values))
+
+
+def _cache_runtime_tags(*pools: Any) -> tuple[str, ...]:
+    tags = [
+        f"torch={torch.__version__}",
+        f"cuda={torch.version.cuda}",
+        f"hip={getattr(torch.version, 'hip', None)}",
+    ]
+    try:
+        tags.append(f"gpu_capability={torch.cuda.get_device_capability()}")
+    except (RuntimeError, AssertionError):
+        tags.append("gpu_capability=unknown")
+    for index, pool in enumerate(pool for pool in pools if pool is not None):
+        tags.append(f"pool{index}={type(pool).__module__}.{type(pool).__qualname__}")
+        for name in ("page_size", "store_dtype", "quant_method"):
+            tags.append(f"pool{index}.{name}={getattr(pool, name, None)}")
+        state_dtypes = getattr(pool, "_state_field_dtypes", {}) or {}
+        tags.extend(
+            f"pool{index}.state_dtype.{name}={dtype}"
+            for name, dtype in sorted(state_dtypes.items())
+        )
+        fields = getattr(pool, "_fields", {}) or {}
+        tags.extend(
+            f"pool{index}.field_dtype.{name}={value.dtype}"
+            for name, value in sorted(fields.items())
+        )
+        contract = getattr(pool, "runtime_contract", None)
+        if contract is not None:
+            tags.append(f"pool{index}.block_size={contract.block_size}")
+            for spec in contract.group_specs:
+                tags.append(
+                    f"pool{index}.group={spec.group_id}:{spec.family}:"
+                    f"{spec.retention}:{spec.rows_per_page}:"
+                    f"{spec.entry_stride_tokens}:"
+                    f"{spec.cache_blocks_per_lcm_block}"
+                )
+    return tuple(tags)
 
 
 class L3CacheExecutor:
@@ -83,9 +125,14 @@ class L3CacheExecutor:
         direct_gpu: str = "auto",
         direct_gpu_chunk_objects: int = 2,
         host_pipeline_chunk_pages: int = 2,
+        transfer_chunk_bytes: int = 64 * 1024**2,
+        transfer_chunk_fragments: int = 128,
+        max_pending_writes: int = 64,
     ) -> None:
         if store is None:
             raise ValueError("L3 requires an initialized Store backend")
+        if l2_executor is None:
+            raise ValueError("L3 requires L2 to fence stable write snapshots")
         self._validate_config(
             io_backend=io_backend,
             max_stash_bytes=max_stash_bytes,
@@ -94,6 +141,9 @@ class L3CacheExecutor:
             direct_gpu=direct_gpu,
             direct_gpu_chunk_objects=direct_gpu_chunk_objects,
             host_pipeline_chunk_pages=host_pipeline_chunk_pages,
+            transfer_chunk_bytes=transfer_chunk_bytes,
+            transfer_chunk_fragments=transfer_chunk_fragments,
+            max_pending_writes=max_pending_writes,
         )
         self.store: BaseKVStore | None = store
         self._write_store: BaseKVStore | None = store
@@ -125,13 +175,26 @@ class L3CacheExecutor:
             if isinstance(store_namespace, str) and store_namespace.strip()
             else None
         )
-        abi = cache_abi_fingerprint or fingerprint_cache_layout(self.layout)
+        runtime_tags = list(_cache_runtime_tags(device_pool, draft_pool))
+        if cache_abi_fingerprint:
+            runtime_tags.append(f"external={cache_abi_fingerprint}")
+        abi = fingerprint_cache_layout(
+            self.layout,
+            runtime_tags=tuple(runtime_tags),
+        )
         if tp_size is not None and tp_size > 1:
             abi = f"{abi}_tp{tp_size}"
+        model_fingerprint = fingerprint_model_artifacts(model_id)
+        if model_id and Path(str(model_id)).is_dir() and model_fingerprint is None:
+            raise ValueError("L3 could not establish a stable local model identity")
+        if not model_revision and model_fingerprint is None:
+            raise ValueError(
+                "L3 requires a pinned model revision for non-local model IDs"
+            )
         self._store_namespace = build_store_namespace(
             model_id=model_id,
             model_revision=model_revision,
-            model_fingerprint=fingerprint_model_artifacts(model_id),
+            model_fingerprint=model_fingerprint,
             cache_abi_fingerprint=abi,
             extra_tag=explicit_namespace or store.extra_backend_tag,
         )
@@ -153,10 +216,15 @@ class L3CacheExecutor:
             direct_gpu=direct_gpu,
             direct_chunk_objects=direct_gpu_chunk_objects,
             host_chunk_objects=host_pipeline_chunk_pages,
+            transfer_chunk_bytes=transfer_chunk_bytes,
+            transfer_chunk_fragments=transfer_chunk_fragments,
             cache_blocks_per_hash=cache_blocks_per_hash,
         )
         self._submissions = L3SubmissionTracker(
-            io_workers=io_workers, presence_ttl=store_probe_ttl
+            io_workers=io_workers,
+            presence_ttl=store_probe_ttl,
+            max_pending_writes=max_pending_writes,
+            max_pending_write_bytes=max_stash_bytes,
         )
         self._closed = False
         logger.info(
@@ -183,6 +251,12 @@ class L3CacheExecutor:
             raise ValueError("L3 direct_gpu_chunk_objects must be positive")
         if config["host_pipeline_chunk_pages"] <= 0:
             raise ValueError("L3 host_pipeline_chunk_pages must be positive")
+        if config["transfer_chunk_bytes"] <= 0:
+            raise ValueError("L3 transfer_chunk_bytes must be positive")
+        if config["transfer_chunk_fragments"] <= 0:
+            raise ValueError("L3 transfer_chunk_fragments must be positive")
+        if config["max_pending_writes"] <= 0:
+            raise ValueError("L3 max_pending_writes must be positive")
 
     @staticmethod
     def _cache_blocks_per_hash(
@@ -306,44 +380,85 @@ class L3CacheExecutor:
 
         load_key = _ordered_unique(load_ids)
         if load_key:
-            self._io.batcher.begin_read()
-            try:
-                self._submissions.submit_load(
+            self._submissions.submit_load(
+                load_key,
+                tuple(load_hashes),
+                lambda: self._run_load(
                     load_key,
+                    tuple(load_transfers),
                     tuple(load_hashes),
-                    lambda: self._run_load(
-                        load_key,
-                        tuple(load_transfers),
-                        tuple(load_hashes),
-                        tuple(load_offsets),
-                        cache_zero_event,
-                    ),
-                )
-            except L3SubmissionError:
-                self._io.batcher.end_read()
-                raise
-        if write_ids and write_transfers:
-            try:
-                ready_event = torch.cuda.Event()
-                ready_event.record()
-            except RuntimeError as exc:
-                raise L3TransferError("failed to record L3 write readiness") from exc
-            objects = tuple(
-                (int(transfer[0]), value, int(offset))
-                for transfer, value, offset in zip(
-                    write_transfers, write_hashes, write_offsets
-                )
-                if value
-            )
-            self._submissions.submit_write(
-                objects,
-                lambda: self._run_put(
-                    tuple(write_transfers),
-                    tuple(write_hashes),
-                    tuple(write_offsets),
-                    ready_event,
+                    tuple(load_offsets),
+                    cache_zero_event,
                 ),
             )
+        if write_ids:
+            snapshot = None
+            ack_sealed = False
+            try:
+                objects = tuple(
+                    (int(transfer[0]), value, int(offset))
+                    for transfer, value, offset in zip(
+                        write_transfers, write_hashes, write_offsets
+                    )
+                    if value
+                )
+                if not write_transfers or not objects:
+                    return load_key
+                snapshot_nbytes = self._io.write_nbytes(write_transfers)
+                if not self._submissions.can_accept_write(snapshot_nbytes):
+                    self._submissions.record_outcomes(
+                        {value: False for value in objects}
+                    )
+                    return load_key
+                try:
+                    snapshot = self._io.snapshot_write(tuple(write_transfers))
+                except L3TransferError as exc:
+                    logger.warning(
+                        "dropping L3 write: cannot create stable snapshot: %s", exc
+                    )
+                    self._submissions.record_outcomes(
+                        {value: False for value in objects}
+                    )
+                    return load_key
+                try:
+                    self.l2_executor.seal_write_ack(write_ids, snapshot.ready_event)
+                except RuntimeError as exc:
+                    self._io.discard_write_snapshot(snapshot)
+                    snapshot = None
+                    raise L3SubmissionError(
+                        "failed to fence L2 completion on the L3 snapshot"
+                    ) from exc
+                ack_sealed = True
+                try:
+                    accepted = self._submissions.submit_write(
+                        objects,
+                        lambda: self._run_put(
+                            snapshot,
+                            tuple(write_hashes),
+                            tuple(write_offsets),
+                        ),
+                        nbytes=snapshot.nbytes,
+                    )
+                except L3SubmissionError:
+                    self._io.discard_write_snapshot(snapshot)
+                    snapshot = None
+                    raise
+                if not accepted:
+                    self._io.discard_write_snapshot(snapshot)
+                    snapshot = None
+                    self._submissions.record_outcomes(
+                        {value: False for value in objects}
+                    )
+            finally:
+                if not ack_sealed:
+                    if snapshot is not None:
+                        self._io.discard_write_snapshot(snapshot)
+                    try:
+                        self.l2_executor.seal_write_ack(write_ids)
+                    except RuntimeError as exc:
+                        raise L3SubmissionError(
+                            "failed to release held L2 write ACKs"
+                        ) from exc
         return load_key
 
     def _run_load(self, op_ids, transfers, hashes, offsets, zero_event) -> int:
@@ -371,12 +486,11 @@ class L3CacheExecutor:
             except RuntimeError as exc:
                 raise L3TransferError("failed to cancel L3 cache consumers") from exc
             raise
-        finally:
-            self._io.batcher.end_read()
 
     def _run_put(
-        self, transfers, hashes, offsets, ready_event
+        self, snapshot: WriteSnapshot, hashes, offsets
     ) -> dict[StoreObjectKey, bool]:
+        transfers = snapshot.transfers
         requested = tuple(
             dict.fromkeys(
                 (int(transfer[0]), value, int(offset))
@@ -386,13 +500,15 @@ class L3CacheExecutor:
         )
         try:
             try:
-                ready_event.synchronize()
+                snapshot.ready_event.synchronize()
             except RuntimeError as exc:
                 raise L3TransferError("failed to wait for L3 write readiness") from exc
-            present = self._io.put(transfers, hashes, offsets)
+            present = self._io.put_snapshot(snapshot, hashes, offsets)
         except (L3BackendError, L3TransferError) as exc:
             logger.warning("L3 put failed: %s", exc)
             present = {}
+        finally:
+            self._io.release_write_snapshot(snapshot)
         return {value: bool(present.get(value, False)) for value in requested}
 
     def poll_results(self) -> list:
@@ -407,8 +523,7 @@ class L3CacheExecutor:
 
     def abort_load_submission(self, op_ids: Sequence[int]) -> None:
         key = _ordered_unique(op_ids)
-        if self._submissions.abort_load(key):
-            self._io.batcher.end_read()
+        self._submissions.abort_load(key)
         self._io.abort(key)
 
     def probe_store_presence(self, content_hashes: Sequence[str]):
@@ -434,6 +549,14 @@ class L3CacheExecutor:
     def record_store_index_outcomes(self, outcomes: dict[StoreObjectKey, bool]) -> None:
         self._submissions.record_outcomes(outcomes)
 
+    def release_held_write_acks(self, op_ids: Sequence[int]) -> None:
+        if not op_ids:
+            return
+        try:
+            self.l2_executor.seal_write_ack(op_ids)
+        except RuntimeError as exc:
+            raise L3SubmissionError("failed to release held L2 write ACKs") from exc
+
     def shutdown(self) -> None:
         if self._closed:
             return
@@ -446,6 +569,13 @@ class L3CacheExecutor:
             self._io.synchronize()
         except L3TransferError as exc:
             errors.append(str(exc))
+        buffers_cleared = False
+        if self._buffers.can_unregister:
+            try:
+                self._buffers.clear()
+                buffers_cleared = True
+            except (L3BackendError, L3TransferError) as exc:
+                errors.append(f"registered buffers: {exc}")
         stores = tuple(
             dict.fromkeys(
                 store for store in (self._write_store, self.store) if store is not None
@@ -459,7 +589,11 @@ class L3CacheExecutor:
                     store.close()
             except (KVStoreShutdownError, RuntimeError, OSError) as exc:
                 errors.append(f"{type(store).__name__}: {exc}")
-        self._buffers.clear()
+        if not buffers_cleared:
+            try:
+                self._buffers.clear(unregister=False)
+            except L3TransferError as exc:
+                errors.append(f"registered buffers: {exc}")
         self._submissions.clear()
         self._closed = True
         if errors:

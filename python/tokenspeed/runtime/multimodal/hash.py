@@ -36,7 +36,6 @@ from collections.abc import Iterable
 
 import numpy as np
 import torch
-
 from tokenspeed.runtime.utils import flatten_nested_list
 
 # blake2b emits an 8-byte digest natively, which is exactly our key width.
@@ -82,3 +81,58 @@ def hash_feature(feature) -> int:
         return _fold([feature])
 
     return _fold([repr(feature).encode()])
+
+
+def digest_feature(feature, model_specific_data=None) -> str:
+    """Return a persistable SHA-256 identity for exact encoder inputs."""
+    digest = hashlib.sha256()
+
+    def framed(value) -> None:
+        if isinstance(value, torch.Tensor):
+            tensor = value.detach()
+            digest.update(b"torch\0")
+            digest.update(str(tensor.dtype).encode())
+            digest.update(b"\0")
+            digest.update(repr(tuple(tensor.shape)).encode())
+            digest.update(b"\0")
+            digest.update(_raw_bytes(tensor))
+            return
+        if isinstance(value, np.ndarray):
+            array = np.ascontiguousarray(value)
+            digest.update(b"numpy\0")
+            digest.update(array.dtype.str.encode())
+            digest.update(b"\0")
+            digest.update(repr(tuple(array.shape)).encode())
+            digest.update(b"\0")
+            digest.update(memoryview(array).cast("B"))
+            return
+        if isinstance(value, dict):
+            digest.update(b"dict\0")
+            for key in sorted(value, key=lambda item: str(item)):
+                framed(str(key))
+                framed(value[key])
+            digest.update(b"end\0")
+            return
+        if isinstance(value, (list, tuple)):
+            digest.update(b"list\0")
+            digest.update(str(len(value)).encode())
+            digest.update(b"\0")
+            for item in value:
+                framed(item)
+            digest.update(b"end\0")
+            return
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            payload = bytes(value)
+            digest.update(b"bytes\0")
+            digest.update(str(len(payload)).encode())
+            digest.update(b"\0")
+            digest.update(payload)
+            return
+        digest.update(type(value).__qualname__.encode())
+        digest.update(b"\0")
+        digest.update(repr(value).encode())
+        digest.update(b"\0")
+
+    framed(feature)
+    framed(model_specific_data or {})
+    return digest.hexdigest()

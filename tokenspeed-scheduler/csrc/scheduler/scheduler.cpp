@@ -98,6 +98,10 @@ Scheduler::Scheduler(SchedulerConfig config)
     if (config_.prefix_replay_tokens < 0) {
         throw std::invalid_argument("Scheduler: prefix_replay_tokens must be >= 0");
     }
+    if (config_.store_state_checkpoint_interval_pages <= 0) {
+        throw std::invalid_argument("Scheduler: Store state checkpoint interval must be > 0");
+    }
+    coordinator_.SetStoreStateCheckpointInterval(config_.store_state_checkpoint_interval_pages);
     tier_transfers_.SetEnableL3(config_.enable_l3_storage);
     if (coordinator_.HasMambaStateGroup() && config_.max_scheduled_tokens < coordinator_.CacheBlockTokens()) {
         throw std::invalid_argument("Scheduler: Mamba max_scheduled_tokens must cover one cache block");

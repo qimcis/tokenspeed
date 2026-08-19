@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import uuid
 from collections.abc import Mapping
 from enum import Enum, auto
@@ -30,8 +31,7 @@ from typing import Any
 
 import msgspec
 import torch
-
-from tokenspeed.runtime.multimodal.hash import hash_feature
+from tokenspeed.runtime.multimodal.hash import digest_feature, hash_feature
 from tokenspeed.runtime.multimodal.shm_transport import ShmTensorHandle
 from tokenspeed.runtime.utils.env import envs
 
@@ -179,6 +179,10 @@ class MultimodalDataItem(msgspec.Struct, eq=False, kw_only=True, array_like=True
     # worker row-splits the concatenated-subgrid embedding per item). None for
     # non-EPD items (left to the vision tower).
     encode_handshake: dict | None = None
+    # Full post-preprocessing identity used only by persistent prefix caches.
+    # Append-only wire field: older producers may omit it, in which case reuse
+    # is safely disabled for that item with a request-unique digest.
+    cache_digest: str | None = None
 
     def __post_init__(self) -> None:
         # Compatibility shim for callers that predate the feature/feature_shm
@@ -240,6 +244,25 @@ class MultimodalDataItem(msgspec.Struct, eq=False, kw_only=True, array_like=True
             _MM_PAD_BASE + modality_offset + (self.hash % _MM_PAD_HASH_SLOTS)
         )
 
+    def ensure_cache_digest(self, *, fallback_salt: str | None = None) -> None:
+        if self.cache_digest is not None:
+            return
+        if self.feature is not None:
+            self.cache_digest = digest_feature(
+                self.feature,
+                self.model_specific_data,
+            )
+            return
+        # A legacy/remote producer may expose only a truncated integer hash.
+        # Never promote that value into a persistent cache identity. The
+        # gateway uses a random digest before TP broadcast; as a final fallback
+        # workers derive the same request-unique digest independently.
+        if fallback_salt is None:
+            self.cache_digest = f"uncacheable-{uuid.uuid4().hex}"
+        else:
+            payload = f"mm-uncacheable-v1\0{fallback_salt}".encode()
+            self.cache_digest = "uncacheable-" + hashlib.sha256(payload).hexdigest()
+
     def is_modality(self, modality: Modality) -> bool:
         return self.modality == modality
 
@@ -256,7 +279,40 @@ class MultimodalInputs(msgspec.Struct, eq=False, kw_only=True, array_like=True):
 
     def ensure_pad_values(self) -> None:
         for item in self.mm_items:
+            item.ensure_cache_digest()
             item.set_pad_value()
+
+    def cache_keys_per_page(
+        self, *, request_id: str, num_tokens: int, page_size: int
+    ) -> list[list[str]]:
+        if num_tokens < 0 or page_size <= 0:
+            raise ValueError("invalid multimodal cache page geometry")
+        pages = [[] for _ in range((num_tokens + page_size - 1) // page_size)]
+        for item_index, item in enumerate(self.mm_items):
+            item.ensure_cache_digest(fallback_salt=f"{request_id}\0{item_index}")
+            for start, end in item.offsets or ():
+                if start < 0 or end < start or end >= num_tokens:
+                    raise ValueError(
+                        f"multimodal item {item_index} has invalid offsets {(start, end)}"
+                    )
+                first_page = start // page_size
+                last_page = end // page_size
+                if item.encode_handshake is None:
+                    provenance = "local"
+                else:
+                    # Encode workers do not yet publish a model/kernel
+                    # fingerprint. Keep EPD pages request-local until they do,
+                    # rather than treating potentially different embeddings as
+                    # interchangeable in a persistent cross-node cache.
+                    request_digest = hashlib.sha256(request_id.encode()).hexdigest()
+                    provenance = f"epd-request-{request_digest}"
+                for page_index in range(first_page, last_page + 1):
+                    pages[page_index].append(
+                        "mm-v1:"
+                        f"{provenance}:{item_index}:{item.modality.name}:{start}:{end}:"
+                        f"{item.cache_digest}"
+                    )
+        return pages
 
     def publish_shm_features(self) -> None:
         for item in self.mm_items:

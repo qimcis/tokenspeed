@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Sequence
-from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
@@ -21,6 +21,18 @@ from tokenspeed.runtime.utils import get_colorful_logger
 logger = get_colorful_logger(__name__)
 
 
+def _future_result(future: Future, context: str):
+    """Normalize arbitrary worker failures at the asynchronous boundary."""
+    try:
+        return future.result()
+    except L3Error:
+        raise
+    except Exception as exc:
+        raise L3SubmissionError(
+            f"{context} raised {type(exc).__name__}: {exc}"
+        ) from exc
+
+
 @dataclass
 class _PendingLoad:
     hashes: tuple[str, ...]
@@ -33,6 +45,7 @@ class _PendingLoad:
 class _PendingWrite:
     objects: tuple[StoreObjectKey, ...]
     future: Future
+    nbytes: int
 
 
 @dataclass
@@ -50,7 +63,14 @@ class _ObjectProbe:
 class L3SubmissionTracker:
     """Own futures and cache-index observations, independent of Store I/O."""
 
-    def __init__(self, *, io_workers: int, presence_ttl: float) -> None:
+    def __init__(
+        self,
+        *,
+        io_workers: int,
+        presence_ttl: float,
+        max_pending_writes: int,
+        max_pending_write_bytes: int,
+    ) -> None:
         io_pool = None
         try:
             io_pool = ThreadPoolExecutor(
@@ -72,6 +92,9 @@ class L3SubmissionTracker:
         self._probe: _PresenceProbe | None = None
         self._object_probe: _ObjectProbe | None = None
         self._presence_ttl = float(presence_ttl)
+        self._max_pending_writes = int(max_pending_writes)
+        self._max_pending_write_bytes = int(max_pending_write_bytes)
+        self._pending_write_bytes = 0
 
     def submit_load(
         self,
@@ -91,12 +114,40 @@ class L3SubmissionTracker:
         self,
         objects: tuple[StoreObjectKey, ...],
         function: Callable[[], dict[StoreObjectKey, bool]],
-    ) -> None:
+        *,
+        nbytes: int,
+    ) -> bool:
+        if not self.can_accept_write(nbytes):
+            return False
         try:
             future = self._write_pool.submit(function)
         except RuntimeError as exc:
             raise L3SubmissionError("failed to submit background L3 write") from exc
-        self._writes.append(_PendingWrite(objects=objects, future=future))
+        self._writes.append(
+            _PendingWrite(objects=objects, future=future, nbytes=int(nbytes))
+        )
+        self._pending_write_bytes += int(nbytes)
+        return True
+
+    def can_accept_write(self, nbytes: int) -> bool:
+        """Check queue capacity before allocating a pinned write snapshot."""
+        self.poll_writes()
+        if nbytes <= 0:
+            raise L3SubmissionError("L3 write size must be positive")
+        if (
+            len(self._writes) >= self._max_pending_writes
+            or self._pending_write_bytes + nbytes > self._max_pending_write_bytes
+        ):
+            logger.warning(
+                "dropping L3 write snapshot: pending=%s/%s bytes=%s/%s requested=%s",
+                len(self._writes),
+                self._max_pending_writes,
+                self._pending_write_bytes,
+                self._max_pending_write_bytes,
+                nbytes,
+            )
+            return False
+        return True
 
     def load_status(self, key: tuple[int, ...]) -> tuple[str, list[str], str | None]:
         submission = self._loads.get(key)
@@ -104,10 +155,10 @@ class L3SubmissionTracker:
             return "failed", [], f"unknown L3 load submission {key}"
         if submission.status == "pending" and submission.future.done():
             try:
-                submission.future.result()
+                _future_result(submission.future, f"L3 load {key}")
                 submission.status = "succeeded"
                 self.record_presence(submission.hashes, present=True)
-            except (L3Error, RuntimeError, CancelledError) as exc:
+            except L3Error as exc:
                 submission.status = "failed"
                 submission.error = str(exc)
         hashes = (
@@ -128,8 +179,8 @@ class L3SubmissionTracker:
         if submission.future.cancel():
             return True
         try:
-            submission.future.result()
-        except (L3Error, RuntimeError, CancelledError):
+            _future_result(submission.future, f"aborted L3 load {key}")
+        except L3Error:
             pass
         return False
 
@@ -141,17 +192,29 @@ class L3SubmissionTracker:
                 pending.append(submission)
                 continue
             try:
-                outcome = submission.future.result()
-            except (L3Error, RuntimeError, CancelledError) as exc:
+                outcome = _future_result(submission.future, "L3 background Store write")
+                if not isinstance(outcome, dict):
+                    raise L3SubmissionError(
+                        "L3 background Store write returned a non-dict outcome"
+                    )
+            except L3Error as exc:
                 logger.warning("L3 background put failed: %s", exc)
                 outcome = {value: False for value in submission.objects}
-            self._outcomes.update(outcome)
-            for (_group, content_hash, _offset), present in outcome.items():
-                if not present:
-                    self._presence[content_hash] = (
-                        False,
-                        now + self._presence_ttl,
-                    )
+            try:
+                self._outcomes.update(outcome)
+                for (_group, content_hash, _offset), present in outcome.items():
+                    if not present:
+                        self._presence[content_hash] = (
+                            False,
+                            now + self._presence_ttl,
+                        )
+            except Exception as exc:
+                logger.warning(
+                    "invalid L3 background put outcome; marking failed: %s", exc
+                )
+                self._outcomes.update({value: False for value in submission.objects})
+            finally:
+                self._pending_write_bytes -= submission.nbytes
         self._writes = pending
 
     def probe_presence(
@@ -179,8 +242,12 @@ class L3SubmissionTracker:
             probe = self._probe
             self._probe = None
             try:
-                outcome = probe.future.result()
-            except (L3Error, RuntimeError, CancelledError) as exc:
+                outcome = _future_result(probe.future, "L3 Store existence probe")
+                if not isinstance(outcome, dict):
+                    raise L3SubmissionError(
+                        "L3 Store existence probe returned a non-dict outcome"
+                    )
+            except L3Error as exc:
                 logger.warning("L3 Store existence probe failed: %s", exc)
                 outcome = {value: False for value in probe.hashes}
                 probe_error = str(exc)
@@ -231,8 +298,17 @@ class L3SubmissionTracker:
             return "pending", {}, None
         self._object_probe = None
         try:
-            return "ready", probe.future.result(), None
-        except (L3Error, RuntimeError, CancelledError) as exc:
+            outcome = _future_result(probe.future, "L3 Store object probe")
+            if not isinstance(outcome, dict):
+                raise L3SubmissionError(
+                    "L3 Store object probe returned a non-dict outcome"
+                )
+            return (
+                "ready",
+                outcome,
+                None,
+            )
+        except L3Error as exc:
             logger.warning("L3 Store object probe failed: %s", exc)
             return "ready", {}, str(exc)
 
@@ -262,8 +338,8 @@ class L3SubmissionTracker:
             futures.append(self._object_probe.future)
         for future in futures:
             try:
-                future.result()
-            except (L3Error, RuntimeError, CancelledError):
+                _future_result(future, "L3 shutdown wait")
+            except L3Error:
                 pass
         self.poll_writes()
 
@@ -281,6 +357,7 @@ class L3SubmissionTracker:
     def clear(self) -> None:
         self._loads.clear()
         self._writes.clear()
+        self._pending_write_bytes = 0
         self._outcomes.clear()
         self._presence.clear()
         self._probe = None
