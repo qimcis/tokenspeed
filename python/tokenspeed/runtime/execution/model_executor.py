@@ -234,14 +234,32 @@ class ModelExecutorConfig:
                 physical_context_len - derived_context_len,
             )
 
+        layer_types = tuple(getattr(model_config.hf_text_config, "layer_types", ()))
+        qwen_gdn_prefill_graph_unsafe = (
+            getattr(model_config.hf_text_config, "model_type", "")
+            in {"qwen3_5_text", "qwen3_5_moe_text"}
+            and "linear_attention" in layer_types
+        )
+
         # DSA's sparse indexer reads the attention backend's
         # ``chunked_prefill_metadata`` from inside the captured prefill segment,
         # but the prefill graph rebinds only the live ForwardContext at replay --
         # the backend metadata object stays frozen at capture-time (dummy) values.
         # So the two are fundamentally incompatible; force eager prefill for DSA.
-        disable_prefill_graph = bool(server_args.disable_prefill_graph) or (
-            model_config.attention_arch == AttentionArch.DSA
+        # Qwen3.5 GDN has a separate correctness hazard: after constrained-cache
+        # parent promotion, padded replay can consume stale recurrent state and
+        # produce NaN logits. Keep its prefill eager until the graph owns a
+        # replay-stable state-page mapping; decode graphs remain enabled.
+        disable_prefill_graph = (
+            bool(server_args.disable_prefill_graph)
+            or model_config.attention_arch == AttentionArch.DSA
+            or qwen_gdn_prefill_graph_unsafe
         )
+        if qwen_gdn_prefill_graph_unsafe and not server_args.disable_prefill_graph:
+            logger.warning(
+                "Disabling prefill CUDA graphs for Qwen3.5 GDN because "
+                "constrained-cache page promotion is not replay-safe"
+            )
 
         return ModelExecutorConfig(
             max_req_pool_size=max_req_pool_size,

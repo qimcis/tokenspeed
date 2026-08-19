@@ -4,16 +4,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Callable
 
 import torch
 import torch.distributed as dist
-from tokenspeed_scheduler import Cache, ExecutionEvent
-
 from tokenspeed.runtime.cache.l3.errors import L3Error, L3SubmissionError
 from tokenspeed.runtime.utils import get_colorful_logger
+from tokenspeed_scheduler import Cache, ExecutionEvent
 
 logger = get_colorful_logger(__name__)
 
@@ -95,6 +94,38 @@ class L3LoadCoordinator:
             )
         )
 
+    @staticmethod
+    def _write_objects(plan) -> list[tuple[int, str, int]]:
+        objects = []
+        for op in plan.cache:
+            if not isinstance(op, Cache.WriteBackOp):
+                continue
+            offset_groups = list(op.cache_block_offsets)
+            for index, (groups, hashes) in enumerate(
+                zip(op.group_ids, op.content_hashes)
+            ):
+                offsets = (
+                    offset_groups[index]
+                    if index < len(offset_groups)
+                    else [0] * len(hashes)
+                )
+                objects.extend(
+                    (int(group), str(value), int(offset))
+                    for group, value, offset in zip(groups, hashes, offsets)
+                    if value
+                )
+        return list(dict.fromkeys(objects))
+
+    def _update_store_keys(
+        self, objects: list[tuple[int, str, int]], present: list[bool]
+    ) -> None:
+        self.scheduler.update_store_keys(
+            [value[0] for value in objects],
+            [value[1] for value in objects],
+            [value[2] for value in objects],
+            present,
+        )
+
     def submit(self, plan, zero_event) -> bool:
         """Submit L3 work and return whether execution must be deferred."""
         l3_ops = [
@@ -116,17 +147,10 @@ class L3LoadCoordinator:
                     )
             except L3Error as exc:
                 submit_error = str(exc)
-                write_hashes = {
-                    str(value)
-                    for op in l3_ops
-                    if isinstance(op, Cache.WriteBackOp)
-                    for values in op.content_hashes
-                    for value in values
-                    if value
-                }
-                if write_hashes:
+                write_objects = self._write_objects(SimpleNamespace(cache=l3_ops))
+                if write_objects:
                     self.executor.record_store_index_outcomes(
-                        {value: False for value in write_hashes}
+                        {value: False for value in write_objects}
                     )
                 if not op_ids:
                     logger.warning(
@@ -209,18 +233,24 @@ class L3LoadCoordinator:
         hashes = [str(value) for value in self.scheduler.store_probe_hashes()]
         if not hashes:
             return True
-        status, outcome, error = self.executor.probe_store_presence(hashes)
+        status, outcome, error = self.executor.probe_store_objects(hashes)
         gathered = self._gather({"status": status, "outcome": outcome, "error": error})
         if any(item["status"] == "pending" for item in gathered):
             return False
+        if any(item["error"] for item in gathered):
+            self.scheduler.update_store_index(hashes, [False] * len(hashes))
+            self.executor.record_presence(hashes, present=False)
+            return True
+        objects = sorted(set().union(*(item["outcome"] for item in gathered)))
         present = [
             all(bool(item["outcome"].get(value, False)) for item in gathered)
-            for value in hashes
+            for value in objects
         ]
-        self.scheduler.update_store_index(hashes, present)
-        missing = [value for value, exists in zip(hashes, present) if not exists]
+        if objects:
+            self._update_store_keys(objects, present)
+        missing = {value[1] for value, exists in zip(objects, present) if not exists}
         if missing:
-            self.executor.record_presence(missing, present=False)
+            self.executor.record_presence(sorted(missing), present=False)
         return True
 
     def commit_store_index_outcomes(self) -> None:
@@ -233,12 +263,12 @@ class L3LoadCoordinator:
             common.intersection_update(outcome)
         if not common:
             return
-        hashes = sorted(common)
+        objects = sorted(common)
         present = [
-            all(bool(outcome[value]) for outcome in gathered) for value in hashes
+            all(bool(outcome[value]) for outcome in gathered) for value in objects
         ]
-        self.scheduler.update_store_index(hashes, present)
-        self.executor.acknowledge_store_index_outcomes(hashes)
-        failed = [value for value, success in zip(hashes, present) if not success]
+        self._update_store_keys(objects, present)
+        self.executor.acknowledge_store_index_outcomes(objects)
+        failed = [value[1] for value, success in zip(objects, present) if not success]
         if failed:
             self.executor.record_presence(failed, present=False)

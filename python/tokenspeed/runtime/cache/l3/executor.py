@@ -26,7 +26,6 @@ from collections.abc import Sequence
 from typing import Any
 
 import torch
-
 from tokenspeed.runtime.cache.l3.buffers import L3BufferManager
 from tokenspeed.runtime.cache.l3.errors import (
     L3BackendError,
@@ -41,7 +40,7 @@ from tokenspeed.runtime.cache.l3.namespace import (
     fingerprint_model_artifacts,
     store_key,
 )
-from tokenspeed.runtime.cache.l3.store_io import L3StoreIO
+from tokenspeed.runtime.cache.l3.store_io import L3StoreIO, StoreObjectKey
 from tokenspeed.runtime.cache.l3.submissions import L3SubmissionTracker
 from tokenspeed.runtime.cache.store.base import BaseKVStore
 from tokenspeed.runtime.cache.store.errors import KVStoreShutdownError
@@ -108,6 +107,9 @@ class L3CacheExecutor:
         scheduler_group_ids = tuple(
             spec.group_id for spec in device_pool.paged_cache_group_specs
         )
+        cache_blocks_per_hash = self._cache_blocks_per_hash(
+            device_pool, target_layout, scheduler_group_ids
+        )
         if (
             draft_layout is not None
             and draft_layout.buffers[0] is target_layout.buffers[0]
@@ -151,6 +153,7 @@ class L3CacheExecutor:
             direct_gpu=direct_gpu,
             direct_chunk_objects=direct_gpu_chunk_objects,
             host_chunk_objects=host_pipeline_chunk_pages,
+            cache_blocks_per_hash=cache_blocks_per_hash,
         )
         self._submissions = L3SubmissionTracker(
             io_workers=io_workers, presence_ttl=store_probe_ttl
@@ -180,6 +183,26 @@ class L3CacheExecutor:
             raise ValueError("L3 direct_gpu_chunk_objects must be positive")
         if config["host_pipeline_chunk_pages"] <= 0:
             raise ValueError("L3 host_pipeline_chunk_pages must be positive")
+
+    @staticmethod
+    def _cache_blocks_per_hash(
+        device_pool, layout, group_ids: Sequence[str]
+    ) -> tuple[int, ...]:
+        contract = getattr(device_pool, "runtime_contract", None)
+        if contract is None:
+            return tuple(group.cache_blocks_per_lcm_block for group in layout.groups)
+        specs = {spec.group_id: spec for spec in contract.group_specs}
+        counts = []
+        for group_id in group_ids:
+            spec = specs[group_id]
+            cache_block_tokens = int(spec.rows_per_page) * int(spec.entry_stride_tokens)
+            if contract.block_size % cache_block_tokens:
+                raise ValueError(
+                    f"L3 cache group {group_id!r} block size does not divide "
+                    "the scheduler hash span"
+                )
+            counts.append(contract.block_size // cache_block_tokens)
+        return tuple(counts)
 
     @staticmethod
     def _metadata(operation: Any, transfer_count: int, *, required: bool):
@@ -305,9 +328,15 @@ class L3CacheExecutor:
                 ready_event.record()
             except RuntimeError as exc:
                 raise L3TransferError("failed to record L3 write readiness") from exc
-            hashes = tuple(value for value in write_hashes if value)
+            objects = tuple(
+                (int(transfer[0]), value, int(offset))
+                for transfer, value, offset in zip(
+                    write_transfers, write_hashes, write_offsets
+                )
+                if value
+            )
             self._submissions.submit_write(
-                hashes,
+                objects,
                 lambda: self._run_put(
                     tuple(write_transfers),
                     tuple(write_hashes),
@@ -345,18 +374,26 @@ class L3CacheExecutor:
         finally:
             self._io.batcher.end_read()
 
-    def _run_put(self, transfers, hashes, offsets, ready_event) -> dict[str, bool]:
-        requested = tuple(dict.fromkeys(value for value in hashes if value))
+    def _run_put(
+        self, transfers, hashes, offsets, ready_event
+    ) -> dict[StoreObjectKey, bool]:
+        requested = tuple(
+            dict.fromkeys(
+                (int(transfer[0]), value, int(offset))
+                for transfer, value, offset in zip(transfers, hashes, offsets)
+                if value
+            )
+        )
         try:
             try:
                 ready_event.synchronize()
             except RuntimeError as exc:
                 raise L3TransferError("failed to wait for L3 write readiness") from exc
-            completed = set(self._io.put(transfers, hashes, offsets))
+            present = self._io.put(transfers, hashes, offsets)
         except (L3BackendError, L3TransferError) as exc:
             logger.warning("L3 put failed: %s", exc)
-            completed = set()
-        return {value: value in completed for value in requested}
+            present = {}
+        return {value: bool(present.get(value, False)) for value in requested}
 
     def poll_results(self) -> list:
         self._submissions.poll_writes()
@@ -377,19 +414,24 @@ class L3CacheExecutor:
     def probe_store_presence(self, content_hashes: Sequence[str]):
         return self._submissions.probe_presence(content_hashes, self._io.probe)
 
+    def probe_store_objects(self, content_hashes: Sequence[str]):
+        return self._submissions.probe_objects(content_hashes, self._io.probe_objects)
+
     def invalidate_presence(self, content_hashes: Sequence[str]) -> None:
         self._submissions.invalidate_presence(content_hashes)
 
     def record_presence(self, content_hashes: Sequence[str], *, present: bool) -> None:
         self._submissions.record_presence(content_hashes, present=present)
 
-    def peek_store_index_outcomes(self) -> dict[str, bool]:
+    def peek_store_index_outcomes(self) -> dict[StoreObjectKey, bool]:
         return self._submissions.outcomes()
 
-    def acknowledge_store_index_outcomes(self, content_hashes: Sequence[str]) -> None:
-        self._submissions.acknowledge_outcomes(content_hashes)
+    def acknowledge_store_index_outcomes(
+        self, objects: Sequence[StoreObjectKey]
+    ) -> None:
+        self._submissions.acknowledge_outcomes(objects)
 
-    def record_store_index_outcomes(self, outcomes: dict[str, bool]) -> None:
+    def record_store_index_outcomes(self, outcomes: dict[StoreObjectKey, bool]) -> None:
         self._submissions.record_outcomes(outcomes)
 
     def shutdown(self) -> None:

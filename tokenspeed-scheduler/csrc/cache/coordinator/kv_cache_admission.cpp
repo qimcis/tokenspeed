@@ -311,7 +311,8 @@ bool KvCacheCoordinator::CanAdmitAfterReleasing(
 }
 
 std::int32_t KvCacheCoordinator::PromotionBoundaryTokens(const PrefixProbe& prefix) const {
-    const std::int32_t matched_tokens = std::max(prefix.device.num_common_tokens, prefix.host.num_common_tokens);
+    const std::int32_t matched_tokens =
+        std::max({prefix.device.num_common_tokens, prefix.host.num_common_tokens, prefix.store.num_common_tokens});
     const std::int32_t prefix_closed_tokens =
         std::max(prefix.device.prefix_closed_tokens, prefix.host.prefix_closed_tokens);
     return prefix_closed_tokens > matched_tokens ? prefix_closed_tokens : 0;
@@ -344,6 +345,7 @@ std::optional<KvCacheCoordinator::AdmissionResult> KvCacheCoordinator::Admit(
     const std::uint64_t access_epoch = request_access_epoch.has_value() ? *request_access_epoch : ++next_access_epoch_;
     const std::int32_t promotion_boundary_tokens = PromotionBoundaryTokens(plan.prefix);
     std::vector<std::vector<CacheKey>> group_keys = plan.prefix.group_keys;
+    std::vector<GroupPrefixProbe> store_probes = plan.prefix.store.per_group;
     AcquiredPrefix acquired_prefix = acquirePrefix(std::move(plan.prefix), access_epoch);
     AdmissionResult result{
         .device_prefix_tokens = acquired_prefix.device.num_common_tokens,
@@ -391,35 +393,38 @@ std::optional<KvCacheCoordinator::AdmissionResult> KvCacheCoordinator::Admit(
                 pool_, *demand.table, std::move(acquired_prefix.host.per_group[i].blocks), result.load_pairs);
         }
     }
-    const std::int32_t host_tokens = result.host_prefix_tokens > 0 ? result.host_prefix_tokens : result.device_prefix_tokens;
-    const std::int32_t store_extra_tokens = result.store_prefix_tokens - std::max(result.device_prefix_tokens, host_tokens);
-    const std::int32_t store_extra_pages = store_extra_tokens > 0 ? store_extra_tokens / cache_block_tokens_ : 0;
-    const std::int32_t host_pages = std::max(result.device_prefix_tokens, host_tokens) / cache_block_tokens_;
-    if (store_extra_pages > 0) {
+    const std::int32_t local_prefix_tokens = std::max(result.device_prefix_tokens, result.host_prefix_tokens);
+    if (result.store_prefix_tokens > local_prefix_tokens) {
         for (std::size_t gi = 0; gi < groups_.size(); ++gi) {
             const std::int32_t g_tokens = groups_[gi].Manager().CacheBlockTokens();
-            const std::int32_t blocks_per_hash = cache_block_tokens_ / g_tokens;
-            const std::int32_t num_store_blocks = store_extra_pages * blocks_per_hash;
-            if (num_store_blocks == 0) continue;
+            const std::int32_t begin_block = local_prefix_tokens / g_tokens;
+            const std::int32_t end_block = result.store_prefix_tokens / g_tokens;
+            _assert(static_cast<std::size_t>(end_block) <= store_probes[gi].hits.size(),
+                    "store extension exceeds its probe");
+            const auto extension_hits = std::span<const std::uint8_t>(store_probes[gi].hits).subspan(
+                static_cast<std::size_t>(begin_block), static_cast<std::size_t>(end_block - begin_block));
+            const std::int32_t num_store_blocks =
+                static_cast<std::int32_t>(std::ranges::count(extension_hits, std::uint8_t{1}));
             std::vector<CacheBlockRef> dest_refs = pool_.AcquireBlocks(static_cast<std::uint32_t>(gi),
                                                                         groups_[gi].Manager().CacheBlocksPerLcmBlock(),
                                                                         num_store_blocks);
             FatalCheck(static_cast<std::int32_t>(dest_refs.size()) == num_store_blocks,
                        "store extension: admission plan no longer fits the block pool");
             auto dest_it = dest_refs.begin();
-            for (std::int32_t page = host_pages; page < host_pages + store_extra_pages; ++page) {
-                for (std::int32_t off = 0; off < blocks_per_hash; ++off) {
-                    const std::size_t key_idx = static_cast<std::size_t>(page * blocks_per_hash + off);
-                    const CacheKey& key = group_keys[gi][key_idx];
-                    demands[gi].table->blocks_.push_back(std::move(*dest_it));
-                    ++dest_it;
-                    result.store_load_pairs.push_back(StoreTransfer{
-                        .group_id = static_cast<std::uint32_t>(gi),
-                        .content_hash = key.content_hash,
-                        .cache_block_offset = key.cache_block_offset,
-                        .destination = demands[gi].table->blocks_.back(),
-                    });
+            for (std::int32_t block = begin_block; block < end_block; ++block) {
+                if (store_probes[gi].hits[static_cast<std::size_t>(block)] == 0) {
+                    demands[gi].table->blocks_.emplace_back();
+                    continue;
                 }
+                const CacheKey& key = group_keys[gi][static_cast<std::size_t>(block)];
+                demands[gi].table->blocks_.push_back(std::move(*dest_it));
+                ++dest_it;
+                result.store_load_pairs.push_back(StoreTransfer{
+                    .group_id = static_cast<std::uint32_t>(gi),
+                    .content_hash = key.content_hash,
+                    .cache_block_offset = key.cache_block_offset,
+                    .destination = demands[gi].table->blocks_.back(),
+                });
             }
             _assert(dest_it == dest_refs.end(), "unused store extension destination");
         }

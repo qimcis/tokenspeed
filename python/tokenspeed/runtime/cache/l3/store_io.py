@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-
 from tokenspeed.runtime.cache.l2.layerwise_load import LayerwiseLoadTracker
 from tokenspeed.runtime.cache.l3.buffers import L3BufferManager, StashSlot
 from tokenspeed.runtime.cache.l3.errors import L3BackendError, L3TransferError
@@ -24,6 +23,7 @@ from tokenspeed.runtime.utils import get_colorful_logger, get_device_module
 
 logger = get_colorful_logger(__name__)
 device_module = get_device_module()
+StoreObjectKey = tuple[int, str, int]
 
 
 @dataclass(frozen=True)
@@ -232,6 +232,7 @@ class L3StoreIO:
         direct_gpu: str,
         direct_chunk_objects: int,
         host_chunk_objects: int,
+        cache_blocks_per_hash: Sequence[int],
     ) -> None:
         self.store = store
         self.write_store = write_store
@@ -243,6 +244,13 @@ class L3StoreIO:
         self.namespace = namespace
         self.direct_chunk_objects = direct_chunk_objects
         self.host_chunk_objects = host_chunk_objects
+        self.cache_blocks_per_hash = tuple(
+            int(value) for value in cache_blocks_per_hash
+        )
+        if len(self.cache_blocks_per_hash) != len(self.layout.groups) or any(
+            value <= 0 for value in self.cache_blocks_per_hash
+        ):
+            raise L3TransferError("invalid per-group L3 cache blocks per hash")
         self.load_trackers: list[tuple[LayerwiseLoadTracker, int]] = []
         for pool, pool_layout in pool_layouts:
             try:
@@ -312,14 +320,14 @@ class L3StoreIO:
         transfers: Sequence[tuple[int, int, int]],
         content_hashes: Sequence[str],
         offsets: Sequence[int],
-    ) -> list[str]:
+    ) -> dict[StoreObjectKey, bool]:
         records = [
             (index, content_hash, self._key(content_hash, group, offsets[index]))
             for index, (group, _device, _host) in enumerate(transfers)
             if index < len(content_hashes) and (content_hash := content_hashes[index])
         ]
         if not records:
-            return []
+            return {}
         keys = [record[2] for record in records]
         try:
             exists = self.batcher.exists(keys, write=True)
@@ -350,10 +358,14 @@ class L3StoreIO:
             missing = []
         if missing:
             self._put_staged(transfers, records, keys, succeeded, missing)
-        by_hash: dict[str, bool] = {}
-        for (_index, content_hash, _key), success in zip(records, succeeded):
-            by_hash[content_hash] = by_hash.get(content_hash, True) and success
-        return [value for value, success in by_hash.items() if success]
+        return {
+            (
+                int(transfers[index][0]),
+                content_hash,
+                int(offsets[index]),
+            ): bool(success)
+            for (index, content_hash, _key), success in zip(records, succeeded)
+        }
 
     def _put_staged(self, transfers, records, keys, succeeded, missing) -> None:
         from tokenspeed_kernel.ops.kvcache.host_transfer import transfer_cache_ranges
@@ -595,11 +607,22 @@ class L3StoreIO:
         return results
 
     def probe(self, content_hashes: Sequence[str]) -> dict[str, bool]:
+        objects = self.probe_objects(content_hashes)
+        outcome = {value: True for value in content_hashes}
+        for (_group, content_hash, _offset), present in objects.items():
+            outcome[content_hash] = outcome[content_hash] and present
+        return outcome
+
+    def probe_objects(
+        self, content_hashes: Sequence[str]
+    ) -> dict[StoreObjectKey, bool]:
         keys: list[str] = []
-        owners: list[str] = []
+        owners: list[StoreObjectKey] = []
         for content_hash in content_hashes:
-            for group in self.layout.groups:
-                for offset in range(group.cache_blocks_per_lcm_block):
+            for group_index, (group, blocks_per_hash) in enumerate(
+                zip(self.layout.groups, self.cache_blocks_per_hash)
+            ):
+                for offset in range(blocks_per_hash):
                     keys.append(
                         store_key(
                             content_hash,
@@ -609,16 +632,13 @@ class L3StoreIO:
                             namespace=self.namespace,
                         )
                     )
-                    owners.append(content_hash)
+                    owners.append((group_index, content_hash, offset))
         exists = self.batcher.exists(keys)
         if len(exists) != len(keys):
             raise L3BackendError(
                 f"L3 batch_exists length mismatch {len(exists)} != {len(keys)}"
             )
-        outcome = {value: True for value in content_hashes}
-        for owner, present in zip(owners, exists):
-            outcome[owner] = outcome[owner] and int(present) == 1
-        return outcome
+        return {owner: int(present) == 1 for owner, present in zip(owners, exists)}
 
     def abort(self, op_ids: Sequence[int]) -> None:
         key = set(op_ids)

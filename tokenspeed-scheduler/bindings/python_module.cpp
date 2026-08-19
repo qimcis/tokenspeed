@@ -359,6 +359,15 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
             },
             nb::arg("page_hashes"), nb::arg("present"))
         .def(
+            "update_store_keys",
+            [](tokenspeed::Scheduler& s, std::vector<std::uint32_t> group_ids,
+               std::vector<std::string> hashes, std::vector<std::int32_t> offsets,
+               std::vector<bool> present) {
+                s.UpdateStoreKeys(group_ids, hashes, offsets, present);
+            },
+            nb::arg("group_ids"), nb::arg("content_hashes"),
+            nb::arg("cache_block_offsets"), nb::arg("present"))
+        .def(
             "store_hit_tokens",
             [](tokenspeed::Scheduler& s, std::vector<std::string> hashes) { return s.StoreHitTokens(hashes); },
             nb::arg("page_hashes"))

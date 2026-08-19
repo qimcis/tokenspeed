@@ -15,6 +15,7 @@ from tokenspeed.runtime.cache.l3.errors import (
     L3ShutdownError,
     L3SubmissionError,
 )
+from tokenspeed.runtime.cache.l3.store_io import StoreObjectKey
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
@@ -30,12 +31,18 @@ class _PendingLoad:
 
 @dataclass
 class _PendingWrite:
-    hashes: tuple[str, ...]
+    objects: tuple[StoreObjectKey, ...]
     future: Future
 
 
 @dataclass
 class _PresenceProbe:
+    hashes: tuple[str, ...]
+    future: Future
+
+
+@dataclass
+class _ObjectProbe:
     hashes: tuple[str, ...]
     future: Future
 
@@ -60,9 +67,10 @@ class L3SubmissionTracker:
         self._write_pool = write_pool
         self._loads: dict[tuple[int, ...], _PendingLoad] = {}
         self._writes: list[_PendingWrite] = []
-        self._outcomes: dict[str, bool] = {}
+        self._outcomes: dict[StoreObjectKey, bool] = {}
         self._presence: dict[str, tuple[bool, float]] = {}
         self._probe: _PresenceProbe | None = None
+        self._object_probe: _ObjectProbe | None = None
         self._presence_ttl = float(presence_ttl)
 
     def submit_load(
@@ -80,13 +88,15 @@ class L3SubmissionTracker:
         self._loads[key] = _PendingLoad(hashes=hashes, future=future)
 
     def submit_write(
-        self, hashes: tuple[str, ...], function: Callable[[], dict[str, bool]]
+        self,
+        objects: tuple[StoreObjectKey, ...],
+        function: Callable[[], dict[StoreObjectKey, bool]],
     ) -> None:
         try:
             future = self._write_pool.submit(function)
         except RuntimeError as exc:
             raise L3SubmissionError("failed to submit background L3 write") from exc
-        self._writes.append(_PendingWrite(hashes=hashes, future=future))
+        self._writes.append(_PendingWrite(objects=objects, future=future))
 
     def load_status(self, key: tuple[int, ...]) -> tuple[str, list[str], str | None]:
         submission = self._loads.get(key)
@@ -134,10 +144,14 @@ class L3SubmissionTracker:
                 outcome = submission.future.result()
             except (L3Error, RuntimeError, CancelledError) as exc:
                 logger.warning("L3 background put failed: %s", exc)
-                outcome = {value: False for value in submission.hashes}
+                outcome = {value: False for value in submission.objects}
             self._outcomes.update(outcome)
-            for value, present in outcome.items():
-                self._presence[value] = (bool(present), now + self._presence_ttl)
+            for (_group, content_hash, _offset), present in outcome.items():
+                if not present:
+                    self._presence[content_hash] = (
+                        False,
+                        now + self._presence_ttl,
+                    )
         self._writes = pending
 
     def probe_presence(
@@ -197,21 +211,46 @@ class L3SubmissionTracker:
             if value:
                 self._presence[str(value)] = (bool(present), expiry)
 
+    def probe_objects(
+        self,
+        content_hashes: Sequence[str],
+        loader: Callable[[tuple[str, ...]], dict[StoreObjectKey, bool]],
+    ) -> tuple[str, dict[StoreObjectKey, bool], str | None]:
+        hashes = tuple(dict.fromkeys(value for value in content_hashes if value))
+        if not hashes:
+            return "ready", {}, None
+        if self._object_probe is None:
+            try:
+                future = self._io_pool.submit(loader, hashes)
+            except RuntimeError as exc:
+                raise L3SubmissionError("failed to submit L3 object probe") from exc
+            self._object_probe = _ObjectProbe(hashes, future)
+            return "pending", {}, None
+        probe = self._object_probe
+        if not probe.future.done():
+            return "pending", {}, None
+        self._object_probe = None
+        try:
+            return "ready", probe.future.result(), None
+        except (L3Error, RuntimeError, CancelledError) as exc:
+            logger.warning("L3 Store object probe failed: %s", exc)
+            return "ready", {}, str(exc)
+
     def invalidate_presence(self, content_hashes: Sequence[str]) -> None:
         for value in content_hashes:
             self._presence.pop(value, None)
 
-    def outcomes(self) -> dict[str, bool]:
+    def outcomes(self) -> dict[StoreObjectKey, bool]:
         self.poll_writes()
         return dict(self._outcomes)
 
-    def acknowledge_outcomes(self, hashes: Sequence[str]) -> None:
-        for value in hashes:
+    def acknowledge_outcomes(self, objects: Sequence[StoreObjectKey]) -> None:
+        for value in objects:
             self._outcomes.pop(value, None)
 
-    def record_outcomes(self, outcomes: dict[str, bool]) -> None:
+    def record_outcomes(self, outcomes: dict[StoreObjectKey, bool]) -> None:
         self._outcomes.update(
-            {str(value): bool(present) for value, present in outcomes.items() if value}
+            {value: bool(present) for value, present in outcomes.items()}
         )
 
     def wait(self) -> None:
@@ -219,6 +258,8 @@ class L3SubmissionTracker:
         futures.extend(submission.future for submission in self._writes)
         if self._probe is not None:
             futures.append(self._probe.future)
+        if self._object_probe is not None:
+            futures.append(self._object_probe.future)
         for future in futures:
             try:
                 future.result()
@@ -243,3 +284,4 @@ class L3SubmissionTracker:
         self._outcomes.clear()
         self._presence.clear()
         self._probe = None
+        self._object_probe = None

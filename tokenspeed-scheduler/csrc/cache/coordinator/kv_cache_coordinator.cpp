@@ -294,44 +294,68 @@ KvCacheCoordinator::PrefixProbe KvCacheCoordinator::ProbePrefix(std::span<const 
     }
     const std::int32_t floor_tokens = std::max(out.device.num_common_tokens, out.host.num_common_tokens);
     out.store.per_group.resize(groups_.size());
+    for (std::size_t gi = 0; gi < groups_.size(); ++gi) {
+        const std::int32_t blocks_per_hash =
+            cache_block_tokens_ / groups_[gi].Manager().CacheBlockTokens();
+        out.store.per_group[gi].hits.assign(
+            static_cast<std::size_t>(num_cache_blocks * blocks_per_hash), 0);
+    }
+    out.store.num_common_tokens = floor_tokens;
     if (!store_index_.empty() && num_cache_blocks > 0) {
-        std::int32_t hit_pages = 0;
-        for (std::int32_t page = floor_tokens / cache_block_tokens_; page < num_cache_blocks; ++page) {
-            bool page_hit = true;
-            for (std::size_t gi = 0; gi < groups_.size(); ++gi) {
-                const std::int32_t g_tokens = groups_[gi].Manager().CacheBlockTokens();
-                const std::int32_t blocks_per_hash = cache_block_tokens_ / g_tokens;
+        const std::int32_t floor_page = floor_tokens / cache_block_tokens_;
+        std::int32_t closed_boundary = num_cache_blocks;
+        for (std::size_t gi = 0; gi < groups_.size(); ++gi) {
+            const KvCacheManager& manager = groups_[gi].Manager();
+            if (!manager.MatchIsPrefixClosed()) continue;
+            const std::int32_t blocks_per_hash = cache_block_tokens_ / manager.CacheBlockTokens();
+            std::int32_t group_boundary = floor_page;
+            for (std::int32_t page = floor_page; page < num_cache_blocks; ++page) {
+                bool page_hit = true;
                 for (std::int32_t off = 0; off < blocks_per_hash; ++off) {
                     const std::size_t key_idx = static_cast<std::size_t>(page * blocks_per_hash + off);
-                    if (key_idx >= out.group_keys[gi].size() || !store_index_.contains(out.group_keys[gi][key_idx])) {
+                    if (!store_index_.contains(out.group_keys[gi][key_idx])) {
                         page_hit = false;
                         break;
                     }
                 }
                 if (!page_hit) break;
+                group_boundary = page + 1;
             }
-            if (!page_hit) break;
-            ++hit_pages;
+            closed_boundary = std::min(closed_boundary, group_boundary);
         }
-        out.store.num_common_tokens = floor_tokens + hit_pages * cache_block_tokens_;
-        for (std::size_t gi = 0; gi < groups_.size(); ++gi) {
-            const std::int32_t g_tokens = groups_[gi].Manager().CacheBlockTokens();
-            const std::int32_t blocks_per_hash = cache_block_tokens_ / g_tokens;
-            const std::int32_t total_blocks = num_cache_blocks * blocks_per_hash;
-            out.store.per_group[gi].hits.assign(static_cast<std::size_t>(total_blocks), 0);
-            for (std::int32_t page = floor_tokens / cache_block_tokens_;
-                 page < floor_tokens / cache_block_tokens_ + hit_pages; ++page) {
-                for (std::int32_t off = 0; off < blocks_per_hash; ++off) {
-                    out.store.per_group[gi].hits[static_cast<std::size_t>(page * blocks_per_hash + off)] = 1;
+        std::int32_t boundary = closed_boundary;
+        while (boundary > floor_page) {
+            bool resumable = true;
+            for (std::size_t gi = 0; gi < groups_.size(); ++gi) {
+                const KvCacheManager& manager = groups_[gi].Manager();
+                if (manager.MatchIsPrefixClosed()) continue;
+                const std::int32_t blocks_per_hash = cache_block_tokens_ / manager.CacheBlockTokens();
+                const std::int32_t end = boundary * blocks_per_hash;
+                const std::int32_t begin = std::max(
+                    floor_page * blocks_per_hash, end - manager.BoundaryLookbackBlocks());
+                for (std::int32_t block = begin; block < end; ++block) {
+                    if (!store_index_.contains(out.group_keys[gi][static_cast<std::size_t>(block)])) {
+                        resumable = false;
+                        break;
+                    }
                 }
+                if (!resumable) break;
             }
+            if (resumable) break;
+            --boundary;
         }
-    } else {
-        out.store.num_common_tokens = floor_tokens;
+        out.store.num_common_tokens = boundary * cache_block_tokens_;
         for (std::size_t gi = 0; gi < groups_.size(); ++gi) {
-            const std::int32_t g_tokens = groups_[gi].Manager().CacheBlockTokens();
-            const std::int32_t blocks_per_hash = cache_block_tokens_ / g_tokens;
-            out.store.per_group[gi].hits.assign(static_cast<std::size_t>(num_cache_blocks * blocks_per_hash), 0);
+            const KvCacheManager& manager = groups_[gi].Manager();
+            const std::int32_t blocks_per_hash = cache_block_tokens_ / manager.CacheBlockTokens();
+            const std::int32_t end = boundary * blocks_per_hash;
+            const std::int32_t begin = manager.MatchIsPrefixClosed()
+                                           ? floor_page * blocks_per_hash
+                                           : std::max(floor_page * blocks_per_hash,
+                                                      end - manager.BoundaryLookbackBlocks());
+            for (std::int32_t block = begin; block < end; ++block) {
+                out.store.per_group[gi].hits[static_cast<std::size_t>(block)] = 1;
+            }
         }
     }
     return out;
@@ -492,6 +516,31 @@ void KvCacheCoordinator::UpdateStoreIndex(const std::vector<std::string>& page_h
                     store_index_.erase(key);
                 }
             }
+        }
+    }
+}
+
+void KvCacheCoordinator::UpdateStoreKeys(const std::vector<std::uint32_t>& group_ids,
+                                         const std::vector<std::string>& content_hashes,
+                                         const std::vector<std::int32_t>& cache_block_offsets,
+                                         const std::vector<bool>& present) {
+    _assert(group_ids.size() == content_hashes.size() && group_ids.size() == cache_block_offsets.size() &&
+                group_ids.size() == present.size(),
+            "store key update size mismatch");
+    for (std::size_t i = 0; i < group_ids.size(); ++i) {
+        _assert(group_ids[i] < groups_.size(), "store key group id is out of range");
+        const std::int32_t blocks_per_hash =
+            cache_block_tokens_ / groups_[group_ids[i]].Manager().CacheBlockTokens();
+        _assert(0 <= cache_block_offsets[i] && cache_block_offsets[i] < blocks_per_hash,
+                "store key offset is out of range");
+        CacheKey key{.namespace_id = kDefaultCacheNamespaceId,
+                     .group_id = group_ids[i],
+                     .content_hash = content_hashes[i],
+                     .cache_block_offset = cache_block_offsets[i]};
+        if (present[i]) {
+            store_index_.insert(std::move(key));
+        } else {
+            store_index_.erase(key);
         }
     }
 }

@@ -79,6 +79,12 @@ public:
     void UpdateStoreIndex(const std::vector<std::string>& page_hashes, const std::vector<bool>& present) {
         coordinator_.UpdateStoreIndex(page_hashes, present);
     }
+    void UpdateStoreKeys(const std::vector<std::uint32_t>& group_ids,
+                         const std::vector<std::string>& content_hashes,
+                         const std::vector<std::int32_t>& cache_block_offsets,
+                         const std::vector<bool>& present) {
+        coordinator_.UpdateStoreKeys(group_ids, content_hashes, cache_block_offsets, present);
+    }
     std::int32_t StoreHitTokens(const std::vector<std::string>& page_hashes) const {
         return coordinator_.StoreHitTokens(page_hashes);
     }
