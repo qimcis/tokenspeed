@@ -30,6 +30,7 @@ import torch
 from tokenspeed_kernel.ops.attention import (
     dsa_decode_topk,
     dsa_prefill_topk,
+    mla_project_value,
 )
 from torch import nn
 from transformers import PretrainedConfig
@@ -911,13 +912,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             max_seq_len=prefill_topk.max_seq_len,
         )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
-        output_view = output.view(-1, self.num_local_heads, self.v_head_dim)
-        torch.bmm(
-            attn_output.transpose(0, 1),
-            self.w_vc,
-            out=output_view.transpose(0, 1),
-        )
-        return output
+        return mla_project_value(attn_output, self.w_vc, out=output)
 
     def forward_absorb(
         self,
@@ -972,13 +967,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             topk_lens=topk_lens,
         )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
-        output_view = output.view(-1, self.num_local_heads, self.v_head_dim)
-        torch.bmm(
-            attn_output.transpose(0, 1),
-            self.w_vc,
-            out=output_view.transpose(0, 1),
-        )
-        return output
+        return mla_project_value(attn_output, self.w_vc, out=output)
 
 
 class GlmMoeDsaDecoderLayer(DeepseekV3DecoderLayer):
