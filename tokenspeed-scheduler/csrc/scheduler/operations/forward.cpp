@@ -848,15 +848,19 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
 // (its first decode) and Decoding candidate. The budget guard protects the
 // mamba state reserve of a prefill scheduled beside them in mixed mode; on
 // the D role decodes consume no budget, so it never binds there.
-void Scheduler::scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build,
-                                    std::span<Request* const> candidates) {
-    for (Request* request : candidates) {
+void Scheduler::scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
+                                    std::span<const std::string> preferred_decode_ids) {
+    std::unordered_set<Request*> candidate_set(candidates.begin(), candidates.end());
+    std::unordered_set<Request*> considered;
+
+    const auto schedule_one = [&](Request* request) -> bool {
         if (build.Full(config_.max_batch_size) ||
             build.token_budget < build.state_prefill_reserve + config_.decode_input_tokens) {
-            return;
+            return false;
         }
-        if ((!request->Is<fsm::PrefillDone>() && !request->Is<fsm::Decoding>()) || build.Scheduled(*request)) {
-            continue;
+        if (request == nullptr || !candidate_set.contains(request) || !considered.insert(request).second ||
+            (!request->Is<fsm::PrefillDone>() && !request->Is<fsm::Decoding>()) || build.Scheduled(*request)) {
+            return true;
         }
         feedback.admission_failed = false;
         if (auto event = scheduleDecode(build.plan, feedback, request)) {
@@ -864,6 +868,22 @@ void Scheduler::scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& buil
             request->TrackScheduledForward();
         } else if (feedback.admission_failed && feedback.capacity_blocker == nullptr) {
             feedback.capacity_blocker = request;
+        }
+        return true;
+    };
+
+    // Preferences are advisory and ephemeral: valid decode candidates move
+    // to the front for this plan only. Unknown, duplicate, and non-decode IDs
+    // are ignored; capacity and every non-decode phase remain authoritative.
+    for (const std::string& request_id : preferred_decode_ids) {
+        const auto it = requests_by_id_.find(request_id);
+        if (!schedule_one(it == requests_by_id_.end() ? nullptr : it->second)) {
+            return;
+        }
+    }
+    for (Request* request : candidates) {
+        if (!schedule_one(request)) {
+            return;
         }
     }
 }
@@ -902,7 +922,8 @@ void Scheduler::buildPrefillWorkerPlan(AdmissionFeedback& feedback, PlanBuild& b
 // retries the blocked admission in the same round.
 void Scheduler::buildDecodeWorkerPlan(AdmissionFeedback& feedback, PlanBuild& build,
                                       std::span<Request* const> candidates,
-                                      std::vector<WriteBackOperation>& write_back_operations) {
+                                      std::vector<WriteBackOperation>& write_back_operations,
+                                      std::span<const std::string> preferred_decode_ids) {
     // Phase 1: local recovery, alone in its batch -- a resident chunk if one
     // is mid-prompt (always recovery here: a remote prompt is
     // RemotePrefilling, which schedules nothing until the peer is done),
@@ -928,7 +949,7 @@ void Scheduler::buildDecodeWorkerPlan(AdmissionFeedback& feedback, PlanBuild& bu
 
     // Phase 2: the decode batch. Completed prefills' first decodes go ahead
     // of the running ones; neither consumes token budget on this role.
-    scheduleDecodeBatch(feedback, build, candidates);
+    scheduleDecodeBatch(feedback, build, candidates, preferred_decode_ids);
 
     // Phase 3: at most one remote admission -- the whole prompt reserves at
     // once, so admitting a queue's worth in one round would drain the pool
@@ -964,7 +985,8 @@ void Scheduler::buildDecodeWorkerPlan(AdmissionFeedback& feedback, PlanBuild& bu
 // round only when no prefill scheduled. Recovery readmission is live when a
 // host cache gives victims a way back.
 void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
-                               std::vector<WriteBackOperation>& write_back_operations) {
+                               std::vector<WriteBackOperation>& write_back_operations,
+                               std::span<const std::string> preferred_decode_ids) {
     Request* readmission = nextReadmission(candidates);
     if (config_.enable_mixed_prefill_decode) {
         const bool has_local_prefill =
@@ -973,20 +995,21 @@ void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, st
             });
         build.state_prefill_reserve =
             coordinator_.HasMambaStateGroup() && has_local_prefill ? coordinator_.PrefixGranularity() : 0;
-        scheduleDecodeBatch(feedback, build, candidates);
+        scheduleDecodeBatch(feedback, build, candidates, preferred_decode_ids);
     }
 
     scheduleLocalPrefillWork(feedback, build, candidates, readmission, config_.decode_input_tokens);
 
     if (!config_.enable_mixed_prefill_decode && !build.pushed_prefill) {
-        scheduleDecodeBatch(feedback, build, candidates);
+        scheduleDecodeBatch(feedback, build, candidates, preferred_decode_ids);
     }
 
     maybeRetractForCapacity(feedback, build, candidates, write_back_operations);
 }
 
 std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Scheduler::buildForwardOperations(
-    ExecutionPlan& plan, std::vector<Request*> candidates, std::vector<WriteBackOperation>& write_back_operations) {
+    ExecutionPlan& plan, std::vector<Request*> candidates, std::vector<WriteBackOperation>& write_back_operations,
+    std::span<const std::string> preferred_decode_ids) {
     // The candidates arrive in submission order (requests_ is the FIFO),
     // identical on every rank -- so within a phase, older requests win.
     AdmissionFeedback feedback;
@@ -997,10 +1020,10 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
             buildPrefillWorkerPlan(feedback, build, candidates);
             break;
         case Role::kD:
-            buildDecodeWorkerPlan(feedback, build, candidates, write_back_operations);
+            buildDecodeWorkerPlan(feedback, build, candidates, write_back_operations, preferred_decode_ids);
             break;
         case Role::kFused:
-            buildFusedPlan(feedback, build, candidates, write_back_operations);
+            buildFusedPlan(feedback, build, candidates, write_back_operations, preferred_decode_ids);
             break;
     }
 

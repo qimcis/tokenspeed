@@ -220,6 +220,7 @@ Current inventory:
 | `_epd_hooks`   | `EpdPrefillHooks` — `epd/prefill_hooks.py`    | glue (EpdPrefillAdmission decides)          | `try_stage`, `drain_ready_embeddings`, `assert_embeddings_received` |
 | `_pd_hooks`    | `PdTransferHooks` — `pd/transfer_hooks.py`    | glue (transfer executors decide)            | `poll_transfer_events` |
 | `_cache_hooks` | `L2CacheHooks` — `engine/cache_hooks.py`      | glue-ish (handed the `DeviceHandle`: submission rides `execute`; polling stays control-side event queries) | `count_plan_ops`, `poll_ready_events` |
+| `_remote_spec_hooks` | `RemoteSpecHooks` — `engine/remote_spec.py` | self-contained control-plane state machine | `before_plan`, `bind_plan`, `observe_commit`, `observe_unlaunched`, `close` |
 
 `_pause_hooks` and `_pd_hooks` are also handed the `DeviceHandle`: both have
 work that must land on the data plane — the DP idle forward and the KV repair
@@ -253,7 +254,8 @@ For orientation, one iteration of `event_loop`:
 2. Poll completed L2 cache ops; **advance the scheduler (head call site)** so
    this round's plan sees them.
 3. Frozen (`PAUSED_ALL`)? Drain the in-flight queue and run the paused idle
-   step. Otherwise: plan (`next_execution_plan`), derive the forward op,
+   step. Otherwise: take the external-speculation shadow snapshot, plan
+   (`next_execution_plan`), derive the forward op,
    record metrics, DP-sync, and gather per-batch state (draining the
    in-flight queue first if the dispatch depends on a pending commit,
    Principle 4).
@@ -271,6 +273,21 @@ For orientation, one iteration of `event_loop`:
 5. **Advance the scheduler (tail call site)** with the round's
    `request_changes`, publish KV events (once), and resolve any pending
    pause/release drain.
+
+The external-speculation hook is shadow-only. Before planning it may return an
+ephemeral list of exact-prefix decode IDs. The C++ scheduler treats those IDs
+as advisory ordering within the decode phase; admission, capacity, phase order,
+and every non-decode operation remain authoritative. After planning, the hook
+binds an immutable seal record beside the pending execution. Commit fills in
+the observed local result and hands the record to a bounded background
+mailbox. It never advances the scheduler and never waits for an endpoint.
+
+At overlap depth greater than zero, a request in the in-flight queue has a
+target step whose committed prefix is not yet visible to the control plane.
+Those request IDs are explicitly marked `TARGET_STEP_UNSETTLED`; their hints
+cannot influence the next plan. The binding travels in the same FIFO entry as
+its `PendingExecution`, so a later commit cannot be attributed to the wrong
+seal.
 
 ## Checklist for extending the loop
 

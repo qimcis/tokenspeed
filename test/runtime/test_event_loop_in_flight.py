@@ -74,21 +74,21 @@ class _DrainHarness:
     """Only the state read by ``EventLoop._drain_in_flight``."""
 
     def __init__(self) -> None:
-        self.committed: list[object] = []
+        self.committed: list[tuple[object, object]] = []
 
-    def _commit_forward_results(self, forward_op, results):
-        self.committed.append(forward_op)
+    def _commit_forward_results(self, forward_op, results, remote_spec_binding):
+        self.committed.append((forward_op, remote_spec_binding))
         return [f"change-{forward_op}"]
 
 
 def test_drain_in_flight_commits_oldest_first() -> None:
     loop = _DrainHarness()
-    in_flight = deque([("op0", None), ("op1", None)])
+    in_flight = deque([("op0", None, "binding0"), ("op1", None, "binding1")])
 
     request_changes = EventLoop._drain_in_flight(loop, in_flight)
 
     assert not in_flight
-    assert loop.committed == ["op0", "op1"]
+    assert loop.committed == [("op0", "binding0"), ("op1", "binding1")]
     assert request_changes == ["change-op0", "change-op1"]
 
 

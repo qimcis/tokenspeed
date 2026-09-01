@@ -183,6 +183,14 @@ builder, readable top to bottom. A round schedules each request at most once
 (`PlanBuild::Scheduled`), whatever states it moves through while the phases
 run.
 
+`NextExecutionPlan(preferred_decode_ids)` has one narrow, advisory exception
+to FIFO. Within the decode phase only, eligible preferred IDs are considered
+first, followed by the untouched FIFO remainder. Unknown IDs, duplicates,
+prefill/recovery IDs, and requests rejected by the normal state or capacity
+checks have no effect. The list is an argument to one plan build and is never
+retained by the scheduler. Empty input is the original FIFO policy. Mirrored
+TP schedulers must receive the same list.
+
 A pass's mutable state is split in two on a layer boundary. `PlanBuild` — the
 output plan, the batch under construction, budgets, and the composition flags —
 is held by the role grammars alone, and every operation enters the batch

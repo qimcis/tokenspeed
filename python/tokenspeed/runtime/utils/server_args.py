@@ -280,6 +280,16 @@ class ServerArgs:
     speculative_num_draft_tokens: int | None = None
     enable_replay_ssm: bool = False
     eagle3_layers_to_capture: str | None = None
+    # External speculation is control-plane-only in shadow mode. The endpoint
+    # is deliberately loopback-local; a separate proxy owns any WAN transport.
+    remote_spec_mode: str = "off"
+    remote_spec_endpoint: str | None = None
+    remote_spec_engine_id: str | None = None
+    remote_spec_mailbox_capacity: int = 8
+    remote_spec_timeout_secs: float = 0.1
+    remote_spec_max_message_bytes: int = 1 << 20
+    remote_spec_max_hint_age_ms: int = 1_000
+    remote_spec_max_depth: int = 8
     # Logprob support flags — all OFF by default. Enabling extends the
     # captured CUDA-graph footprint; requests asking for logprobs on a
     # server started without the matching flag will receive empty logprobs.
@@ -902,6 +912,21 @@ class ServerArgs:
             )
 
     def validate(self):
+        if self.remote_spec_mode not in {"off", "shadow"}:
+            raise ValueError("remote_spec_mode must be 'off' or 'shadow'")
+        if self.remote_spec_mode == "shadow" and not self.remote_spec_endpoint:
+            raise ValueError("remote_spec_endpoint is required in shadow mode")
+        if self.remote_spec_mailbox_capacity <= 0:
+            raise ValueError("remote_spec_mailbox_capacity must be positive")
+        if self.remote_spec_timeout_secs <= 0:
+            raise ValueError("remote_spec_timeout_secs must be positive")
+        if self.remote_spec_max_message_bytes <= 0:
+            raise ValueError("remote_spec_max_message_bytes must be positive")
+        if self.remote_spec_max_hint_age_ms <= 0:
+            raise ValueError("remote_spec_max_hint_age_ms must be positive")
+        if self.remote_spec_max_depth <= 0:
+            raise ValueError("remote_spec_max_depth must be positive")
+
         if self.device == "npu":
             if not self.disable_prefill_graph:
                 raise ValueError("NPU execution requires --disable-prefill-graph")
@@ -1821,6 +1846,54 @@ class ServerArgs:
             type=str,
             help="The layers of Eagle3 to capture.",
             default=ServerArgs.eagle3_layers_to_capture,
+        )
+        parser.add_argument(
+            "--remote-spec-mode",
+            choices=["off", "shadow"],
+            default=ServerArgs.remote_spec_mode,
+            help="Enable bounded external-speculation control-plane shadowing. No external candidates execute in shadow mode.",
+        )
+        parser.add_argument(
+            "--remote-spec-endpoint",
+            type=str,
+            default=ServerArgs.remote_spec_endpoint,
+            help="Loopback HTTP(S) endpoint for external-speculation shadow telemetry and hints.",
+        )
+        parser.add_argument(
+            "--remote-spec-engine-id",
+            type=str,
+            default=ServerArgs.remote_spec_engine_id,
+            help="Stable engine identity reported by external-speculation shadow telemetry.",
+        )
+        parser.add_argument(
+            "--remote-spec-mailbox-capacity",
+            type=int,
+            default=ServerArgs.remote_spec_mailbox_capacity,
+            help="Maximum queued shadow telemetry seals; oldest seals are dropped on overflow.",
+        )
+        parser.add_argument(
+            "--remote-spec-timeout-secs",
+            type=float,
+            default=ServerArgs.remote_spec_timeout_secs,
+            help="Timeout used only by the background shadow HTTP worker.",
+        )
+        parser.add_argument(
+            "--remote-spec-max-message-bytes",
+            type=int,
+            default=ServerArgs.remote_spec_max_message_bytes,
+            help="Maximum encoded shadow request or response size.",
+        )
+        parser.add_argument(
+            "--remote-spec-max-hint-age-ms",
+            type=int,
+            default=ServerArgs.remote_spec_max_hint_age_ms,
+            help="Maximum local mailbox age for an advisory decode-order hint.",
+        )
+        parser.add_argument(
+            "--remote-spec-max-depth",
+            type=int,
+            default=ServerArgs.remote_spec_max_depth,
+            help="Maximum remote candidate depth represented by shadow readiness hints.",
         )
 
         # Runtime options

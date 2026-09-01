@@ -321,8 +321,11 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
              nb::overload_cast<const std::vector<tokenspeed::RequestSpec>&>(&tokenspeed::Scheduler::SubmitRequests),
              nb::arg("request_specs"))
         .def(
-            "next_execution_plan", [](tokenspeed::Scheduler& s) { return s.NextExecutionPlan(); },
-            nb::call_guard<nb::gil_scoped_release>())
+            "next_execution_plan",
+            [](tokenspeed::Scheduler& s, const std::vector<std::string>& preferred_decode_ids) {
+                return s.NextExecutionPlan(preferred_decode_ids);
+            },
+            nb::arg("preferred_decode_ids") = std::vector<std::string>{}, nb::call_guard<nb::gil_scoped_release>())
         .def("advance", &tokenspeed::Scheduler::Advance, nb::arg("event"))
         .def("drain_kv_events",
              [](tokenspeed::Scheduler& s) {

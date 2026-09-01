@@ -53,7 +53,7 @@ public:
 
     void SubmitRequests(const std::vector<RequestSpec>& request_specs);
 
-    ExecutionPlan NextExecutionPlan();
+    ExecutionPlan NextExecutionPlan(const std::vector<std::string>& preferred_decode_ids = {});
     void Advance(const ExecutionEvent& event);
     std::vector<KvCacheEvent> DrainKvEvents();
     // Testing/control-plane operation. A successful return means the complete
@@ -114,7 +114,8 @@ private:
     };
 
     std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> buildForwardOperations(
-        ExecutionPlan& plan, std::vector<Request*> candidates, std::vector<WriteBackOperation>& write_back_operations);
+        ExecutionPlan& plan, std::vector<Request*> candidates, std::vector<WriteBackOperation>& write_back_operations,
+        std::span<const std::string> preferred_decode_ids);
     std::optional<fsm::SchedulePrefillFirstChunkEvent> schedulePrefillFirstChunk(ExecutionPlan& plan,
                                                                                  AdmissionFeedback& feedback,
                                                                                  Request* request,
@@ -256,12 +257,15 @@ private:
     // now the phase sequence itself, and within a phase older requests win.
     void buildPrefillWorkerPlan(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);
     void buildDecodeWorkerPlan(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
-                               std::vector<WriteBackOperation>& write_back_operations);
+                               std::vector<WriteBackOperation>& write_back_operations,
+                               std::span<const std::string> preferred_decode_ids);
     void buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
-                        std::vector<WriteBackOperation>& write_back_operations);
+                        std::vector<WriteBackOperation>& write_back_operations,
+                        std::span<const std::string> preferred_decode_ids);
     void scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                   Request* readmission, std::int32_t decode_reserve);
-    void scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);
+    void scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
+                             std::span<const std::string> preferred_decode_ids);
 
     std::int32_t calculateMaxSingleRequestTokens(std::int64_t usable_lcm_blocks) const;
     std::int64_t singleRequestLcmBlocksRequired(std::int32_t token_limit) const;

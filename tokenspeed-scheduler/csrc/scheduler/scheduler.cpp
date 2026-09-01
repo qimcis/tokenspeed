@@ -412,7 +412,7 @@ std::int32_t Scheduler::RequestTokenSize(const std::string& id) const {
     return it == requests_by_id_.end() ? -1 : it->second->TokenSize();
 }
 
-ExecutionPlan Scheduler::NextExecutionPlan() {
+ExecutionPlan Scheduler::NextExecutionPlan(const std::vector<std::string>& preferred_decode_ids) {
     std::vector<WriteBackOperation> write_back_operations = std::exchange(pending_write_back_operations_, {});
     std::erase_if(requests_, [this](const auto& request) {
         if (!request->template Is<fsm::Finished>()) {
@@ -433,7 +433,7 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     }
     ExecutionPlan plan;
     auto [forward_operations, load_back_operations] =
-        buildForwardOperations(plan, std::move(candidates), write_back_operations);
+        buildForwardOperations(plan, std::move(candidates), write_back_operations, preferred_decode_ids);
 
     plan.With(ForwardBatch{std::move(forward_operations)});
 

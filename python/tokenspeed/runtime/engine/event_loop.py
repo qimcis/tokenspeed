@@ -42,6 +42,7 @@ from tokenspeed.runtime.engine.io_struct import IpcReceiver, IpcSender, NullSend
 from tokenspeed.runtime.engine.load_snapshot import create_load_reporter
 from tokenspeed.runtime.engine.memory_occupation import MemoryOccupationController
 from tokenspeed.runtime.engine.pause import PauseController, PauseHooks
+from tokenspeed.runtime.engine.remote_spec import RemoteSpecHooks
 from tokenspeed.runtime.engine.request_handler import RequestHandler
 from tokenspeed.runtime.engine.scheduler_utils import (
     advance_scheduler,
@@ -448,6 +449,33 @@ class EventLoop:
             metrics=self.metrics,
             defer_to_device=self._device.run_multimodal_work,
         )
+        self._remote_spec_hooks = RemoteSpecHooks(
+            mode=self.server_args.remote_spec_mode,
+            endpoint=self.server_args.remote_spec_endpoint,
+            engine_id=(
+                self.server_args.remote_spec_engine_id
+                or f"{self.server_args.served_model_name}:dp{self.dp_rank}"
+            ),
+            mailbox_capacity=self.server_args.remote_spec_mailbox_capacity,
+            timeout_secs=self.server_args.remote_spec_timeout_secs,
+            max_message_bytes=self.server_args.remote_spec_max_message_bytes,
+            max_hint_age_ms=self.server_args.remote_spec_max_hint_age_ms,
+            target_revision=(
+                f"{self.server_args.served_model_name}"
+                f"@{self.server_args.weight_version}"
+            ),
+            native_speculative_algorithm=self.server_args.speculative_algorithm,
+            max_depth=self.server_args.remote_spec_max_depth,
+            local_spec_width=(
+                self.server_args.speculative_num_draft_tokens
+                if self.server_args.speculative_algorithm is not None
+                else 0
+            ),
+            attn_tp_rank=self.attn_tp_rank,
+            attn_tp_size=self.attn_tp_size,
+            attn_tp_cpu_group=self.attn_tp_cpu_group,
+            attn_tp_src_global_rank=self.server_args.mapping.attn.tp_group[0],
+        )
         # The peer's control face only — bootstrap register/abort, event
         # polling. Its execution face is inside the handle.
         self.kv_transfer = device.transfer
@@ -748,6 +776,7 @@ class EventLoop:
         self,
         forward_op,
         pending: PendingExecution,
+        remote_spec_binding=None,
     ):
         # Where a dispatched round waits for the GPU: join the forward
         # thread's future (launches done) + the copy event (D2H landed).
@@ -767,6 +796,13 @@ class EventLoop:
             forward_op,
             results,
             is_prefill_instance=is_prefill_instance,
+        )
+        self._remote_spec_hooks.observe_commit(
+            forward_op,
+            results,
+            request_changes,
+            remote_spec_binding,
+            self.output_processor.rid_to_state,
         )
 
         # Fold committed tokens into the decode throughput window (host-side
@@ -879,8 +915,10 @@ class EventLoop:
         """Commit every queued forward, oldest first; return their changes."""
         request_changes = []
         while in_flight:
-            fo, res = in_flight.popleft()
-            request_changes.extend(self._commit_forward_results(fo, res))
+            fo, res, remote_spec_binding = in_flight.popleft()
+            request_changes.extend(
+                self._commit_forward_results(fo, res, remote_spec_binding)
+            )
         return request_changes
 
     def _dispatch_depends_on_pending_commit(self, forward_op, grammar_inputs) -> bool:
@@ -953,6 +991,7 @@ class EventLoop:
                 # advance_scheduler call at the tail.
                 request_changes = []
                 forward_op = None
+                remote_spec_binding = None
                 # An idle round (freeze or DP idle) runs no dispatch and no
                 # kv-transfer event poll.
                 idle_round = False
@@ -964,7 +1003,21 @@ class EventLoop:
                     self._pause_hooks.paused_idle_step()
                     idle_round = True
                 else:
-                    execution_plan = self.scheduler.next_execution_plan()
+                    preferred_decode_ids = self._remote_spec_hooks.before_plan(
+                        self.output_processor.rid_to_state,
+                        self._get_scheduler_stats,
+                        time.monotonic_ns(),
+                        unsettled_request_ids=(
+                            request_id
+                            for pending_forward, _, _ in in_flight
+                            for request_id in pending_forward.request_ids[
+                                pending_forward.num_extends() :
+                            ]
+                        ),
+                    )
+                    execution_plan = self.scheduler.next_execution_plan(
+                        preferred_decode_ids
+                    )
                     self._cache_hooks.count_plan_ops(execution_plan)
 
                     forward_op = self._get_forward_op(execution_plan)
@@ -992,6 +1045,7 @@ class EventLoop:
                             idle_round = True
 
                     planned = None
+                    sampling_params_list = ()
                     if not idle_round and forward_op is not None:
                         # Gather sampling params and grammar state BEFORE any
                         # pending commit below — a commit can finish requests and
@@ -1007,6 +1061,9 @@ class EventLoop:
 
                         self._mark_stats_scheduled(forward_op)
                         self._batch_logger.log_dispatch(forward_op, stats)
+                        remote_spec_binding = self._remote_spec_hooks.bind_plan(
+                            forward_op, sampling_params_list
+                        )
                         planned = PlannedForward(
                             forward_op=forward_op,
                             sampling_params_list=sampling_params_list,
@@ -1026,6 +1083,10 @@ class EventLoop:
                         self._epd_hooks.assert_embeddings_received(
                             planned.multimodal_context
                         )
+                    else:
+                        remote_spec_binding = self._remote_spec_hooks.bind_plan(
+                            forward_op, sampling_params_list
+                        )
 
                     # One call per round: the plan's page zeroing and cache
                     # transfers ride the FIFO first, then the batch the role
@@ -1035,7 +1096,9 @@ class EventLoop:
                     if idle_round:
                         self._device.run_idle_forward(dp_metadata)
                     if pending is not None:
-                        in_flight.append((forward_op, pending))
+                        in_flight.append((forward_op, pending, remote_spec_binding))
+                    else:
+                        self._remote_spec_hooks.observe_unlaunched(remote_spec_binding)
 
                 if not idle_round:
                     # Commit from the head once the queue exceeds the depth
@@ -1044,8 +1107,10 @@ class EventLoop:
                     # fully so results never wait on future traffic.
                     effective_depth = depth if forward_op is not None else 0
                     while len(in_flight) > effective_depth:
-                        fo, res = in_flight.popleft()
-                        request_changes.extend(self._commit_forward_results(fo, res))
+                        fo, res, binding = in_flight.popleft()
+                        request_changes.extend(
+                            self._commit_forward_results(fo, res, binding)
+                        )
 
                     request_changes.extend(self._pd_hooks.poll_transfer_events())
 
@@ -1066,6 +1131,8 @@ class EventLoop:
 
                 # Resolve a deferred abort/wait pause reply once in-flight work drains.
                 self._pause.maybe_finish_drain(self.scheduler)
+
+        self._remote_spec_hooks.close()
 
     def _mark_stats_scheduled(self, forward_op) -> None:
         # Stamp the pre-forward "scheduled" time on each request's stats tracker

@@ -187,6 +187,26 @@ TEST_F(StableCandidateOrderingSuite, ForwardBatchIsReproducibleAcrossMirroredSch
     EXPECT_EQ(ids_a, ids_b);
 }
 
+TEST_F(SchedulerTestSuite, PreferredDecodeIdsAreEphemeralAndDoNotReorderPrefill) {
+    Submit({MakeRequestSpec("oldest", 2, 100), MakeRequestSpec("preferred", 2, 200)});
+
+    const ExecutionPlan prefill_plan = scheduler_->NextExecutionPlan({"preferred"});
+    const ForwardBatch* prefill = FindForwardBatch(prefill_plan);
+    ASSERT_NE(prefill, nullptr);
+    EXPECT_EQ(prefill->request_ids, (std::vector<std::string>{"oldest", "preferred"}));
+
+    const ExecutionPlan preferred_plan = scheduler_->NextExecutionPlan({"missing", "preferred", "preferred"});
+    const ForwardBatch* preferred = FindForwardBatch(preferred_plan);
+    ASSERT_NE(preferred, nullptr);
+    EXPECT_EQ(preferred->NumExtends(), 0u);
+    EXPECT_EQ(preferred->request_ids, (std::vector<std::string>{"preferred", "oldest"}));
+
+    const ExecutionPlan fifo_plan = scheduler_->NextExecutionPlan();
+    const ForwardBatch* fifo = FindForwardBatch(fifo_plan);
+    ASSERT_NE(fifo, nullptr);
+    EXPECT_EQ(fifo->request_ids, (std::vector<std::string>{"oldest", "preferred"}));
+}
+
 class SchedulerKvCacheEventTestSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {

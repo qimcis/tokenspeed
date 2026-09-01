@@ -173,6 +173,22 @@ class TestFSMTransitions:
         assert len(decode_plan.forward) == 1
         assert decode_plan.forward[0].num_extends() == 0
 
+    def test_preferred_decode_ids_reorder_only_eligible_decodes(self):
+        """A one-plan hint moves exact decode IDs ahead of the FIFO remainder."""
+        s = Scheduler(make_config(max_scheduled_tokens=512))
+        submit(s, "oldest", list(range(8)))
+        submit(s, "preferred", list(range(8, 16)))
+
+        prefill_plan = s.next_execution_plan(["preferred"])
+        assert prefill_plan.forward[0].request_ids == ["oldest", "preferred"]
+
+        decode_plan = s.next_execution_plan(["missing", "preferred", "preferred"])
+        assert decode_plan.forward[0].num_extends() == 0
+        assert decode_plan.forward[0].request_ids == ["preferred", "oldest"]
+
+        next_decode = s.next_execution_plan()
+        assert next_decode.forward[0].request_ids == ["oldest", "preferred"]
+
     def test_finish_event_erases_request(self):
         """advance(finish=True) triggers FinishEvent: Decoding → Finished, erased on next plan."""
         s = Scheduler(make_config(max_scheduled_tokens=512))
