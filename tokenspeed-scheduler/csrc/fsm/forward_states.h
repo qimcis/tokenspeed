@@ -46,6 +46,9 @@ struct CacheProgress {
     std::int32_t promotion_boundary_tokens{0};
     // Whether cache storage for the final state-checkpoint tail was reserved.
     bool state_checkpoint_tail_reserved{false};
+    // Intermediate snapshot written by the last scheduled prefill. Publish
+    // this aligned boundary before reclaiming its block or finishing.
+    std::int32_t state_checkpoint_len{0};
 };
 
 inline std::vector<std::int32_t> ComputeShiftedInputIds(const TokenContainer* token_container,

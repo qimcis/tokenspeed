@@ -146,6 +146,8 @@ private:
     void discardUncachedKvEventPages(std::span<const CacheKey> keys);
     void handleCacheMutation(const CacheKey& key, CacheCoordinator::CacheMutation mutation);
     std::optional<WriteBackOperation> publishCompletedPages(Request& request);
+    void publishPrefillStateCheckpoint(Request& request, fsm::CacheProgress& progress,
+                                       std::int32_t num_computed_tokens);
 
     std::size_t groupIndex(const std::string& group_id) const;
     Request* findRequest(const std::string& request_id);

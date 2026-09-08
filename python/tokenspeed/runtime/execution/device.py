@@ -133,6 +133,8 @@ class DeviceSpecs:
             (rather than by the capturable side-stream executor), which is
             what makes a grammar batch depend on the pending commit.
         supports_disaggregation: The KV arena can hand pages to a peer node.
+        prefill_state_checkpoints: Every target state backend can write an
+            intermediate aligned checkpoint within a single model forward.
         supports_pd_layerwise_finalization: The drafter can finalize
             layerwise KV writes, required for PD layerwise transfer.
         cache_state_group_ids: Group ids of the state-family cache groups,
@@ -150,6 +152,7 @@ class DeviceSpecs:
     spec_num_steps: int
     spec_num_tokens: int
     uses_eager_grammar: bool
+    prefill_state_checkpoints: bool
     supports_disaggregation: bool
     supports_pd_layerwise_finalization: bool
     cache_state_group_ids: tuple[str, ...]
@@ -661,6 +664,9 @@ def build_device_side(
         create_model_executor,
         create_model_runner,
     )
+    from tokenspeed.runtime.layers.attention.backends.support import (
+        supports_prefill_state_checkpoints,
+    )
     from tokenspeed.runtime.layers.attention.registry import (
         create_attn_components,
     )
@@ -777,6 +783,9 @@ def build_device_side(
         spec_num_steps=executor.config.spec_num_steps or 0,
         spec_num_tokens=executor.config.spec_num_tokens or 0,
         uses_eager_grammar=executor.eager_grammar_buffers is not None,
+        prefill_state_checkpoints=supports_prefill_state_checkpoints(
+            attn_backend, draft_attn_backend
+        ),
         supports_disaggregation=token_to_kv_pool.arena.supports_disaggregation,
         supports_pd_layerwise_finalization=bool(
             getattr(executor.drafter, "supports_pd_layerwise_finalization", False)

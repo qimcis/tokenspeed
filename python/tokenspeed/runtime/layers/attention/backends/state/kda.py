@@ -100,6 +100,8 @@ class KdaAttnBackend(MambaAttnBackend):
     the conv, the gate GEMV and the recurrence into a single launch.
     """
 
+    supports_prefill_state_checkpoints = True
+
     def __init__(
         self,
         config: AttnConfig,

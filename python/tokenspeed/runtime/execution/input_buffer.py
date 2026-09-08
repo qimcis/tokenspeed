@@ -94,6 +94,7 @@ class InputBuffers:
         # NOT pinned: python readers only; the H2D uses the per-step bulk pinned staging (_bulk_pinned).
         self.extend_prefix_lens_cpu = torch.zeros(max_bs, dtype=torch.int32)
         self.extend_seq_lens_cpu = torch.zeros(max_bs, dtype=torch.int32)
+        self.state_checkpoint_lens_cpu = torch.zeros(max_bs, dtype=torch.int32)
         self._pad_tape = self._record_pad_tape()
 
     def _record_pad_tape(self) -> "PrepTape | None":
@@ -211,6 +212,9 @@ class InputBuffers:
 
         if num_extends > 0:
             # Fresh bulk pinned per step (see _bulk_pinned: persistent staging races overlap scheduling).
+            self.state_checkpoint_lens_cpu[:num_extends] = torch.as_tensor(
+                forward_op.state_checkpoint_lens, dtype=torch.int32
+            )
             self.extend_prefix_lens_cpu[:num_extends] = torch.as_tensor(
                 forward_op.extend_prefix_lens, dtype=torch.int32
             )

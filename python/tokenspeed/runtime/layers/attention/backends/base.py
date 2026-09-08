@@ -127,6 +127,7 @@ class AttentionBackend(ABC):
     # This backend forwards each layer's ``sliding_window_size`` to its kernels.
     # Left False, a declared window silently widens to full-history attention.
     supports_layer_sliding_window: bool = False
+    supports_prefill_state_checkpoints: bool = False
 
     def __init__(self, config: AttnConfig, spec: SoftmaxAttnConfig) -> None:
         self.device = config.device

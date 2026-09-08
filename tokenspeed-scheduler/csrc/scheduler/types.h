@@ -65,6 +65,9 @@ struct SchedulerConfig {
     Role role{Role::kFused};
 
     bool disable_prefix_cache{false};
+    // All participating state backends can write an intermediate checkpoint
+    // during a single model forward. Unsupported backends keep split prefill.
+    bool prefill_state_checkpoints{false};
     // Minimum prompt tail that must be recomputed after a prefix-cache hit.
     // Zero preserves the default logits contract, which already recomputes at
     // least the final prompt token. The effective hit is page-aligned down.

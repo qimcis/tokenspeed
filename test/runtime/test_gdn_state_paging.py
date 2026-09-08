@@ -104,6 +104,7 @@ def _extend_kwargs(torch, extend_seq_lens_cpu, extend_prefix_lens_cpu, device):
         extend_seq_lens_cpu=extend_seq_lens_cpu,
         extend_prefix_lens=extend_prefix_lens_cpu.to(device),
         extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+        state_checkpoint_lens_cpu=torch.zeros_like(extend_seq_lens_cpu),
         extend_with_prefix=bool(extend_prefix_lens_cpu.any()),
     )
 

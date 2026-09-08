@@ -96,9 +96,32 @@ void Scheduler::handleEvent(const forward::Finish& event) {
     }
 }
 
+void Scheduler::publishPrefillStateCheckpoint(Request& request, fsm::CacheProgress& progress,
+                                              std::int32_t num_computed_tokens) {
+    const std::int32_t checkpoint = progress.state_checkpoint_len;
+    if (checkpoint == 0) {
+        return;
+    }
+    _assert(checkpoint > 0 && checkpoint <= num_computed_tokens && checkpoint % coordinator_.PrefixGranularity() == 0,
+            "intermediate state checkpoint must be computed and prefix-aligned");
+    // The forward's actual endpoint may be unaligned, which intentionally
+    // cannot publish a snapshot. Publish the separately initialized boundary
+    // explicitly before admission/reclamation can drop its table entry.
+    auto pages = request.FullPrefixPages(false);
+    pages.resize(checkpoint / coordinator_.PrefixGranularity());
+    const auto hashes = ComputePrefixHashes(pages, "");
+    const std::int32_t last_page = static_cast<std::int32_t>(hashes.size()) - 1;
+    const auto event_keys = registerKvEventPrefixPages(request, hashes, last_page);
+    coordinator_.CacheCompletedBlocks(request.BlockTablesRef(), hashes, progress.access_epoch, last_page, checkpoint,
+                                      CacheBoundaryKind::kChunk, config_.StreamsDeviceCacheToHost());
+    discardUncachedKvEventPages(event_keys);
+    progress.state_checkpoint_len = 0;
+}
+
 std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& request) {
     const std::vector<std::span<const std::int32_t>> stable_prefix_pages = request.FullPrefixPages(true);
     fsm::CacheProgress progress = request.CacheProgress();
+    publishPrefillStateCheckpoint(request, progress, request.TokenSize() - 1);
     const std::int32_t first_new_prefix_page = static_cast<std::int32_t>(progress.prefix_hashes.size());
     const std::int32_t num_stable_prefix_pages = static_cast<std::int32_t>(stable_prefix_pages.size());
     _assert(first_new_prefix_page <= num_stable_prefix_pages, "cache progress exceeds completed request pages");

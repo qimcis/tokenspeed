@@ -83,6 +83,35 @@ orders prefills against each other, never a decode behind a prefill.
 
 ### 1.2 The one lookahead: the state-checkpoint tail
 
+When all state-consuming backend leaves advertise
+`supports_prefill_state_checkpoints` and their block granularity equals the
+prefix granularity, the scheduler can include the body and tail in **one
+forward**. `PrefillOperation.state_checkpoint_len` names the absolute aligned
+intermediate boundary; zero means no intermediate snapshot. Both that block
+and the final writable block are materialized. The tail is included in this
+admission's token count, so its state reserve subtracts the already-included
+tail from the split body's growth horizon. This preserves capacity accounting
+and the existing first-decode growth guarantee.
+
+KDA advertises this capability. Other state backends, finer state block
+geometries, and remote D-role prefill retain the existing scheduling behavior.
+Chunk-size and prefix-promotion boundaries still apply; this changes only a
+final body/tail pair that fits the current token budget. Prefix caching remains
+enabled, and cache-hit inputs remain read-only.
+
+The pending boundary travels in `CacheProgress.state_checkpoint_len` until
+publication before decode admission/reclamation, request finish, or snapshot
+retraction. It is published explicitly with its **aligned** computed endpoint,
+not the unaligned end of the full forward. The normal publisher must continue
+rejecting unaligned state snapshots and uninitialized table holes. Publication
+uses the same FIFO execution ordering as other scheduled completed boundaries;
+it does not introduce a GPU synchronization. In particular, the first replay
+after a one-token response must already reuse the checkpoint, without another
+cold prefill to populate the cache.
+
+The fallback for backends without this capability is the two-forward protocol
+below.
+
 The single place capacity is reserved beyond the current chunk. For mamba /
 state-checkpoint architectures, a prompt's **final** state checkpoint must land
 on an aligned boundary; without a reservation the pages for that tail may not

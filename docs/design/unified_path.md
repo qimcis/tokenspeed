@@ -551,3 +551,20 @@ down to the router and V4).
 * New backends implement `refresh_decode_metadata` + `init_cuda_graph_state`;
   capture is inherited from the base default (idle refresh). Only a
   kernel-imposed capture asymmetry justifies an override.
+
+## Intermediate prefill state checkpoints
+
+The scheduler's optional aligned checkpoint is carried as the host-only
+`state_checkpoint_lens_cpu` extend vector. Decode and idle calls pass an empty
+vector; prefill graph warmup passes zeros. The dynamic extend metadata builder
+creates a ragged two-phase routing plan once per batch, including mixed decode
+rows in phase one with no checkpoint. Pure decode refresh/capture is unchanged.
+
+For a checkpointed KDA extend, each layer runs its conv and recurrent body,
+stores the aligned state, and resumes the tail from that stored dtype into a
+different writable state block. All other transformer work runs once over the
+full packed token stream. Outputs are restored to original packed order, and
+only real tokens enter the two phases; the existing breakable-graph handoff
+restores the padded bucket shape. There is no new kernel-package dependency or
+host read of GPU metadata. A one-row batch uses narrow views instead of packed
+gathers. Unsupported state consumers keep the scheduler's split-forward path.

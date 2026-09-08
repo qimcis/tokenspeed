@@ -499,6 +499,7 @@ class PrefillGraph:
         ib.extend_seq_lens_cpu[:bs].copy_(seq_lens_cpu)
         ib.extend_prefix_lens_buf[:bs].zero_()
         ib.extend_prefix_lens_cpu[:bs].zero_()
+        ib.state_checkpoint_lens_cpu[:bs].zero_()
 
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
@@ -554,6 +555,7 @@ class PrefillGraph:
             extend_seq_lens_cpu=ib.extend_seq_lens_cpu[:bs],
             extend_prefix_lens=ib.extend_prefix_lens_buf[:bs],
             extend_prefix_lens_cpu=ib.extend_prefix_lens_cpu[:bs],
+            state_checkpoint_lens_cpu=ib.state_checkpoint_lens_cpu[:bs],
             extend_with_prefix=False,
             **extra_metadata_kwargs,
         )

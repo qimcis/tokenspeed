@@ -55,6 +55,31 @@ class CudaGraphSupport:
         )
 
 
+def supports_prefill_state_checkpoints(*backends) -> bool:
+    """Return whether all state-consuming leaves support intermediate snapshots.
+
+    Args:
+        backends: Target and draft attention backends, including any hybrid
+            children; None entries are skipped.
+
+    Returns:
+        True only if at least one state consumer exists and every state
+        consumer supports checkpoints. History-only leaves impose no constraint.
+    """
+    found_state = False
+    stack = [backend for backend in backends if backend is not None]
+    while stack:
+        current = stack.pop()
+        children = tuple(current.child_backends())
+        if children:
+            stack.extend(children)
+        elif "state" in current.cache_consumer_families:
+            found_state = True
+            if not current.supports_prefill_state_checkpoints:
+                return False
+    return found_state
+
+
 def resolve_cuda_graph_support(*backends) -> CudaGraphSupport:
     """AND-compose ``cuda_graph_support`` over ``backends`` and their
     ``child_backends()`` trees, logging every backend class that lowers an

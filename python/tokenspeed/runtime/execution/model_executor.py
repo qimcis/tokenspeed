@@ -1031,6 +1031,7 @@ class ModelExecutor:
                     extend_prefix_lens_cpu=ib.extend_prefix_lens_cpu[:0],
                     extend_seq_lens=ib.extend_seq_lens_buf[:0],
                     extend_seq_lens_cpu=ib.extend_seq_lens_cpu[:0],
+                    state_checkpoint_lens_cpu=ib.state_checkpoint_lens_cpu[:0],
                 )
             return
 
@@ -1410,6 +1411,9 @@ class ModelExecutor:
                             :num_extends
                         ],
                         extend_seq_lens_cpu=self.input_buffers.extend_seq_lens_cpu[
+                            :num_extends
+                        ],
+                        state_checkpoint_lens_cpu=self.input_buffers.state_checkpoint_lens_cpu[
                             :num_extends
                         ],
                         block_tables=block_tables,

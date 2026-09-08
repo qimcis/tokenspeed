@@ -151,6 +151,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("enable_kv_cache_events", &tokenspeed::SchedulerConfig::enable_kv_cache_events)
         .def_rw("enable_mixed_prefill_decode", &tokenspeed::SchedulerConfig::enable_mixed_prefill_decode)
         .def_rw("disable_prefix_cache", &tokenspeed::SchedulerConfig::disable_prefix_cache)
+        .def_rw("prefill_state_checkpoints", &tokenspeed::SchedulerConfig::prefill_state_checkpoints)
         .def_rw("prefix_replay_tokens", &tokenspeed::SchedulerConfig::prefix_replay_tokens);
 
     nb::class_<tokenspeed::RequestSpec>(m, "RequestSpec")
@@ -226,6 +227,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     forward_batch.def_ro("input_ids", &tokenspeed::ForwardBatch::input_ids)
         .def_ro("shifted_input_ids", &tokenspeed::ForwardBatch::shifted_input_ids)
         .def_ro("extend_prefix_lens", &tokenspeed::ForwardBatch::extend_prefix_lens)
+        .def_ro("state_checkpoint_lens", &tokenspeed::ForwardBatch::state_checkpoint_lens)
         .def_prop_ro(
             "prefill_lengths",
             [](const tokenspeed::ForwardBatch& op) -> const std::vector<std::int32_t>& { return op.prefill_lengths; },

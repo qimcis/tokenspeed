@@ -315,12 +315,13 @@ class EventLoop:
             cache_groups=cache_groups,
             enable_mixed_prefill_decode=server_args.enable_mixed_batch,
         )
+        scheduler_cfg.prefill_state_checkpoints = specs.prefill_state_checkpoints
         logger.info(
             "Scheduler config: prefix_granularity=%s num_device_pages=%s "
             "max_scheduled_tokens=%s decode_input_tokens=%s "
             "overlap_schedule_depth=%s disable_l2_cache=%s "
             "max_batch_size=%s (global max_num_seqs=%s, dp_size=%s) "
-            "disable_prefix_cache=%s prefix_replay_tokens=%s "
+            "disable_prefix_cache=%s prefix_replay_tokens=%s prefill_state_checkpoints=%s "
             "cache_groups=%s",
             scheduler_cfg.prefix_granularity,
             scheduler_cfg.num_device_pages,
@@ -333,6 +334,7 @@ class EventLoop:
             self.dp_size,
             scheduler_cfg.disable_prefix_cache,
             scheduler_cfg.prefix_replay_tokens,
+            scheduler_cfg.prefill_state_checkpoints,
             [group.group_id for group in cache_groups],
         )
         self.scheduler = Scheduler(scheduler_cfg)

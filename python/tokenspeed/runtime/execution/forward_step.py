@@ -879,6 +879,7 @@ class ForwardStepRunner:
         extend_prefix_lens_cpu: torch.Tensor,
         extend_seq_lens: torch.Tensor,
         extend_seq_lens_cpu: torch.Tensor,
+        state_checkpoint_lens_cpu: torch.Tensor,
         positions: torch.Tensor | None = None,
         block_tables: dict | None = None,
     ):
@@ -962,6 +963,7 @@ class ForwardStepRunner:
                 extend_prefix_lens_cpu=extend_prefix_lens_cpu,
                 extend_seq_lens=extend_seq_lens,
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
+                state_checkpoint_lens_cpu=state_checkpoint_lens_cpu,
                 positions=positions,
                 global_num_tokens=ctx.global_num_tokens,
                 all_decode_or_idle=ctx.all_decode_or_idle,
