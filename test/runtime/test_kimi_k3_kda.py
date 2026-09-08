@@ -477,11 +477,6 @@ class _KDAHarness:
         return _tables_for(self.contract, np_tables, self.device)
 
     def extend_metadata(self, tables, seq_lens, extend_prefix_lens):
-        self.checkpoint_metadata(
-            tables, seq_lens, extend_prefix_lens, [0] * len(seq_lens)
-        )
-
-    def checkpoint_metadata(self, tables, seq_lens, extend_prefix_lens, checkpoints):
         """An EXTEND batch: every row extends, the executor's host mirrors
         carry each row's new-token and prefix lengths."""
         bs = len(seq_lens)
@@ -498,7 +493,6 @@ class _KDAHarness:
             extend_seq_lens_cpu=new_cpu,
             extend_prefix_lens=prefix_cpu.to(self.device),
             extend_prefix_lens_cpu=prefix_cpu,
-            state_checkpoint_lens_cpu=torch.tensor(checkpoints, dtype=torch.int32),
             extend_with_prefix=bool(prefix_cpu.any()),
         )
 
@@ -625,100 +619,6 @@ class _KDAHarness:
             fla_out[0].flatten(0, 1),
             _to_slab_layout(fla_state[0].float()),
         )
-
-
-@requires_cuda
-@pytest.mark.parametrize("ragged", [False, True])
-@pytest.mark.parametrize("padding", [0, 5])
-def test_one_forward_checkpoint_matches_split_prefill(ragged, padding):
-    """Real KDA + conv: both snapshots, packed outputs, padding, and replay.
-
-    Uses the selected production prefill solution, not a mocked scan. The
-    independent split arm preserves the stored-state dtype boundary.
-    """
-    contract = _stub_contract(prefix_granularity=4, usable_pages=8)
-
-    def harness():
-        pool = _StubContractPool(
-            contract, "cuda", conv_dim=3 * 4 * 128, width=4, num_heads=4, head_dim=128
-        )
-        return _KDAHarness(pool, contract, layer_ids=[0, 1, 2])
-
-    fused, split = harness(), harness()
-    lengths = [7, 2, 6] if ragged else [7]
-    checkpoints = [4, 0, 4] if ragged else [4]
-    tables = {g: [[1, 4], [2, 0], [3, 5]][: len(lengths)] for g in _STATE_GROUPS}
-    plan = mamba.build_state_checkpoint_split_plan(
-        torch.zeros(len(lengths), dtype=torch.int32),
-        torch.tensor(lengths, dtype=torch.int32),
-        torch.tensor(checkpoints, dtype=torch.int32),
-        4,
-        "cuda",
-    )
-    streams = {i: fused.token_stream(sum(lengths)) for i in range(3)}
-    fused.checkpoint_metadata(tables, lengths, [0] * len(lengths), checkpoints)
-    actual = {}
-    for layer, stream in streams.items():
-        inputs = {
-            key: torch.cat(
-                (value, value.new_full((padding, *value.shape[1:]), float("nan")))
-            )
-            for key, value in stream.items()
-        }
-        actual[layer] = fused.extend(
-            layer, inputs["mixed"], inputs["g_raw"], inputs["beta_raw"], bs=len(lengths)
-        )
-
-    body_lengths = plan.phase1_seq_lens_cpu.tolist()
-    split.extend_metadata(tables, body_lengths, [0] * len(lengths))
-    body_out = {}
-    for layer, stream in streams.items():
-        body = {key: plan.select_tokens(value, 1, 0) for key, value in stream.items()}
-        body_out[layer] = split.extend(
-            layer, body["mixed"], body["g_raw"], body["beta_raw"], bs=len(lengths)
-        ).view(-1, split.H, split.D)
-
-    tail_rows = [row for row, checkpoint in enumerate(checkpoints) if checkpoint]
-    tail_tables = {g: [rows[i] for i in tail_rows] for g, rows in tables.items()}
-    split.extend_metadata(
-        tail_tables,
-        [lengths[i] for i in tail_rows],
-        [checkpoints[i] for i in tail_rows],
-    )
-    for layer, stream in streams.items():
-        tail = {key: plan.select_tokens(value, 2, 0) for key, value in stream.items()}
-        tail_out = split.extend(
-            layer, tail["mixed"], tail["g_raw"], tail["beta_raw"], bs=len(tail_rows)
-        ).view(-1, split.H, split.D)
-        expected = plan.merge_tokens(body_out[layer], tail_out, 0).flatten(0, 1)
-        torch.testing.assert_close(actual[layer], expected, rtol=1e-2, atol=2e-3)
-        for component in ("conv_state", "recurrent_state"):
-            torch.testing.assert_close(
-                fused.pool.get_component(layer, component),
-                split.pool.get_component(layer, component),
-                rtol=1e-2,
-                atol=2e-3,
-            )
-
-    # Reuse the intermediate page, not the final live state, and replay the
-    # same tail into separate writable output pages.
-    replay_tables = {
-        g: [[row[0], row[1] + 2] for row in rows] for g, rows in tail_tables.items()
-    }
-    fused.extend_metadata(
-        replay_tables,
-        [lengths[i] for i in tail_rows],
-        [checkpoints[i] for i in tail_rows],
-    )
-    for layer, stream in streams.items():
-        tail = {key: plan.select_tokens(value, 2, 0) for key, value in stream.items()}
-        replay = fused.extend(
-            layer, tail["mixed"], tail["g_raw"], tail["beta_raw"], bs=len(tail_rows)
-        )
-        expected_tail = plan.select_tokens(
-            actual[layer].view(-1, fused.H, fused.D), 2, 0
-        ).flatten(0, 1)
-        torch.testing.assert_close(replay, expected_tail, rtol=1e-2, atol=2e-3)
 
 
 def _to_slab_layout(state: torch.Tensor) -> torch.Tensor:

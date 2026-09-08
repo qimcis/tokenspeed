@@ -505,7 +505,6 @@ class RunnerSignatureConformanceTest(_TorchCase):
                         extend_seq_lens_cpu=None,
                         extend_prefix_lens=None,
                         extend_prefix_lens_cpu=None,
-                        state_checkpoint_lens_cpu=None,
                         extend_with_prefix=False,
                         positions=None,
                         global_num_tokens=None,
