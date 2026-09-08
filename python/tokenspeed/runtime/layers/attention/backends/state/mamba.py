@@ -872,10 +872,11 @@ class MambaAttnBackend(AttentionBackend):
         extend_seq_lens_cpu: torch.Tensor,
         extend_prefix_lens: torch.Tensor,
         extend_prefix_lens_cpu: torch.Tensor,
+        state_checkpoint_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
         **kwargs,
     ) -> None:
-        del req_pool_indices, extend_with_prefix
+        del req_pool_indices, extend_with_prefix, kwargs
         if not (forward_mode.is_extend_or_mixed() or forward_mode.is_idle()):
             raise RuntimeError(
                 "Mamba decode metadata goes through refresh_decode_metadata; "
@@ -938,7 +939,7 @@ class MambaAttnBackend(AttentionBackend):
         checkpoint_plan = None
         checkpoint_blocks_by_group = None
         if self.supports_prefill_state_checkpoints and num_extends > 0:
-            checkpoint_lens_cpu = kwargs["state_checkpoint_lens_cpu"][:num_extends]
+            checkpoint_lens_cpu = state_checkpoint_lens_cpu[:num_extends]
             checkpoint_plan = build_state_checkpoint_split_plan(
                 torch.cat(
                     (
@@ -958,15 +959,18 @@ class MambaAttnBackend(AttentionBackend):
             )
             if checkpoint_plan is not None:
                 checkpoint_blocks_by_group = {}
+                max_checkpoint_len = int(checkpoint_lens_cpu.max())
                 for group_id in self._state_group_ids:
                     rows = self._state_rows(block_tables, group_id)[:bs]
                     if (
-                        int(checkpoint_lens_cpu.max())
+                        max_checkpoint_len
                         > rows.shape[1] * self._checkpoint_granularity
                     ):
                         raise ValueError(
                             "intermediate checkpoint exceeds its state block table"
                         )
+                    # Non-checkpoint rows gather slot zero only as a placeholder;
+                    # the mask below selects their ordinary writable endpoint.
                     blocks = rows.gather(
                         1, checkpoint_plan.checkpoint_slots[:, None]
                     ).squeeze(1)
@@ -975,14 +979,9 @@ class MambaAttnBackend(AttentionBackend):
                         blocks,
                         state_out_blocks_by_group[group_id],
                     )
-                set_total_chunks_hint(
-                    checkpoint_plan.phase1_seq_lens_cpu,
-                    checkpoint_plan.phase1_query_start_loc,
-                )
-                set_total_chunks_hint(
-                    checkpoint_plan.phase2_seq_lens_cpu,
-                    checkpoint_plan.phase2_query_start_loc,
-                )
+                # KDA passes each phase's CPU boundaries to its scan. It does
+                # not consume GDN's global chunk hints, whose setter clears
+                # prior entries instead of retaining two independent phases.
 
         self.forward_metadata = MambaForwardMetadata(
             query_start_loc=query_start_loc,
@@ -1417,7 +1416,12 @@ class MambaAttnBackend(AttentionBackend):
         beta_raw: torch.Tensor | None,
         lower_bound: float | None,
     ) -> torch.Tensor:
-        """Run two recurrent phases inside one transformer-layer forward."""
+        """Run two recurrent phases inside one transformer-layer forward.
+
+        Checkpoint-capable scan overrides must return token-major outputs,
+        as KDA does. The base GDN scan's [1, T, H, V] output needs adaptation
+        before that backend can enable this capability.
+        """
 
         def scan_phase(
             phase: int,

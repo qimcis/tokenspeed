@@ -111,10 +111,15 @@ void Scheduler::publishPrefillStateCheckpoint(Request& request, fsm::CacheProgre
     pages.resize(checkpoint / coordinator_.PrefixGranularity());
     const auto hashes = ComputePrefixHashes(pages, "");
     const std::int32_t last_page = static_cast<std::int32_t>(hashes.size()) - 1;
+    // Register this snapshot separately; the caller's normal completion
+    // path publishes the earlier history pages before another plan can run.
     const auto event_keys = registerKvEventPrefixPages(request, hashes, last_page);
     coordinator_.CacheCompletedBlocks(request.BlockTablesRef(), hashes, progress.access_epoch, last_page, checkpoint,
                                       CacheBoundaryKind::kChunk, config_.StreamsDeviceCacheToHost());
     discardUncachedKvEventPages(event_keys);
+    // Progress belongs to the caller's prospective FSM transition. If an
+    // admission fails, the live request keeps the pending boundary and a
+    // retry repeats this idempotent registration with the same epoch/pages.
     progress.state_checkpoint_len = 0;
 }
 

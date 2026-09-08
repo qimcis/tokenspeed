@@ -20,12 +20,12 @@
 
 """Host-planned ragged routing for intermediate recurrent-state checkpoints."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class StateCheckpointSplitPlan:
     """Packed-token routing for one-forward intermediate state snapshots."""
 
@@ -42,6 +42,7 @@ class StateCheckpointSplitPlan:
     phase2_cu_seqlens_cpu: torch.Tensor
     single_boundary: int | None
     total_tokens: int
+    _routing_staging_cpu: torch.Tensor = field(repr=False)
 
     def select_tokens(
         self, tensor: torch.Tensor | None, phase: int, token_dim: int
@@ -84,6 +85,35 @@ def _host_prefix_sum(lengths: torch.Tensor) -> torch.Tensor:
     return bounds
 
 
+def _upload_checkpoint_routing(
+    tensors: dict[str, torch.Tensor], device: torch.device
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Pack host routing into one allocation and enqueue one nonblocking copy."""
+    offsets = {}
+    total_bytes = 0
+    for name, tensor in tensors.items():
+        offsets[name] = total_bytes
+        # Align every field for the int64 index views, including fields after
+        # the bool mask and int32 sequence boundaries.
+        total_bytes += (tensor.nbytes + 7) // 8 * 8
+    staging = torch.empty(
+        total_bytes,
+        dtype=torch.uint8,
+        device="cpu",
+        pin_memory=device.type == "cuda",
+    )
+    for name, tensor in tensors.items():
+        staging.narrow(0, offsets[name], tensor.nbytes).view(tensor.dtype).copy_(tensor)
+    # Fresh storage per plan: another batch must never overwrite an in-flight
+    # H2D source. The plan retains it; the pinned allocator also tracks copy
+    # completion if the plan is released before the GPU finishes the upload.
+    uploaded = staging.to(device=device, non_blocking=True)
+    return staging, {
+        name: uploaded.narrow(0, offsets[name], tensor.nbytes).view(tensor.dtype)
+        for name, tensor in tensors.items()
+    }
+
+
 def build_state_checkpoint_split_plan(
     extend_prefix_lens_cpu: torch.Tensor,
     extend_seq_lens_cpu: torch.Tensor,
@@ -116,6 +146,7 @@ def build_state_checkpoint_split_plan(
     if not checkpoint_rows:
         return None
 
+    single_row = len(lengths) == 1
     phase1_lengths: list[int] = []
     phase2_lengths: list[int] = []
     phase1_indices: list[int] = []
@@ -141,42 +172,50 @@ def build_state_checkpoint_split_plan(
             phase1_len = checkpoint - prefix
             phase2_len = endpoint - checkpoint
             phase2_lengths.append(phase2_len)
-            phase2_indices.extend(range(offset + phase1_len, offset + length))
+            if not single_row:
+                phase2_indices.extend(range(offset + phase1_len, offset + length))
         else:
             phase1_len = length
         phase1_lengths.append(phase1_len)
-        phase1_indices.extend(range(offset, offset + phase1_len))
+        if not single_row:
+            phase1_indices.extend(range(offset, offset + phase1_len))
         offset += length
 
     phase1_lens_cpu = torch.tensor(phase1_lengths, dtype=torch.int32)
     phase2_lens_cpu = torch.tensor(phase2_lengths, dtype=torch.int32)
     phase1_cu_cpu = _host_prefix_sum(phase1_lens_cpu)
     phase2_cu_cpu = _host_prefix_sum(phase2_lens_cpu)
-    checkpoint_tensor = torch.tensor(checkpoints, dtype=torch.int32, device=device)
-    checkpoint_slots = torch.div(
-        checkpoint_tensor - 1, checkpoint_granularity, rounding_mode="floor"
-    ).clamp_(min=0)
-    single_boundary = phase1_lengths[0] if len(lengths) == 1 else None
+    routing_cpu = {
+        "checkpoint_mask": torch.tensor([value > 0 for value in checkpoints]),
+        "checkpoint_rows": torch.tensor(checkpoint_rows, dtype=torch.int64),
+        "checkpoint_slots": torch.tensor(
+            [max((value - 1) // checkpoint_granularity, 0) for value in checkpoints],
+            dtype=torch.int64,
+        ),
+        "phase1_query_start_loc": phase1_cu_cpu.to(dtype=torch.int32),
+        "phase2_query_start_loc": phase2_cu_cpu.to(dtype=torch.int32),
+    }
+    if not single_row:
+        routing_cpu["phase1_token_indices"] = torch.tensor(
+            phase1_indices, dtype=torch.int64
+        )
+        routing_cpu["phase2_token_indices"] = torch.tensor(
+            phase2_indices, dtype=torch.int64
+        )
+    staging, routing = _upload_checkpoint_routing(routing_cpu, torch.device(device))
     return StateCheckpointSplitPlan(
-        checkpoint_mask=checkpoint_tensor > 0,
-        checkpoint_rows=torch.tensor(checkpoint_rows, dtype=torch.int64, device=device),
-        checkpoint_slots=checkpoint_slots.to(torch.int64),
-        phase1_token_indices=(
-            None
-            if single_boundary is not None
-            else torch.tensor(phase1_indices, dtype=torch.int64, device=device)
-        ),
-        phase2_token_indices=(
-            None
-            if single_boundary is not None
-            else torch.tensor(phase2_indices, dtype=torch.int64, device=device)
-        ),
-        phase1_query_start_loc=phase1_cu_cpu.to(device=device, dtype=torch.int32),
-        phase2_query_start_loc=phase2_cu_cpu.to(device=device, dtype=torch.int32),
+        checkpoint_mask=routing["checkpoint_mask"],
+        checkpoint_rows=routing["checkpoint_rows"],
+        checkpoint_slots=routing["checkpoint_slots"],
+        phase1_token_indices=routing.get("phase1_token_indices"),
+        phase2_token_indices=routing.get("phase2_token_indices"),
+        phase1_query_start_loc=routing["phase1_query_start_loc"],
+        phase2_query_start_loc=routing["phase2_query_start_loc"],
         phase1_seq_lens_cpu=phase1_lens_cpu,
         phase2_seq_lens_cpu=phase2_lens_cpu,
         phase1_cu_seqlens_cpu=phase1_cu_cpu,
         phase2_cu_seqlens_cpu=phase2_cu_cpu,
-        single_boundary=single_boundary,
+        single_boundary=phase1_lengths[0] if single_row else None,
         total_tokens=offset,
+        _routing_staging_cpu=staging,
     )

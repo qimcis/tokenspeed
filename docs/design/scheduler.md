@@ -109,6 +109,20 @@ it does not introduce a GPU synchronization. In particular, the first replay
 after a one-token response must already reuse the checkpoint, without another
 cold prefill to populate the cache.
 
+A completed prefill can be retracted before its first decode admission when
+the batch budget is exhausted. Snapshot retraction uses that prefill's
+computed window, including under speculation; subtracting the decode width
+from its token count would undercount the completed prompt. Retraction without
+a host cache deliberately releases the request's storage and recomputes on
+readmission, so an unpublished checkpoint need not survive that path.
+
+Checkpoint publication uses the caller's prospective `CacheProgress`. If
+admission fails, the pending boundary remains on the live request and the next
+attempt repeats the idempotent cache registration. Its cleared value is
+committed with a successful FSM transition. The checkpoint registration and
+ordinary publication of earlier history pages run within the same serialized
+scheduler operation.
+
 The fallback for backends without this capability is the two-forward protocol
 below.
 

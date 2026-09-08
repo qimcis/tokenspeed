@@ -722,10 +722,14 @@ void Scheduler::retractVictim(Request& victim, std::vector<WriteBackOperation>& 
         // A decoding request has its whole prompt plus generated tokens bar
         // the one it is about to write; an incomplete prefill has only the
         // chunks it has been through -- taking TokenSize() there would
-        // publish pages that were never computed.
+        // publish pages that were never computed. A PrefillDone victim may
+        // not have reached scheduleDecode (e.g. the mixed batch's token
+        // budget was exhausted), so it also uses its completed prefill
+        // window rather than subtracting a speculative decode width.
         const std::int32_t num_computed_tokens = [&] {
-            if (const auto* prefilling = victim.GetIf<fsm::Prefilling>()) {
-                return prefilling->window.begin + prefilling->window.size;
+            if (victim.Is<fsm::Prefilling>() || victim.Is<fsm::PrefillDone>()) {
+                const PrefillInfo previous = victim.CurrentPrefillInfo();
+                return previous.already_scheduled_len + previous.extend_len;
             }
             return victim.TokenSize() - config_.decode_input_tokens;
         }();

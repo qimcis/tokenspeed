@@ -560,6 +560,15 @@ vector; prefill graph warmup passes zeros. The dynamic extend metadata builder
 creates a ragged two-phase routing plan once per batch, including mixed decode
 rows in phase one with no checkpoint. Pure decode refresh/capture is unchanged.
 
+Routing masks, indices, and boundaries are computed on the host, packed into
+one fresh pinned allocation per CUDA batch, and uploaded with one nonblocking
+copy. The plan retains that staging allocation; it is never overwritten for
+another batch, and the pinned allocator tracks in-flight copies when a plan
+is released. CPU execution uses unpinned storage. A single-row plan builds no
+per-token index lists. KDA consumes the per-phase CPU boundaries directly
+(FLA/CuTe) or plans on device (FlashKDA); it does not use GDN's global chunk
+hint cache.
+
 For a checkpointed KDA extend, each layer runs its conv and recurrent body,
 stores the aligned state, and resumes the tail from that stored dtype into a
 different writable state block. All other transformer work runs once over the
