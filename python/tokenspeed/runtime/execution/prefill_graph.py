@@ -46,12 +46,17 @@ from __future__ import annotations
 
 import bisect
 from contextlib import contextmanager
+from datetime import timedelta
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
+import torch.distributed as dist
 import tqdm
 
+from tokenspeed.runtime.distributed.process_group_manager import (
+    process_group_manager as pg_manager,
+)
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     BreakableCapture,
     active_forward,
@@ -88,6 +93,8 @@ PREFILL_BUCKET_STEP_DIVISOR: int = 8
 
 # Absolute rung-spacing cap, bounding the worst case at the top of the ladder.
 PREFILL_BUCKET_MAX_STEP: int = 512
+
+DEEPEP_CAPTURE_BARRIER_TIMEOUT = timedelta(minutes=5)
 
 
 def get_prefill_token_buckets(config: ModelExecutorConfig) -> list[int]:
@@ -238,6 +245,11 @@ class PrefillGraph:
         self.drafter = drafter
         self.num_warmup = num_warmup
         self.dp_size = config.data_parallel_size
+        self._deepep_enabled = (
+            model_runner.deepep_prefill_graph_enabled
+            if model_runner is not None
+            else False
+        )
 
         self.capture_buckets = get_prefill_token_buckets(config)
         self.disable = (
@@ -251,12 +263,8 @@ class PrefillGraph:
             or self._embed_tokens is None
             or model_runner is None
             or not model_runner.is_generation
-            # DP replay decisions must come from replicated state, and a
-            # forward's multimodal-ness is rank-local: one rank running its mm
-            # prefill eager while text-only peers replay desyncs the EP
-            # collectives. Until the DP metadata gather carries a multimodal
-            # flag, keep the graph off for multimodal models under DP.
-            or (config.data_parallel_size > 1 and model_runner.is_multimodal)
+            # Rank-local multimodal fallback would desynchronize DP collectives.
+            or (config.data_parallel_size > 1 and model_runner.is_multimodal_active)
         )
 
         self._ctx: ForwardContext | None = None
@@ -352,14 +360,33 @@ class PrefillGraph:
         for _ in range(self.num_warmup):
             self._run_inner(bucket)
         torch.cuda.synchronize()
+        self._deepep_capture_barrier()
         stream = decode_wrapper.stream if decode_wrapper is not None else None
         cap = BreakableCapture(pool=self._pool, stream=stream)
         with cap:
             self._outputs[bucket] = CapturedForward(*self._run_inner(bucket))
         if self._pool is None:
             self._pool = cap.pool  # share the pool across all subsequent buckets
+        # All ranks must finish capture before real DeepEP replay starts.
+        self._deepep_capture_barrier()
         cap.replay()  # capture records kernels without executing; smoke-test replay
+        if self._deepep_enabled:
+            torch.cuda.synchronize()
         self._captures[bucket] = cap
+
+    def _deepep_capture_barrier(self) -> None:
+        """Align DeepEP warmup, capture and smoke replay across the Gloo world.
+
+        Attention-TP groups omit DP peers; PP is excluded by the capability check.
+        """
+        if not self._deepep_enabled or self.config.world_size <= 1:
+            return
+        cpu_group = pg_manager.get_process_group("gloo", self.config.world_group)
+        dist.monitored_barrier(
+            group=cpu_group,
+            timeout=DEEPEP_CAPTURE_BARRIER_TIMEOUT,
+            wait_all_ranks=True,
+        )
 
     def _run_inner(self, num_tokens: int):
         """Run the inner model over the leading ``num_tokens`` of the static buffers.
@@ -592,7 +619,6 @@ class PrefillGraph:
         """
         bucket = self._replay_bucket(ctx)
         assert bucket is not None, "replay() called without can_run()"
-        self._log_engaged_once(bucket, ctx, multimodal_context is not None)
         num_tokens = ctx.input_num_tokens
         input_embeds = None
         if multimodal_context is not None:
@@ -613,6 +639,7 @@ class PrefillGraph:
                 ib.positions_buf[num_tokens:bucket].zero_()
         with self._padded_to(ctx, bucket):
             self._captures[bucket].replay(valid_rows=num_tokens)
+        self._log_engaged_once(bucket, ctx, multimodal_context is not None)
         hidden_states, aux_hidden_states = self._outputs[bucket].sliced(num_tokens)
         # The eager logits tail of BaseCausalLM.forward, on the replayed hidden states.
         logits_metadata = LogitsMetadata.from_forward_context(ctx)
@@ -625,25 +652,43 @@ class PrefillGraph:
         )
 
     def _replay_bucket(self, ctx: ForwardContext) -> int | None:
-        """The captured bucket this forward replays, or ``None`` to run eager.
+        """Return a replay bucket, or None for eager execution.
 
-        Pure-extend AND mixed extend+decode batches are eligible: the attention
-        break reads the LIVE ambient ctx and dispatches the prefill/decode
-        split itself, while the captured token-shaped compute is uniform over
-        all rows (pure decode is the decode graph's job). Two ctx fields are
-        baked into the captured segments rather than rebound at replay -- the
-        draft first-step row narrowing (``draft_narrowing``) and the
-        ``capture_hidden_mode`` aux-hidden capture -- so a live forward carrying
-        different values falls back to eager rather than silently dropping the
-        reduce / mismatching aux. Prefix caching (cache hits and chunked-prefill
-        chunks 2+) IS eligible: the prefix affects only the ragged attention,
-        which runs entirely inside the eager break, and it adds zero new tokens,
-        so the padded bucket -- hence the baked EP all-to-all shape under DP --
-        is identical on prefix and non-prefix ranks.
+        DeepEP requires pure EXTEND on every DP rank; other backends allow MIXED.
+        Prefix hits and later chunks use live attention metadata. Row narrowing
+        and hidden capture mode must match the recorded layout.
         """
-        if self.disable or ctx.forward_mode is None:
+        if self.disable:
             return None
-        if ctx.num_extends <= 0:
+        if self._deepep_enabled:
+            # Choose collectively before checking local layout invariants.
+            bucket = self._select_bucket(ctx)
+            if bucket is None:
+                return None
+            if bucket not in self._captures:
+                raise RuntimeError(
+                    f"DeepEP prefill graph is missing the captured bucket {bucket}"
+                )
+            if self.dp_size <= 1:
+                if ctx.forward_mode != ForwardMode.EXTEND or ctx.num_extends <= 0:
+                    return None
+            elif ctx.forward_mode != ForwardMode.EXTEND or ctx.num_extends <= 0:
+                raise RuntimeError(
+                    "DeepEP prefill graph: all_extend disagrees with the local forward"
+                )
+            if (
+                ctx.collective_num_tokens is not None
+                or ctx.collective_global_num_tokens is not None
+                or ctx.draft_narrowing is not None
+                or ctx.capture_hidden_mode != self._captured_hidden_mode
+            ):
+                # A local eager fallback here would desynchronize peers.
+                raise RuntimeError(
+                    "DeepEP prefill graph does not support collective overrides "
+                    "or a changed capture layout"
+                )
+            return bucket
+        if ctx.forward_mode is None or ctx.num_extends <= 0:
             return None
         if not (ctx.forward_mode.is_extend() or ctx.forward_mode.is_mixed()):
             return None
@@ -657,18 +702,24 @@ class PrefillGraph:
         return bucket
 
     def _select_bucket(self, ctx: ForwardContext) -> int | None:
-        """The padded bucket for this forward, or ``None`` to run eager.
+        """Choose a padded bucket from replicated DP counts, or None for eager.
 
-        Under data parallelism the MoE expert-parallel all-to-all is a collective
-        across ALL ranks, sized from a replicated per-rank token list. The captured
-        graph bakes a uniform ``[bucket]*world_size`` layout, so every rank must
-        replay the SAME bucket or the collective desyncs (NCCL deadlock). Decide
-        purely from replicated global state -- the all-extend flag and the global
-        max token count -- so all ranks reach the identical decision/bucket with no
-        extra sync (mirrors the decode graph). Idle ranks run a DECODE forward, so
-        ``all_extend`` is False whenever any rank is idle and the graph stays off
-        (e.g. warmup), correctly falling back to eager.
+        Captured collectives require the same bucket on every rank. Use
+        ``all_extend`` and the global maximum; idle ranks keep graphs off.
         """
+        if self._deepep_enabled and self.dp_size <= 1 and ctx.input_num_tokens <= 0:
+            return None
+        if self._deepep_enabled and self.dp_size > 1:
+            if not ctx.all_extend or ctx.global_num_tokens is None:
+                return None
+            if len(ctx.global_num_tokens) != self.config.world_size:
+                raise RuntimeError(
+                    "DeepEP prefill graph requires counts for every rank"
+                )
+            # Counts are before TP scatter; an individual TP shard may be empty.
+            if any(n <= 0 for n in ctx.global_num_tokens):
+                return None
+            return self._padded_bucket(max(ctx.global_num_tokens))
         if self.dp_size <= 1 or ctx.global_num_tokens is None:
             return self._padded_bucket(ctx.input_num_tokens)
         if not ctx.all_extend:
@@ -722,6 +773,14 @@ class PrefillGraph:
         if kind in self._engaged_logged:
             return
         self._engaged_logged.add(kind)
+        if self._deepep_enabled:
+            logger.info(
+                "DeepEP prefill BCG replay: rank=%d bucket=%d real_tokens=%d",
+                self.config.global_rank,
+                bucket,
+                ctx.input_num_tokens,
+            )
+            return
         logger.info(
             "prefill breakable graph ENGAGED (%s): bucket=%d dp=%s mode=%s "
             "(mixed prefill+decode batches supported)",

@@ -38,6 +38,11 @@ from torch import nn
 from tokenspeed.runtime.configs.qwen3_5_text_base_config import Qwen3_5BaseTextConfig
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.execution.breakable_cuda_graph import (
+    break_here,
+    current_valid_rows,
+    is_breakable_capture_active,
+)
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_step import (
     get_is_capture_mode,
@@ -349,6 +354,17 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         ctx: ForwardContext,
     ) -> torch.Tensor:
         if self.use_deepep:
+            if is_breakable_capture_active():
+                # Allocate in the graph pool; downstream consumers may retain it.
+                dst = torch.empty_like(hidden_states)
+                return break_here(
+                    self._forward_deepep_bcg_into,
+                    dst,
+                    hidden_states,
+                    ctx,
+                    dst,
+                    capture_stub=self._stub_deepep_bcg_into,
+                )
             return self._forward_deepep(
                 hidden_states, num_global_tokens, max_num_tokens_per_gpu, ctx
             )
@@ -420,6 +436,38 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
+    @staticmethod
+    def _stub_deepep_bcg_into(
+        hidden_states: torch.Tensor,
+        ctx: ForwardContext,
+        dst: torch.Tensor,
+    ) -> torch.Tensor:
+        """Initialize the output without DeepEP communication during capture."""
+        return dst.zero_()
+
+    def _forward_deepep_bcg_into(
+        self,
+        hidden_states: torch.Tensor,
+        ctx: ForwardContext,
+        dst: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the complete MoE on live local rows and write the padded output."""
+        live_rows = self.comm_manager.moe_num_valid_rows(ctx, current_valid_rows())
+        num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
+            ctx
+        )
+        # Clear the local tail; valid_rows is in pre-TP coordinates.
+        dst.zero_()
+        # Empty source ranks still dispatch/combine for remote expert work.
+        result = self._forward_deepep(
+            hidden_states[:live_rows],
+            num_global_tokens,
+            max_num_tokens_per_gpu,
+            ctx,
+        )
+        dst[:live_rows].copy_(result)
+        return dst
+
     def _forward_deepep(
         self,
         hidden_states: torch.Tensor,
@@ -434,11 +482,8 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         # Gate on local tokens (no all-gather needed)
         router_logits, _ = self.gate(hidden_states)
 
-        # Shared expert on this rank's token shard. Weights are replicated for
-        # the DeepEP path (see the constructor), so the result is already
-        # complete -- no tensor-parallel reduction. It only reads
-        # ``hidden_states``, so it runs inside DeepEP's dispatch window below,
-        # where its GEMMs cover the in-flight token transfer.
+        # Shared weights are replicated: no TP reduction. The callback overlaps
+        # low-latency dispatch; normal dispatch runs it before communication.
         shared_output = None
         overlap_fn = None
         if self.shared_expert is not None:

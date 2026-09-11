@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import inspect
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 import torch
@@ -90,6 +91,10 @@ class ModelRunner:
         self.mapping = server_args.mapping
         self.is_generation = model_config.is_generation
         self.is_multimodal = model_config.is_multimodal
+        # Unlike is_multimodal, this is false for --language-model-only.
+        self.is_multimodal_active = model_config.is_multimodal_active
+        # Enabled by the executor after validating the loaded MoE plans.
+        self.deepep_prefill_graph_enabled = False
         self.is_draft_worker = is_draft_worker
         self.mambaish_config = getattr(model_config, "mambaish_config", None)
         self.is_hybrid_gdn = getattr(model_config, "is_hybrid_gdn", False)
@@ -144,6 +149,49 @@ class ModelRunner:
     @property
     def multimodal_encoder_dtype(self) -> str | None:
         return infer_multimodal_encoder_dtype(self.model)
+
+    def deepep_prefill_graph_unsupported_reason(self) -> str | None:
+        """Return a rejection reason, or None for supported Qwen DeepEP plans.
+
+        Every MoE must belong to a complete Qwen graph break and use FP8 DeepGEMM.
+        """
+        from tokenspeed.runtime.layers.moe.expert import MoELayer
+        from tokenspeed.runtime.models.qwen3_5_moe import Qwen3_5MoeSparseMoeBlock
+
+        if self.model_config.dtype != torch.bfloat16:
+            return "the loaded model must use BF16 activations"
+
+        modules = tuple(self.model.modules())
+        blocks = tuple(
+            module for module in modules if type(module) is Qwen3_5MoeSparseMoeBlock
+        )
+        if not blocks:
+            return "the loaded model has no supported Qwen MoE graph-break blocks"
+        owned_experts = {id(block.experts) for block in blocks}
+        for module in modules:
+            plan = getattr(module, "plan", None)
+            if (
+                isinstance(module, MoELayer)
+                or (isinstance(plan, Mapping) and plan.get("a2a_backend") == "deepep")
+            ) and id(module) not in owned_experts:
+                return "every MoE operation must use the complete Qwen graph break"
+        for block in blocks:
+            plan = block.experts.plan
+            if not block.use_deepep:
+                return "a Qwen MoE block did not select its DeepEP execution path"
+            if not (
+                plan.get("apply_kernel_name") == "deep_gemm_deepep_fp8_moe_apply"
+                and plan.get("solution") == "deep_gemm"
+                and plan.get("weight_dtype") == "fp8"
+                and plan.get("a2a_backend") == "deepep"
+                and plan.get("deepep_mode") == "auto"
+                and plan.get("internal_activation_dtype") == "input"
+            ):
+                return (
+                    "every Qwen MoE layer must resolve the BF16/block-FP8 "
+                    "DeepGEMM DeepEP kernel in auto mode"
+                )
+        return None
 
     def prepare_multimodal_runtime(self) -> None:
         """Prepare loaded multimodal encoders for serving.
