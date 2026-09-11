@@ -26,8 +26,7 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass
-from types import SimpleNamespace
+from dataclasses import dataclass, replace
 
 import pytest
 import torch
@@ -48,6 +47,10 @@ from tokenspeed.runtime.draft_pool.transport import (
     TargetDraftClient,
     TargetDraftClientConfig,
 )
+from tokenspeed.runtime.draft_pool.worker import (
+    WorkerBatchCompletion,
+    WorkerDraftResult,
+)
 
 
 def await_condition(condition, label: str) -> None:
@@ -66,55 +69,106 @@ class DeterministicEngine:
         self.owner = threading.get_ident()
         self.sessions = {}
         self.batches = []
+        self.stages = []
         self.started = threading.Event()
         self.release = threading.Event()
         self.closed = threading.Event()
         self.block_first = block_first
+        self._next_ticket = 0
+        self._staged = {}
+        self._active = None
+        self._blocked = None
+        self._jobs = ()
 
     def open_session(self, session_id: str) -> None:
         assert threading.get_ident() == self.owner
+        assert session_id not in self.sessions
         self.sessions[session_id] = torch.empty((0, 4), dtype=torch.bfloat16)
 
-    def install_features(
-        self, session_id, feature_start, confirmed_endpoint, features, is_snapshot
-    ) -> None:
+    def validate_features(self, update) -> None:
         assert threading.get_ident() == self.owner
-        assert features.device.type == "cpu"
-        assert features.dtype == torch.bfloat16
-        assert features.shape[0] == confirmed_endpoint - feature_start
-        if is_snapshot:
-            assert feature_start == 0
-            self.sessions[session_id] = features.clone()
+        assert update.features.device.type == "cpu"
+        assert update.features.dtype == torch.bfloat16
+        assert (
+            update.features.shape[0] == update.confirmed_endpoint - update.feature_start
+        )
+        if update.is_snapshot:
+            assert update.feature_start == 0
+            assert len(self.sessions[update.session_id]) == 0
         else:
-            assert len(self.sessions[session_id]) == feature_start
-            self.sessions[session_id] = torch.cat((self.sessions[session_id], features))
+            assert len(self.sessions[update.session_id]) == update.feature_start
 
-    def draft_batch(self, jobs):
+    def stage_batch(self, updates) -> int:
         assert threading.get_ident() == self.owner
+        assert len(self._staged) < 2
+        self._next_ticket += 1
+        self._staged[self._next_ticket] = tuple(
+            replace(update, features=update.features.clone()) for update in updates
+        )
+        self.stages.append(tuple(update.session_id for update in updates))
+        return self._next_ticket
+
+    def launch_batch(self, ticket, jobs) -> None:
+        assert threading.get_ident() == self.owner
+        assert self._active is None
+        for update in self._staged[ticket]:
+            self.validate_features(update)
+            if update.is_snapshot:
+                self.sessions[update.session_id] = update.features
+            else:
+                self.sessions[update.session_id] = torch.cat(
+                    (self.sessions[update.session_id], update.features)
+                )
+        self._active = ticket
+        self._jobs = tuple(jobs)
         self.batches.append(tuple(job.session_id for job in jobs))
         if self.block_first:
             self.block_first = False
+            self._blocked = ticket
             self.started.set()
-            assert self.release.wait(5), "test did not release worker inference"
+
+    def poll_batch(self, ticket):
+        assert threading.get_ident() == self.owner
+        assert self._active == ticket
+        if ticket == self._blocked and not self.release.is_set():
+            return None
         results = []
-        for job in jobs:
+        for job in self._jobs:
             value = int(self.sessions[job.session_id].float().sum()) + job.anchor_token
             results.append(
-                SimpleNamespace(
+                WorkerDraftResult(
                     session_id=job.session_id,
                     confirmed_endpoint=job.confirmed_endpoint,
                     anchor_token=job.anchor_token,
                     candidate_ids=tuple((value + index) % 128 for index in range(7)),
                 )
             )
-        return results
+        installed = tuple(update.session_id for update in self._staged.pop(ticket))
+        self._active = None
+        self._jobs = ()
+        return WorkerBatchCompletion(
+            installed=installed,
+            results=tuple(results),
+            install_error=None,
+            draft_error=None,
+        )
 
     def close_session(self, session_id: str) -> None:
         assert threading.get_ident() == self.owner
+        assert all(
+            update.session_id != session_id
+            for batch in self._staged.values()
+            for update in batch
+        )
         del self.sessions[session_id]
 
     def close(self) -> None:
         assert threading.get_ident() == self.owner
+        if self._active is not None and self._active == self._blocked:
+            assert self.release.wait(5), "test did not retire worker inference"
+        self._staged.clear()
+        self._active = None
+        self._jobs = ()
         self.sessions.clear()
         self.closed.set()
 
@@ -301,6 +355,12 @@ def test_pool_batches_independent_cohorts_and_retires_cancelled_work(pool):
     first.open("cancelled", 4, 10)
     first.update("cancelled", 4, 10, 0, True, snapshot)
     assert running.engines[0].started.wait(5)
+    first.open("uploaded", 4, 13)
+    first.update("uploaded", 4, 13, 0, True, snapshot)
+    await_condition(
+        lambda: ("uploaded",) in running.engines[0].stages,
+        "next batch upload while first inference runs",
+    )
     first.open("other-a", 4, 11)
     second.open("other-b", 4, 12)
     first.update("other-a", 4, 11, 0, True, snapshot)
@@ -310,9 +370,12 @@ def test_pool_batches_independent_cohorts_and_retires_cancelled_work(pool):
         lambda: running.service.queued_jobs == 2, "independent queued requests"
     )
     assert first.client.submit(Close(session_id="cancelled"), None)
-    # One ordered message behind CLOSE proves the service processed cancellation.
-    first.open("after-cancel", 4, 13)
+    # Repeating an outstanding OPEN is idempotent and forms an ordered barrier
+    # behind CLOSE without consuming another resident/staging reservation.
+    first.open("other-a", 4, 11)
     running.engines[0].release.set()
+    uploaded = first.proposal("uploaded", 4)
+    assert uploaded.candidate_ids[0] == (int(expected.float().sum()) + 13) % 128
     a = first.proposal("other-a", 4)
     b = second.proposal("other-b", 4)
     assert a.candidate_ids[0] == (int(expected.float().sum()) + 11) % 128

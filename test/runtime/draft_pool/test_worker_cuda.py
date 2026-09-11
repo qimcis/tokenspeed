@@ -101,7 +101,7 @@ def test_native_eight_batched_forward_and_cold_context_equivalence():
         max_resident_sessions=2,
         max_batch_size=2,
     )
-    engine = DFlash2WorkerEngine(config)
+    engine = DFlash2WorkerEngine(config, pipeline_host_budget_bytes=1024**3)
     try:
         engine.open_session("incremental")
         engine.open_session("snapshot")

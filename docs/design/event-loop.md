@@ -292,6 +292,16 @@ retires outstanding copy tickets before releasing memory. Socket linger and
 worker session leases are bounded. Worker loss leaves target requests on the
 same execution path with real width-one progress.
 
+The worker also separates socket ownership from GPU ownership. Its single
+execution thread batches context installation and drafting on one compute
+stream while a copy stream can upload one subsequent batch. Running and queued
+uploads both consume the existing bounded staging admission; pipelining must
+not create uncharged work. Completion events retain upload buffers and session
+KV until their last GPU use, including after cancellation. Context ACKs follow
+successful installation, never upload submission alone. New transport work,
+execution completion and shutdown wake the socket thread without waiting for
+its periodic housekeeping poll.
+
 The round still issues exactly one `DeviceHandle.execute`. Post-plan DP metadata
 includes the immutable selected width. Every attention cohort participates in
 the same width/graph decision, including all eight in the TP1/DPA8 recipe and

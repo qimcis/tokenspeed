@@ -23,6 +23,7 @@ import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -233,7 +234,7 @@ def test_empty_snapshot_installs_without_launching_zero_row_kernels(monkeypatch)
     engine = object.__new__(DFlash2WorkerEngine)
     engine._thread_id = threading.get_ident()
     engine._closed = False
-    engine.config = SimpleNamespace(device_id=0)
+    engine.config = SimpleNamespace(device_id=0, max_batch_size=1)
     engine.contract = SimpleNamespace(feature_width=2)
     engine.geometry = WorkerCacheGeometry(1, 8, 8)
     engine.sessions = WorkerSessionTable(1, 7)
@@ -251,6 +252,29 @@ def test_empty_snapshot_installs_without_launching_zero_row_kernels(monkeypatch)
         "current_stream",
         lambda device: SimpleNamespace(synchronize=lambda: None),
     )
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
+    monkeypatch.setattr(
+        torch.cuda,
+        "Stream",
+        lambda device: SimpleNamespace(
+            wait_stream=lambda stream: None, wait_event=lambda event: None
+        ),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "Event",
+        lambda: SimpleNamespace(
+            record=lambda stream: None, synchronize=lambda: None, query=lambda: True
+        ),
+    )
+    original_empty = torch.empty
+
+    def cpu_empty(*args, **kwargs):
+        kwargs.pop("pin_memory", None)
+        return original_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", cpu_empty)
+    engine._init_pipeline()
     engine.install_features(
         "empty", 0, 0, torch.empty(0, 2, dtype=torch.bfloat16), True
     )
@@ -325,6 +349,9 @@ def test_worker_forwards_native_geometry_and_unscaled_embeddings(monkeypatch):
         .float()
         .expand(hidden.shape[0], 32)
     )
+    engine._batches = {}
+    engine._compute_stream = object()
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
     results = engine.draft_batch(
         [WorkerDraftJob("a", 4, 5), WorkerDraftJob("b", 99, 6)]
     )

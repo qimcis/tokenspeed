@@ -70,9 +70,10 @@ not an OpenAI-compatible API and not a target NCCL/Gloo rank.
 
 Set `DRAFT_LISTEN_ADDRESS` to its private bind address, for example
 `tcp://10.0.0.20:5557` on a private network where that address belongs to the
-worker. Set `DRAFT_MAX_RESIDENT_SESSIONS` and `DRAFT_MAX_BATCH_SIZE` from the
-available worker memory and measured service rate. Batch size cannot exceed
-resident-session capacity.
+worker. Set `DRAFT_MAX_RESIDENT_SESSIONS`, `DRAFT_MAX_BATCH_SIZE`,
+`DRAFT_STAGING_SLOTS` and `DRAFT_MAX_HOST_MEMORY_BYTES` from the available worker
+memory and measured service rate. Batch size cannot exceed staging capacity,
+and staging capacity cannot exceed resident-session capacity.
 
 Inside the SM86 worker image:
 
@@ -86,27 +87,64 @@ tokenspeed draft-worker \
   --device-id 0 \
   --max-resident-sessions "${DRAFT_MAX_RESIDENT_SESSIONS:?Set the resident capacity}" \
   --max-batch-size "${DRAFT_MAX_BATCH_SIZE:?Set the worker batch limit}" \
-  --staging-slots "${DRAFT_MAX_BATCH_SIZE:?Set the worker batch limit}" \
+  --staging-slots "${DRAFT_STAGING_SLOTS:?Set the staged request capacity}" \
   --max-queued-jobs 64 \
   --max-peers 8 \
   --max-header-bytes 65536 \
   --max-feature-bytes 25165824 \
-  --max-host-memory-bytes 1073741824 \
+  --max-host-memory-bytes "${DRAFT_MAX_HOST_MEMORY_BYTES:?Set the host memory budget}" \
   --lease-ms 30000 \
   --heartbeat-ms 1000 \
   --poll-ms 10 \
   --linger-ms 1000
 ```
 
-Eight peer slots serve the eight cohort leaders in this recipe. Staging slots
-must be at least the batch limit and at most the resident-session limit. The
-remaining limits are explicit starting values, not a worker-capacity
+Eight peer slots serve the eight cohort leaders in this recipe. Set staging
+capacity to at least twice the batch limit to admit a full next batch while a
+full current batch runs; for example, batch eight needs at least sixteen staged
+and sixteen resident slots. A staging capacity equal to the batch limit is
+valid, but a full running batch leaves no room to upload the next one. These
+capacities bound requests, not additional target replicas.
+
+The remaining limits are explicit starting values, not a worker-capacity
 measurement. Keep heartbeat shorter than the finite session lease. The
-configured feature-frame limit cannot exceed 24 MiB, and the service validates
-its conservative host memory budget before accepting work; larger resident or
-staging limits may require a larger budget. Worker KV is bounded independently of
-target KV; weight fit alone does not establish that the selected resident and
-batch limits fit alongside workspace.
+configured feature-frame limit cannot exceed 24 MiB. The service validates its
+conservative host memory budget, including pinned upload staging, before
+accepting work; larger batch, resident or staging limits may require a larger
+budget. Worker KV and upload buffers consume GPU memory independently of target
+KV; weight fit alone does not establish that the selected limits fit alongside
+workspace.
+
+For batch eight, sixteen resident/staging slots and the frame/peer limits
+above, the transport plus pinned-buffer bound is 1,843,200,192 bytes
+(approximately 1.72 GiB). A 2 GiB host budget covers that configuration. This is
+an allocation-bound calculation, not a measured process-memory or throughput result.
+
+## Worker pipeline
+
+The worker combines the valid requests in each batch into one context-KV
+installation, followed by native-eight drafting. Its six draft layers still
+perform their context projections, but each projection operates on the batch's
+combined feature rows. Installation no longer synchronizes separately after
+each request.
+
+One GPU execution thread owns the pipeline. A separate copy stream uploads the
+next batch through pinned staging while the current batch computes. There is
+at most one active forward and one uploaded next batch; context-KV installation
+and drafting remain ordered on the compute stream. Completion events protect
+upload-buffer reuse, session KV and context acknowledgements. Cancelling a
+request invalidates its result without reusing storage that GPU work still
+references.
+
+Transport submission, execution-thread completion and shutdown wake the socket loops
+directly. Bounded outbound draining sends queued messages without a periodic
+poll delay. `--poll-ms` remains a periodic housekeeping interval; lowering it is
+not required to wake newly queued work. Pending GPU events and replies blocked
+by socket backpressure use bounded one-millisecond checks while work remains.
+
+Upload/compute overlap depends on enough independent ready requests, available
+staging capacity and the GPU's copy/compute behavior. Measure it with a device
+timeline; a separate stream alone does not establish a throughput improvement.
 
 ## Launch the target
 
@@ -207,7 +245,11 @@ Another accelerator can establish functional behavior only for the hardware
 actually tested; it cannot establish B200/A10 performance or economics.
 
 The worker's opt-in checkpoint test covers native-eight batched inference and
-cold-snapshot versus incremental context KV. From the source checkout on the
+cold-snapshot versus incremental context KV. Qualify the pipeline with mixed
+snapshot/delta batches, cancellation while uploads or forwards are in flight,
+and repeated reuse of both upload buffers. Verify context ACKs only become
+visible after successful installation and compare batched installation against
+the same requests installed individually. From the source checkout on the
 intended worker GPU, with test dependencies installed:
 
 ```bash
@@ -217,10 +259,12 @@ TOKENSPEED_TEST_TARGET_REVISION="${TARGET_REVISION:?Set the target checkpoint co
 TOKENSPEED_TEST_DRAFT_CHECKPOINT=incoai/GLM-5.3-DFlash2 \
 TOKENSPEED_TEST_DRAFT_REVISION="${DRAFT_REVISION:?Set the draft checkpoint commit}" \
 PYTHONPATH=python \
-python -m pytest -q test/runtime/draft_pool/test_worker_cuda.py
+python -m pytest -q \
+  test/runtime/draft_pool/test_worker_cuda.py \
+  test/runtime/draft_pool/test_worker_pipeline_cuda.py
 ```
 
-This test is skipped unless explicitly enabled. A pass covers the worker test
+These tests are skipped unless explicitly enabled. A pass covers the worker test
 cases only; target DPA/EP execution, transport recovery and economics still
 need the deployment qualification above.
 

@@ -77,6 +77,22 @@ class WorkerModelConfig:
             raise ValueError("Both checkpoint paths and revisions are required.")
 
 
+def worker_pipeline_buffer_bytes(
+    max_batch_size: int,
+    history_tokens: int,
+    feature_width: int,
+    native_block_tokens: int,
+) -> tuple[int, int]:
+    """Return pinned-host and device bytes for both fixed pipeline slots.
+
+    Each slot holds BF16 features and int64 positions/locations for a full
+    history batch. Host slots also hold the int32 native proposal IDs.
+    """
+    device_bytes = 2 * max_batch_size * history_tokens * (feature_width * 2 + 16)
+    host_bytes = device_bytes + 2 * max_batch_size * (native_block_tokens - 1) * 4
+    return host_bytes, device_bytes
+
+
 @dataclass(frozen=True)
 class WorkerDraftJob:
     """A proposal request for an unchanged confirmed prefix and its anchor."""
@@ -94,6 +110,60 @@ class WorkerDraftResult:
     confirmed_endpoint: int
     anchor_token: int
     candidate_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class WorkerFeatureUpdate:
+    """One CPU feature interval to validate and pack into a worker upload."""
+
+    session_id: str
+    feature_start: int
+    confirmed_endpoint: int
+    features: torch.Tensor
+    is_snapshot: bool
+
+
+@dataclass(frozen=True)
+class WorkerBatchCompletion:
+    """Retired GPU work; installed context survives a proposal-only failure."""
+
+    installed: tuple[str, ...]
+    results: tuple[WorkerDraftResult, ...]
+    install_error: str | None
+    draft_error: str | None
+
+
+@dataclass(frozen=True)
+class _FeatureInterval:
+    session_id: str
+    feature_start: int
+    confirmed_endpoint: int
+    is_snapshot: bool
+
+
+@dataclass
+class _WorkerStagingBuffers:
+    host_features: torch.Tensor
+    device_features: torch.Tensor
+    host_positions: torch.Tensor
+    device_positions: torch.Tensor
+    host_locations: torch.Tensor
+    device_locations: torch.Tensor
+    host_tokens: torch.Tensor
+    upload_ready: torch.cuda.Event
+    completed: torch.cuda.Event
+
+
+@dataclass
+class _WorkerPendingBatch:
+    slot: int
+    intervals: tuple[_FeatureInterval, ...]
+    rows: int
+    jobs: tuple[WorkerDraftJob, ...]
+    launched: bool
+    installed: bool
+    install_error: str | None
+    draft_error: str | None
 
 
 @dataclass
@@ -165,7 +235,9 @@ class DFlash2WorkerEngine:
     No distributed process group or target model is constructed.
     """
 
-    def __init__(self, config: WorkerModelConfig) -> None:
+    def __init__(
+        self, config: WorkerModelConfig, pipeline_host_budget_bytes: int
+    ) -> None:
         import torch
 
         from tokenspeed.runtime.distributed.mapping import Mapping
@@ -231,6 +303,19 @@ class DFlash2WorkerEngine:
             self.contract.window_tokens,
             self.contract.native_block_tokens,
         )
+        self.pipeline_host_bytes, self.pipeline_device_bytes = (
+            worker_pipeline_buffer_bytes(
+                config.max_batch_size,
+                self.geometry.history_tokens,
+                self.contract.feature_width,
+                self.geometry.native_block_tokens,
+            )
+        )
+        if self.pipeline_host_bytes > pipeline_host_budget_bytes:
+            raise ValueError(
+                "Worker pinned pipeline buffers exceed the remaining host-memory "
+                "budget; reduce max_batch_size or increase max_host_memory_bytes."
+            )
         self.sessions = WorkerSessionTable(
             config.max_resident_sessions, self.geometry.history_tokens
         )
@@ -339,7 +424,7 @@ class DFlash2WorkerEngine:
                 * 4
             )
             available, _ = torch.cuda.mem_get_info(config.device_id)
-            if kv_bytes + transient_bytes > available:
+            if kv_bytes + transient_bytes + self.pipeline_device_bytes > available:
                 raise ValueError(
                     "Worker resident/batch limits exceed available GPU memory; reduce them."
                 )
@@ -352,6 +437,59 @@ class DFlash2WorkerEngine:
             )
             self.backend = WorkerAttentionBackend(self.geometry, self.device)
         torch.cuda.synchronize(config.device_id)
+        self._init_pipeline()
+
+    def _init_pipeline(self) -> None:
+        """Allocate two fixed upload slots; all CUDA objects stay on this thread."""
+        import torch
+
+        self._upload_stream = torch.cuda.Stream(device=self.device)
+        self._compute_stream = torch.cuda.Stream(device=self.device)
+        rows = self.config.max_batch_size * self.geometry.history_tokens
+        width = self.contract.feature_width
+        self._staging = []
+        for _ in range(2):
+            self._staging.append(
+                _WorkerStagingBuffers(
+                    host_features=torch.empty(
+                        (rows, width), dtype=torch.bfloat16, pin_memory=True
+                    ),
+                    device_features=torch.empty(
+                        (rows, width), dtype=torch.bfloat16, device=self.device
+                    ),
+                    host_positions=torch.empty(
+                        rows, dtype=torch.int64, pin_memory=True
+                    ),
+                    device_positions=torch.empty(
+                        rows, dtype=torch.int64, device=self.device
+                    ),
+                    host_locations=torch.empty(
+                        rows, dtype=torch.int64, pin_memory=True
+                    ),
+                    device_locations=torch.empty(
+                        rows, dtype=torch.int64, device=self.device
+                    ),
+                    host_tokens=torch.empty(
+                        (
+                            self.config.max_batch_size,
+                            self.geometry.native_block_tokens - 1,
+                        ),
+                        dtype=torch.int32,
+                        pin_memory=True,
+                    ),
+                    upload_ready=torch.cuda.Event(),
+                    completed=torch.cuda.Event(),
+                )
+            )
+        self._free_staging = [0, 1]
+        self._batches: dict[int, _WorkerPendingBatch] = {}
+        self._active_ticket: int | None = None
+        self._next_ticket = 0
+        # Tensor allocations may reuse storage previously used on the startup
+        # stream. Neither upload nor compute may race that prior use.
+        startup_stream = torch.cuda.current_stream(self.config.device_id)
+        self._upload_stream.wait_stream(startup_stream)
+        self._compute_stream.wait_stream(startup_stream)
 
     def _check_thread(self) -> None:
         if threading.get_ident() != self._thread_id:
@@ -366,6 +504,218 @@ class DFlash2WorkerEngine:
         self._check_thread()
         self.sessions.open(session_id)
 
+    def validate_features(self, update: WorkerFeatureUpdate) -> None:
+        """Validate one interval without changing its installed endpoint or KV."""
+        import torch
+
+        self._check_thread()
+        self.sessions.validate_update(
+            update.session_id,
+            update.feature_start,
+            update.confirmed_endpoint,
+            update.is_snapshot,
+        )
+        if (
+            update.confirmed_endpoint + self.geometry.native_block_tokens
+            > self.max_position
+        ):
+            raise ValueError("Draft positions exceed the checkpoint's RoPE range.")
+        features = update.features
+        if (
+            features.device.type != "cpu"
+            or features.dtype != torch.bfloat16
+            or features.ndim != 2
+        ):
+            raise ValueError("Worker context must be a CPU BF16 matrix.")
+        if tuple(features.shape) != (
+            update.confirmed_endpoint - update.feature_start,
+            self.contract.feature_width,
+        ):
+            raise ValueError(
+                "Feature tensor does not match its context interval/schema."
+            )
+
+    def stage_batch(self, updates: Sequence[WorkerFeatureUpdate]) -> int:
+        """Pack validated intervals and enqueue H2D, returning an owned ticket.
+
+        There are two bounded slots. Staging touches neither attention metadata
+        nor resident KV, so it may overlap the preceding batch's GPU forward.
+        The caller may release its CPU feature tensors after this method returns.
+        """
+        import torch
+
+        self._check_thread()
+        if not 1 <= len(updates) <= self.config.max_batch_size:
+            raise ValueError("Worker staging batch is empty or exceeds its limit.")
+        identities = {update.session_id for update in updates}
+        if len(identities) != len(updates):
+            raise ValueError("A session can appear only once in a worker batch.")
+        if not self._free_staging:
+            raise RuntimeError("Both worker staging slots are occupied.")
+        if identities.intersection(
+            interval.session_id
+            for batch in self._batches.values()
+            for interval in batch.intervals
+        ):
+            raise ValueError("Worker session already has outstanding GPU work.")
+        for update in updates:
+            self.validate_features(update)
+        slot_index = self._free_staging.pop()
+        slot = self._staging[slot_index]
+        rows = 0
+        try:
+            for update in updates:
+                end = rows + update.confirmed_endpoint - update.feature_start
+                slot.host_features[rows:end].copy_(update.features)
+                torch.arange(
+                    update.feature_start,
+                    update.confirmed_endpoint,
+                    out=slot.host_positions[rows:end],
+                )
+                state = self.sessions.get(update.session_id)
+                slot.host_locations[rows:end].copy_(
+                    torch.tensor(
+                        self.geometry.context_locations(
+                            state.slot,
+                            update.feature_start,
+                            update.confirmed_endpoint,
+                        ),
+                        dtype=torch.int64,
+                    )
+                )
+                rows = end
+            with torch.cuda.stream(self._upload_stream):
+                if rows:
+                    slot.device_features[:rows].copy_(
+                        slot.host_features[:rows], non_blocking=True
+                    )
+                    slot.device_positions[:rows].copy_(
+                        slot.host_positions[:rows], non_blocking=True
+                    )
+                    slot.device_locations[:rows].copy_(
+                        slot.host_locations[:rows], non_blocking=True
+                    )
+                slot.upload_ready.record(self._upload_stream)
+        except Exception:
+            # A failed enqueue may have already issued some copies. Retain both
+            # source and destination until those copies retire before reuse.
+            self._upload_stream.synchronize()
+            self._free_staging.append(slot_index)
+            raise
+        ticket = self._next_ticket
+        self._next_ticket += 1
+        self._batches[ticket] = _WorkerPendingBatch(
+            slot=slot_index,
+            intervals=tuple(
+                _FeatureInterval(
+                    update.session_id,
+                    update.feature_start,
+                    update.confirmed_endpoint,
+                    update.is_snapshot,
+                )
+                for update in updates
+            ),
+            rows=rows,
+            jobs=(),
+            launched=False,
+            installed=False,
+            install_error=None,
+            draft_error=None,
+        )
+        return ticket
+
+    def launch_batch(self, ticket: int, jobs: Sequence[WorkerDraftJob]) -> None:
+        """Enqueue one packed KV installation and at most one native forward.
+
+        Empty jobs install context only. Errors after staging are retained in
+        the ticket and reported by ``poll_batch`` after issued work retires.
+        A second forward cannot overwrite backend scratch before completion.
+        """
+        import torch
+
+        self._check_thread()
+        batch = self._batches[ticket]
+        if batch.launched:
+            raise ValueError("Worker staging ticket was already launched.")
+        if self._active_ticket is not None:
+            raise RuntimeError("A worker forward is already outstanding.")
+        slot = self._staging[batch.slot]
+        batch.jobs = tuple(jobs)
+        batch.launched = True
+        self._active_ticket = ticket
+        with torch.inference_mode(), torch.cuda.stream(self._compute_stream):
+            self._compute_stream.wait_event(slot.upload_ready)
+            try:
+                for interval in batch.intervals:
+                    self.sessions.validate_update(
+                        interval.session_id,
+                        interval.feature_start,
+                        interval.confirmed_endpoint,
+                        interval.is_snapshot,
+                    )
+                if jobs and (
+                    len(jobs) != len(batch.intervals)
+                    or {(job.session_id, job.confirmed_endpoint) for job in jobs}
+                    != {
+                        (interval.session_id, interval.confirmed_endpoint)
+                        for interval in batch.intervals
+                    }
+                ):
+                    raise ValueError("Draft jobs do not match staged context.")
+                if batch.rows:
+                    self.model.write_context_kv(
+                        slot.device_features[: batch.rows],
+                        slot.device_positions[: batch.rows],
+                        slot.device_locations[: batch.rows],
+                        self.pool,
+                    )
+                batch.installed = True
+            except Exception as exc:
+                batch.install_error = str(exc)[:256]
+            if batch.installed and jobs:
+                try:
+                    # Endpoint validation uses the staged frontier here; only
+                    # completion publishes that frontier to session state.
+                    tokens = self._forward_tokens(jobs)
+                    slot.host_tokens[: len(jobs)].copy_(
+                        tokens[:, 1:], non_blocking=True
+                    )
+                except Exception as exc:
+                    batch.draft_error = str(exc)[:256]
+            slot.completed.record(self._compute_stream)
+
+    def poll_batch(self, ticket: int) -> WorkerBatchCompletion | None:
+        """Return CPU results once all issued work retires, releasing its slot."""
+        self._check_thread()
+        batch = self._batches[ticket]
+        if not batch.launched:
+            raise ValueError("Worker staging ticket has not been launched.")
+        slot = self._staging[batch.slot]
+        if not slot.completed.query():
+            return None
+        installed = ()
+        results = ()
+        if batch.installed:
+            installed = tuple(interval.session_id for interval in batch.intervals)
+            for interval in batch.intervals:
+                self.sessions.get(interval.session_id).confirmed_endpoint = (
+                    interval.confirmed_endpoint
+                )
+            if batch.jobs and batch.draft_error is None:
+                results = self._make_results(
+                    batch.jobs, slot.host_tokens[: len(batch.jobs)].tolist()
+                )
+        completion = WorkerBatchCompletion(
+            installed=installed,
+            results=results,
+            install_error=batch.install_error,
+            draft_error=batch.draft_error,
+        )
+        del self._batches[ticket]
+        self._free_staging.append(batch.slot)
+        self._active_ticket = None
+        return completion
+
     def install_features(
         self,
         session_id: str,
@@ -374,62 +724,55 @@ class DFlash2WorkerEngine:
         features: torch.Tensor,
         is_snapshot: bool,
     ) -> None:
-        """Install CPU BF16 projected context at its original absolute positions.
+        """Synchronously install one interval through the same batched pipeline."""
+        ticket = self.stage_batch(
+            [
+                WorkerFeatureUpdate(
+                    session_id, feature_start, confirmed_endpoint, features, is_snapshot
+                )
+            ]
+        )
+        self.launch_batch(ticket, [])
+        self._staging[self._batches[ticket].slot].completed.synchronize()
+        completion = self.poll_batch(ticket)
+        assert completion is not None
+        if completion.install_error is not None:
+            self.close_session(session_id)
+            raise RuntimeError(completion.install_error)
 
-        The endpoint excludes the anchor token. A failure invalidates the
-        session: partial context writes may have overwritten an older ring.
-        """
+    def draft_batch(self, jobs: Sequence[WorkerDraftJob]) -> list[WorkerDraftResult]:
+        """Synchronously run installed sessions through the native forward core."""
         import torch
 
         self._check_thread()
-        session = self.sessions.validate_update(
-            session_id, feature_start, confirmed_endpoint, is_snapshot
-        )
-        if confirmed_endpoint + self.geometry.native_block_tokens > self.max_position:
-            raise ValueError("Draft positions exceed the checkpoint's RoPE range.")
-        if (
-            features.device.type != "cpu"
-            or features.dtype != torch.bfloat16
-            or features.ndim != 2
-        ):
-            raise ValueError("Worker context must be a CPU BF16 matrix.")
-        if tuple(features.shape) != (
-            confirmed_endpoint - feature_start,
-            self.contract.feature_width,
-        ):
-            raise ValueError(
-                "Feature tensor does not match its context interval/schema."
-            )
-        try:
-            with torch.inference_mode():
-                projected = features.to(device=self.device, non_blocking=False)
-                positions = torch.arange(
-                    feature_start,
-                    confirmed_endpoint,
-                    dtype=torch.int64,
-                    device=self.device,
+        if self._batches:
+            raise RuntimeError("Retire staged work before synchronous drafting.")
+        for job in jobs:
+            if (
+                self.sessions.get(job.session_id).confirmed_endpoint
+                != job.confirmed_endpoint
+            ):
+                raise ValueError(
+                    "Proposal requested for an uninstalled or stale endpoint."
                 )
-                locations = torch.tensor(
-                    self.geometry.context_locations(
-                        session.slot, feature_start, confirmed_endpoint
-                    ),
-                    dtype=torch.int64,
-                    device=self.device,
-                )
-                if confirmed_endpoint > feature_start:
-                    self.model.write_context_kv(
-                        projected, positions, locations, self.pool
-                    )
-                # ACK is an installed-context acknowledgement, not merely an
-                # issued-kernel acknowledgement. This waits only this worker.
-                torch.cuda.current_stream(self.config.device_id).synchronize()
-        except Exception:
-            self.close_session(session_id)
-            raise
-        session.confirmed_endpoint = confirmed_endpoint
+        with torch.inference_mode(), torch.cuda.stream(self._compute_stream):
+            tokens = self._forward_tokens(jobs)
+            rows = tokens[:, 1:].cpu().tolist()
+        return list(self._make_results(jobs, rows))
 
-    def draft_batch(self, jobs: Sequence[WorkerDraftJob]) -> list[WorkerDraftResult]:
-        """Execute full native-eight blocks and selectors for distinct sessions."""
+    @staticmethod
+    def _make_results(
+        jobs: Sequence[WorkerDraftJob], rows: Sequence[Sequence[int]]
+    ) -> tuple[WorkerDraftResult, ...]:
+        return tuple(
+            WorkerDraftResult(
+                job.session_id, job.confirmed_endpoint, job.anchor_token, tuple(row)
+            )
+            for job, row in zip(jobs, rows, strict=True)
+        )
+
+    def _forward_tokens(self, jobs: Sequence[WorkerDraftJob]) -> torch.Tensor:
+        """Enqueue the native-eight forward and return device IDs on its stream."""
         import torch
 
         from tokenspeed.runtime.execution.context import ForwardContext
@@ -446,11 +789,7 @@ class DFlash2WorkerEngine:
         if len({job.session_id for job in jobs}) != len(jobs):
             raise ValueError("A session can appear only once in a worker batch.")
         states = [self.sessions.get(job.session_id) for job in jobs]
-        for job, state in zip(jobs, states, strict=True):
-            if state.confirmed_endpoint != job.confirmed_endpoint:
-                raise ValueError(
-                    "Proposal requested for an uninstalled or stale endpoint."
-                )
+        for job in jobs:
             if not 0 <= job.anchor_token < self.contract.vocab_size:
                 raise ValueError("Anchor token is outside the target vocabulary.")
         with torch.inference_mode():
@@ -510,22 +849,23 @@ class DFlash2WorkerEngine:
                 tokens,
                 self.contract.vocab_size,
             )
-            # The service receives only bounded host IDs. It never touches
-            # model tensors or synchronizes CUDA on its network thread.
-            rows = tokens[:, 1:].cpu().tolist()
-        return [
-            WorkerDraftResult(
-                job.session_id, job.confirmed_endpoint, job.anchor_token, tuple(row)
-            )
-            for job, row in zip(jobs, rows, strict=True)
-        ]
+        return tokens
 
     def close_session(self, session_id: str) -> None:
         """Release a session after earlier execution-thread operations retire."""
+        import torch
+
         self._check_thread()
+        if any(
+            interval.session_id == session_id
+            for batch in self._batches.values()
+            for interval in batch.intervals
+        ):
+            raise RuntimeError("Cannot close a session with outstanding GPU work.")
         slot = self.sessions.close(session_id)
         if slot is not None:
-            self.pool.clear_slot(slot)
+            with torch.cuda.stream(self._compute_stream):
+                self.pool.clear_slot(slot)
 
     def close(self) -> None:
         """Retire device work before releasing resident storage and weights."""
@@ -533,6 +873,8 @@ class DFlash2WorkerEngine:
 
         self._check_thread()
         torch.cuda.synchronize(self.config.device_id)
+        self._batches.clear()
+        self._staging.clear()
         self.pool = None
         self.backend = None
         self.model = None

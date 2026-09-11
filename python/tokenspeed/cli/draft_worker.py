@@ -138,7 +138,10 @@ def add_draft_worker_args(parser: argparse.ArgumentParser) -> None:
         "--staging-slots",
         type=int,
         default=8,
-        help="Maximum admitted feature transfers held in host staging.",
+        help=(
+            "Maximum admitted feature transfers held in host staging; at least "
+            "twice max-batch-size permits a full lookahead batch."
+        ),
     )
     parser.add_argument("--max-queued-jobs", type=int, default=64)
     parser.add_argument("--max-peers", type=int, default=8)
@@ -148,7 +151,7 @@ def add_draft_worker_args(parser: argparse.ArgumentParser) -> None:
         "--max-host-memory-bytes",
         type=int,
         default=1024 * 1024 * 1024,
-        help="Hard configuration budget for bounded transport/staging host memory.",
+        help="Host budget for bounded transport staging and both pinned upload buffers.",
     )
     parser.add_argument(
         "--lease-ms",

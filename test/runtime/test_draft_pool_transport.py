@@ -95,6 +95,9 @@ class _Engine:
         self.control = control
         self.thread_id = threading.get_ident()
         self.sessions = {}
+        self.staged = {}
+        self.active = None
+        self.next_ticket = 0
         self.control.engine = self
 
     def _check(self):
@@ -105,44 +108,106 @@ class _Engine:
         assert session_id not in self.sessions
         self.sessions[session_id] = None
 
-    def install_features(
-        self, session_id, feature_start, confirmed_endpoint, features, is_snapshot
-    ):
+    def validate_features(self, update):
         self._check()
-        assert features.device.type == "cpu"
-        if self.control.fail_install:
-            raise RuntimeError("injected install failure")
-        previous = self.sessions[session_id]
-        if is_snapshot:
+        assert update.features.device.type == "cpu"
+        previous = self.sessions[update.session_id]
+        if update.is_snapshot:
             assert previous is None
-            assert feature_start == 0
+            assert update.feature_start == 0
         else:
-            assert previous[0] == feature_start
-        self.sessions[session_id] = (confirmed_endpoint, features.clone())
+            assert previous[0] == update.feature_start
 
-    def draft_batch(self, jobs):
+    def stage_batch(self, updates):
         self._check()
+        assert len(self.staged) < 2
+        self.next_ticket += 1
+        ticket = self.next_ticket
+        self.staged[ticket] = SimpleNamespace(
+            updates=tuple(
+                replace(update, features=update.features.clone()) for update in updates
+            ),
+            jobs=(),
+            installed=(),
+            install_error=None,
+        )
+        self.control.stages.append(tuple(update.session_id for update in updates))
+        return ticket
+
+    def launch_batch(self, ticket, jobs):
+        self._check()
+        assert self.active is None, "More than one forward owns session KV"
+        batch = self.staged[ticket]
+        batch.jobs = tuple(jobs)
+        self.active = ticket
+        if self.control.fail_install:
+            batch.install_error = "injected install failure"
+        else:
+            for update in batch.updates:
+                self.validate_features(update)
+                self.sessions[update.session_id] = (
+                    update.confirmed_endpoint,
+                    update.features,
+                )
+            batch.installed = tuple(update.session_id for update in batch.updates)
+        self.control.launched.append(tuple(job.session_id for job in jobs))
         self.control.entered.set()
-        assert self.control.gate.wait(3), "test did not release fake forward"
+
+    def poll_batch(self, ticket):
+        self._check()
+        assert self.active == ticket
+        batch = self.staged[ticket]
+        if any(
+            not self.control.completion_gates.get(
+                job.session_id, self.control.gate
+            ).is_set()
+            for job in batch.jobs
+        ):
+            return None
+        self.active = None
+        del self.staged[ticket]
+        self.control.completed.append(tuple(job.session_id for job in batch.jobs))
+        draft_error = None
         if self.control.fail_proposal:
             self.control.fail_proposal = False
-            raise RuntimeError("injected proposal failure")
-        return [
-            SimpleNamespace(
-                session_id=job.session_id,
-                confirmed_endpoint=job.confirmed_endpoint,
-                anchor_token=job.anchor_token,
-                candidate_ids=(1, 2, 3, 4, 5, 6, 7),
+            draft_error = "injected proposal failure"
+        results = (
+            tuple(
+                SimpleNamespace(
+                    session_id=job.session_id,
+                    confirmed_endpoint=job.confirmed_endpoint,
+                    anchor_token=job.anchor_token,
+                    candidate_ids=(1, 2, 3, 4, 5, 6, 7),
+                )
+                for job in batch.jobs
             )
-            for job in jobs
-        ]
+            if batch.install_error is None and draft_error is None
+            else ()
+        )
+        return SimpleNamespace(
+            installed=batch.installed,
+            results=results,
+            install_error=batch.install_error,
+            draft_error=draft_error,
+        )
 
     def close_session(self, session_id):
         self._check()
+        assert all(
+            update.session_id != session_id
+            for batch in self.staged.values()
+            for update in batch.updates
+        ), "Closed a session before its staged/device work retired"
         self.sessions.pop(session_id, None)
 
     def close(self):
         self._check()
+        if self.active is not None:
+            assert self.control.gate.wait(
+                3
+            ), "Close did not retire the fake device event"
+        self.staged.clear()
+        self.active = None
         self.sessions.clear()
         self.control.closed.set()
 
@@ -174,6 +239,10 @@ def _running(config):
         closed=threading.Event(),
         fail_install=False,
         fail_proposal=False,
+        stages=[],
+        launched=[],
+        completed=[],
+        completion_gates={},
         engine=None,
     )
     control.gate.set()
@@ -211,6 +280,8 @@ def _running(config):
         yield service, client, inbox, control
     finally:
         control.gate.set()
+        for gate in control.completion_gates.values():
+            gate.set()
         client.close()
         service.close()
         thread.join(3)
@@ -372,23 +443,34 @@ def test_submit_rejects_non_cpu_features_before_copy():
         assert client.pending_bytes == 0
 
 
-def test_worker_queue_bound_counts_waiting_jobs_separately_from_active_batch():
-    config = replace(_config(), staging_limit=3, max_queued_jobs=1, max_batch_size=1)
+def test_worker_queue_bound_counts_waiting_jobs_separately_from_pipeline_batches():
+    config = replace(
+        _config(),
+        resident_limit=4,
+        staging_limit=4,
+        max_queued_jobs=1,
+        max_batch_size=1,
+    )
     with _running(config) as (service, client, inbox, control):
-        for session_id in ("running", "queued", "waiting"):
+        for session_id in ("running", "uploaded", "queued", "waiting"):
             _open(client, inbox, session_id)
         control.gate.clear()
         features = torch.ones((2, 4), dtype=torch.bfloat16)
         assert client.submit(_snapshot("running"), features)
         assert control.entered.wait(3)
+        assert client.submit(_snapshot("uploaded"), features)
+        deadline = time.monotonic() + 1
+        while ("uploaded",) not in control.stages and time.monotonic() < deadline:
+            time.sleep(0.002)
+        assert ("uploaded",) in control.stages
         assert client.submit(_snapshot("queued"), features)
         assert client.submit(_snapshot("waiting"), features)
         assert "queue" in inbox.wait(Busy, "waiting").reason
         assert service.queued_jobs == 1
-        assert service.staging_slots == 3
+        assert service.staging_slots == 4
         control.gate.set()
-        inbox.wait(Proposal, "running")
-        inbox.wait(Proposal, "queued")
+        for session_id in ("running", "uploaded", "queued"):
+            inbox.wait(Proposal, session_id)
         assert client.submit(_snapshot("waiting"), features)
         inbox.wait(Proposal, "waiting")
 

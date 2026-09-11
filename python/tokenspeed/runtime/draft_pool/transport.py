@@ -29,6 +29,7 @@ run on the worker's single data-plane thread.
 
 from __future__ import annotations
 
+import socket as socket_lib
 import threading
 import time
 from collections import OrderedDict, deque
@@ -55,7 +56,9 @@ from tokenspeed.runtime.draft_pool.protocol import (
     Ready,
     Update,
 )
+from tokenspeed.runtime.draft_pool.worker import WorkerBatchCompletion
 from tokenspeed.runtime.draft_pool.worker import WorkerDraftJob as DraftPoolJob
+from tokenspeed.runtime.draft_pool.worker import WorkerFeatureUpdate
 
 
 @dataclass(frozen=True)
@@ -110,6 +113,52 @@ def _recv_bounded(
             return frames, valid
 
 
+class _PollWakeup:
+    """Coalesced cross-thread notifications for an owning thread's ZMQ poller.
+
+    Only the raw socketpair crosses threads; ZMQ sockets remain thread-affine.
+    A notification means "check owned queues", so one pending byte suffices.
+    """
+
+    def __init__(self) -> None:
+        self._reader, self._writer = socket_lib.socketpair()
+        self._reader.setblocking(False)
+        self._writer.setblocking(False)
+        self._lock = threading.Lock()
+        self._pending = False
+        self._closed = False
+
+    def fileno(self) -> int:
+        return self._reader.fileno()
+
+    def notify(self) -> None:
+        with self._lock:
+            if self._closed or self._pending:
+                return
+            try:
+                self._writer.send(b"\0")
+            except BlockingIOError:
+                # A full socket is already readable by the poller.
+                pass
+            self._pending = True
+
+    def drain(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            try:
+                self._reader.recv(1)
+            except BlockingIOError:
+                pass
+            self._pending = False
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            self._reader.close()
+            self._writer.close()
+
+
 class TargetDraftClient:
     """Nonblocking target-facing DEALER with one CPU I/O thread.
 
@@ -138,6 +187,7 @@ class TargetDraftClient:
         self._pending_bytes = 0
         self._connected = False
         self._stop = threading.Event()
+        self._wakeup = _PollWakeup()
         self._thread = threading.Thread(
             target=self._run, name="draft-pool-client", daemon=True
         )
@@ -191,7 +241,8 @@ class TargetDraftClient:
                     return False
                 self._outbound.append((message, frames))
                 self._pending_bytes += frame_bytes
-                return True
+            self._wakeup.notify()
+            return True
 
     def poll(self) -> list[DecodedMessage]:
         """Drain wire replies in receive order, preserving ACK before proposal."""
@@ -203,6 +254,7 @@ class TargetDraftClient:
     def close(self) -> None:
         """Stop admissions and retire copied sends with bounded socket linger."""
         self._stop.set()
+        self._wakeup.notify()
         self._thread.join((self.config.linger_ms + 4 * self.config.poll_ms) / 1000 + 1)
         if self._thread.is_alive():
             raise RuntimeError("Draft client I/O thread did not stop")
@@ -267,9 +319,19 @@ class TargetDraftClient:
             poller = zmq.Poller()
             poller.register(socket, zmq.POLLIN)
             poller.register(monitor, zmq.POLLIN)
+            poller.register(self._wakeup.fileno(), zmq.POLLIN)
             last_hello = float("-inf")
             while not self._stop.is_set():
+                with self._lock:
+                    has_outbound = self._connected and bool(self._outbound)
+                # Watch writability only for queued sends: a blocked HWM wakes
+                # promptly when it clears, while an idle socket never spins.
+                poller.modify(socket, zmq.POLLIN | (zmq.POLLOUT if has_outbound else 0))
                 events = dict(poller.poll(self.config.poll_ms))
+                if self._wakeup.fileno() in events:
+                    self._wakeup.drain()
+                if self._stop.is_set():
+                    break
                 if monitor in events:
                     event = recv_monitor_message(monitor)
                     if event["event"] == zmq.EVENT_DISCONNECTED:
@@ -286,7 +348,7 @@ class TargetDraftClient:
                             last_hello = now
                         except zmq.Again:
                             pass
-                if socket in events:
+                if events.get(socket, 0) & zmq.POLLIN:
                     try:
                         frames, valid = _recv_bounded(
                             socket, 1, self.config.max_header_bytes
@@ -319,14 +381,18 @@ class TargetDraftClient:
                     except (ValueError, TypeError) as exc:
                         self._reset(f"Invalid worker reply: {str(exc)[:256]}")
                 if self.connected:
-                    with self._lock:
-                        entry = self._outbound[0] if self._outbound else None
-                    if entry is not None:
+                    # Drain a bounded burst, then service replies and connection
+                    # events again even if producers keep refilling the queue.
+                    for _ in range(min(self.config.max_pending_messages, 32)):
+                        with self._lock:
+                            entry = self._outbound[0] if self._outbound else None
+                        if entry is None:
+                            break
                         message, frames = entry
                         try:
                             socket.send_multipart(frames, flags=zmq.DONTWAIT, copy=True)
                         except zmq.Again:
-                            continue
+                            break
                         with self._lock:
                             if self._outbound and self._outbound[0] is entry:
                                 self._outbound.popleft()
@@ -354,6 +420,7 @@ class TargetDraftClient:
                 monitor.close(linger=0)
             socket.close(linger=self.config.linger_ms)
             context.term()
+            self._wakeup.close()
 
 
 @dataclass(frozen=True)
@@ -400,6 +467,8 @@ class DraftPoolServiceConfig:
         ROUTER HWM=1 adds one incoming payload per configured private peer.
         The private network must enforce the configured peer connection count;
         unauthenticated public exposure is deliberately unsupported.
+        The engine's two pinned upload buffers are checked separately against
+        the remaining host budget before allocation, using checkpoint geometry.
         """
         return (
             3 * self.staging_limit + self.max_peers + 1
@@ -413,16 +482,13 @@ class DraftEngine(Protocol):
 
     def open_session(self, session_id: str) -> None: ...
 
-    def install_features(
-        self,
-        session_id: str,
-        feature_start: int,
-        confirmed_endpoint: int,
-        features: Any,
-        is_snapshot: bool,
-    ) -> None: ...
+    def validate_features(self, update: WorkerFeatureUpdate) -> None: ...
 
-    def draft_batch(self, jobs: Sequence[DraftPoolJob]) -> Sequence[Any]: ...
+    def stage_batch(self, updates: Sequence[WorkerFeatureUpdate]) -> int: ...
+
+    def launch_batch(self, ticket: int, jobs: Sequence[DraftPoolJob]) -> None: ...
+
+    def poll_batch(self, ticket: int) -> WorkerBatchCompletion | None: ...
 
     def close_session(self, session_id: str) -> None: ...
 
@@ -449,6 +515,20 @@ class _BatchResult:
     proposals: tuple[Proposal, ...]
     failures: tuple[Failure, ...]
     invalid_sessions: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _PipelineBatch:
+    """CPU metadata and an opaque device-side ticket, never a CUDA object."""
+
+    ticket: int
+    updates: tuple[Update, ...]
+
+
+@dataclass(frozen=True)
+class _StageResult:
+    batch: _PipelineBatch | None
+    failures: _BatchResult
 
 
 class DraftPoolService:
@@ -479,6 +559,11 @@ class DraftPoolService:
         self._running_ids: tuple[str, ...] = ()
         self._closing_ids: tuple[str, ...] = ()
         self._inflight: Future[Any] | None = None
+        self._operation: str | None = None
+        self._current_batch: _PipelineBatch | None = None
+        self._next_batch: _PipelineBatch | None = None
+        self._next_device_poll = 0.0
+        self._wakeup = _PollWakeup()
         self.bound_endpoint: str | None = None
         self.started = threading.Event()
 
@@ -497,6 +582,7 @@ class DraftPoolService:
     def close(self) -> None:
         """Stop new work; the run thread safely retires device work and leases."""
         self._stop.set()
+        self._wakeup.notify()
 
     def run(self) -> None:
         """Serve until close or an engine/transport failure; propagate failures."""
@@ -522,9 +608,30 @@ class DraftPoolService:
             socket.setsockopt(zmq.HEARTBEAT_TIMEOUT, 3 * self.config.heartbeat_ms)
             socket.bind(self.config.listen_endpoint)
             self.bound_endpoint = socket.getsockopt_string(zmq.LAST_ENDPOINT)
+            poller = zmq.Poller()
+            poller.register(socket, zmq.POLLIN)
+            poller.register(self._wakeup.fileno(), zmq.POLLIN)
             self.started.set()
             while not self._stop.is_set():
-                if socket.poll(self.config.poll_ms, zmq.POLLIN):
+                self._complete()
+                self._expire()
+                self._dispatch(engine)
+                self._flush(socket)
+                # Futures wake immediately. Pending CUDA events and replies
+                # blocked by a peer's HWM need bounded retries. ROUTER POLLOUT
+                # could spin on a writable peer while another remains blocked.
+                # Idle services retain their normal poll.
+                timeout = self.config.poll_ms
+                if self._outbox or (
+                    self._current_batch is not None and self._inflight is None
+                ):
+                    timeout = min(timeout, 1)
+                events = dict(poller.poll(timeout))
+                if self._wakeup.fileno() in events:
+                    self._wakeup.drain()
+                for _ in range(self.config.max_queued_jobs + self.config.max_peers):
+                    if not socket.poll(0, zmq.POLLIN):
+                        break
                     frames, valid = _recv_bounded(
                         socket,
                         3,
@@ -554,10 +661,6 @@ class DraftPoolService:
                                 detail=str(exc)[:256],
                             ),
                         )
-                self._complete()
-                self._expire()
-                self._dispatch(engine)
-                self._flush(socket)
         finally:
             self._stop.set()
             self._queued.clear()
@@ -577,6 +680,7 @@ class DraftPoolService:
                 self._executor.shutdown(wait=True, cancel_futures=False)
                 self._sessions.clear()
                 self._staged = 0
+                self._wakeup.close()
                 socket.close(linger=self.config.linger_ms)
                 context.term()
 
@@ -849,26 +953,54 @@ class DraftPoolService:
             if last_activity < deadline:
                 del self._peers[identity]
 
+    def _submit(self, operation: str, function: Callable[..., Any], *args: Any) -> None:
+        self._operation = operation
+        self._inflight = self._executor.submit(function, *args)
+        self._inflight.add_done_callback(lambda _: self._wakeup.notify())
+
     def _dispatch(self, engine: DraftEngine) -> None:
         if self._inflight is not None:
             return
-        closing = tuple(
-            session_id for session_id, state in self._sessions.items() if state.closing
-        )
-        if closing:
-            self._closing_ids = closing
-            self._inflight = self._executor.submit(self._release, engine, closing)
+        if self._current_batch is None:
+            closing = tuple(
+                session_id
+                for session_id, state in self._sessions.items()
+                if state.closing and session_id not in self._running_ids
+            )
+            if closing:
+                self._closing_ids = closing
+                self._submit("release", self._release, engine, closing)
+                return
+        if self._current_batch is None and self._next_batch is not None:
+            batch = self._next_batch
+            self._next_batch = None
+            self._current_batch = batch
+            jobs = tuple(
+                DraftPoolJob(
+                    session_id=update.session_id,
+                    confirmed_endpoint=update.confirmed_endpoint,
+                    anchor_token=update.anchor_token,
+                )
+                for update in batch.updates
+            )
+            self._submit("launch", engine.launch_batch, batch.ticket, jobs)
             return
-        selected = tuple(self._queued)[: self.config.max_batch_size]
-        if not selected:
+        # The next upload may run while the current GPU batch is executing.
+        # No second forward or context write is launched before current retires.
+        if self._next_batch is None and self._queued:
+            selected = tuple(self._queued)[: self.config.max_batch_size]
+            work = []
+            for session_id in selected:
+                session = self._sessions[session_id]
+                work.append((self._queued.pop(session_id), not session.engine_opened))
+                session.engine_opened = True
+            self._running_ids += selected
+            self._submit("stage", self._stage, engine, tuple(work))
             return
-        work = []
-        for session_id in selected:
-            session = self._sessions[session_id]
-            work.append((self._queued.pop(session_id), not session.engine_opened))
-            session.engine_opened = True
-        self._running_ids = selected
-        self._inflight = self._executor.submit(self._execute, engine, tuple(work))
+        if self._current_batch is not None:
+            if time.monotonic() >= self._next_device_poll:
+                self._submit("poll", engine.poll_batch, self._current_batch.ticket)
+            return
 
     @staticmethod
     def _release(engine: DraftEngine, sessions: tuple[str, ...]) -> None:
@@ -876,36 +1008,25 @@ class DraftPoolService:
             engine.close_session(session_id)
 
     @staticmethod
-    def _execute(
+    def _stage(
         engine: DraftEngine, work: tuple[tuple[DecodedMessage, bool], ...]
-    ) -> _BatchResult:
-        installed, proposals, failures, invalid, jobs = [], [], [], [], []
+    ) -> _StageResult:
+        updates, features, failures, invalid = [], [], [], []
         for decoded, needs_open in work:
             update = decoded.message
             try:
                 if needs_open:
                     engine.open_session(update.session_id)
-                engine.install_features(
+                feature_update = WorkerFeatureUpdate(
                     session_id=update.session_id,
                     feature_start=update.feature_start,
                     confirmed_endpoint=update.confirmed_endpoint,
                     features=decoded.features,
                     is_snapshot=update.is_snapshot,
                 )
-                installed.append(
-                    Ack(
-                        session_id=update.session_id,
-                        confirmed_endpoint=update.confirmed_endpoint,
-                        anchor_token=update.anchor_token,
-                    )
-                )
-                jobs.append(
-                    DraftPoolJob(
-                        session_id=update.session_id,
-                        confirmed_endpoint=update.confirmed_endpoint,
-                        anchor_token=update.anchor_token,
-                    )
-                )
+                engine.validate_features(feature_update)
+                updates.append(update)
+                features.append(feature_update)
             except Exception as exc:
                 invalid.append(update.session_id)
                 failures.append(
@@ -915,12 +1036,67 @@ class DraftPoolService:
                         detail=str(exc)[:256],
                     )
                 )
-        if jobs:
+        batch = None
+        if updates:
             try:
-                results = engine.draft_batch(jobs)
+                batch = _PipelineBatch(
+                    ticket=engine.stage_batch(tuple(features)), updates=tuple(updates)
+                )
+            except Exception as exc:
+                for update in updates:
+                    invalid.append(update.session_id)
+                    failures.append(
+                        Failure(
+                            session_id=update.session_id,
+                            code="context_install_failed",
+                            detail=str(exc)[:256],
+                        )
+                    )
+        return _StageResult(
+            batch=batch,
+            failures=_BatchResult((), (), tuple(failures), tuple(invalid)),
+        )
+
+    @staticmethod
+    def _batch_result(
+        contract: DraftProtocolContract,
+        batch: _PipelineBatch,
+        completion: WorkerBatchCompletion,
+    ) -> _BatchResult:
+        installed = set(completion.installed)
+        expected_ids = {update.session_id for update in batch.updates}
+        if not installed <= expected_ids:
+            raise ValueError("Worker returned mismatched installation identities")
+        acks, failures, invalid = [], [], []
+        for update in batch.updates:
+            if update.session_id in installed:
+                acks.append(
+                    Ack(
+                        session_id=update.session_id,
+                        confirmed_endpoint=update.confirmed_endpoint,
+                        anchor_token=update.anchor_token,
+                    )
+                )
+            else:
+                invalid.append(update.session_id)
+                failures.append(
+                    Failure(
+                        session_id=update.session_id,
+                        code="context_install_failed",
+                        detail=(
+                            completion.install_error or "Context was not installed"
+                        )[:256],
+                    )
+                )
+        proposals = []
+        if installed:
+            try:
+                if completion.draft_error is not None:
+                    raise RuntimeError(completion.draft_error)
+                results = completion.results
                 expected = {
-                    (job.session_id, job.confirmed_endpoint, job.anchor_token)
-                    for job in jobs
+                    (ack.session_id, ack.confirmed_endpoint, ack.anchor_token)
+                    for ack in acks
                 }
                 actual = [
                     (result.session_id, result.confirmed_endpoint, result.anchor_token)
@@ -929,10 +1105,9 @@ class DraftPoolService:
                 if len(actual) != len(expected) or set(actual) != expected:
                     raise ValueError("Worker returned mismatched proposal identities")
                 if any(
-                    len(result.candidate_ids) != engine.contract.native_block_tokens - 1
+                    len(result.candidate_ids) != contract.native_block_tokens - 1
                     or any(
-                        type(token) is not int
-                        or not 0 <= token < engine.contract.vocab_size
+                        type(token) is not int or not 0 <= token < contract.vocab_size
                         for token in result.candidate_ids
                     )
                     for result in results
@@ -950,33 +1125,27 @@ class DraftPoolService:
             except Exception as exc:
                 failures.extend(
                     Failure(
-                        session_id=job.session_id,
+                        session_id=ack.session_id,
                         code="proposal_failed",
                         detail=str(exc)[:256],
                     )
-                    for job in jobs
+                    for ack in acks
                 )
         return _BatchResult(
-            tuple(installed), tuple(proposals), tuple(failures), tuple(invalid)
+            tuple(acks), tuple(proposals), tuple(failures), tuple(invalid)
         )
 
-    def _complete(self) -> None:
-        if self._inflight is None or not self._inflight.done():
-            return
-        result = self._inflight.result()
-        self._inflight = None
-        if self._closing_ids:
-            for session_id in self._closing_ids:
-                del self._sessions[session_id]
-            self._closing_ids = ()
-            return
-        for session_id in self._running_ids:
+    def _retire(self, session_ids: tuple[str, ...], result: _BatchResult) -> None:
+        for session_id in session_ids:
             session = self._sessions[session_id]
             session.pending = False
             if session.staged:
                 session.staged = False
                 self._staged -= 1
-        self._running_ids = ()
+        retired = set(session_ids)
+        self._running_ids = tuple(
+            session_id for session_id in self._running_ids if session_id not in retired
+        )
         for ack in result.installed:
             session = self._sessions[ack.session_id]
             session.endpoint = ack.confirmed_endpoint
@@ -990,6 +1159,34 @@ class DraftPoolService:
                 self._reply(session.identity, message)
         for session_id in result.invalid_sessions:
             self._close_session(session_id)
+
+    def _complete(self) -> None:
+        if self._inflight is None or not self._inflight.done():
+            return
+        result = self._inflight.result()
+        operation = self._operation
+        self._inflight = None
+        self._operation = None
+        if operation == "release":
+            for session_id in self._closing_ids:
+                del self._sessions[session_id]
+            self._closing_ids = ()
+        elif operation == "stage":
+            self._retire(result.failures.invalid_sessions, result.failures)
+            self._next_batch = result.batch
+        elif operation == "poll":
+            if result is None:
+                # A completed query is not a completed GPU batch. Rate-limit
+                # the next query even though this future woke the socket loop.
+                self._next_device_poll = time.monotonic() + 0.001
+                return
+            batch = self._current_batch
+            assert batch is not None
+            self._current_batch = None
+            self._retire(
+                tuple(update.session_id for update in batch.updates),
+                self._batch_result(self._codec.contract, batch, result),
+            )
 
 
 def run_draft_worker(
@@ -1005,7 +1202,12 @@ def run_draft_worker(
 
     service = DraftPoolService(
         config=service_config,
-        engine_factory=lambda: DFlash2WorkerEngine(worker_model_config),
+        engine_factory=lambda: DFlash2WorkerEngine(
+            worker_model_config,
+            pipeline_host_budget_bytes=(
+                service_config.max_host_memory_bytes - service_config.max_host_bytes
+            ),
+        ),
     )
     try:
         service.run()
