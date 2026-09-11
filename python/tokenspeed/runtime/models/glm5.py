@@ -413,7 +413,15 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
     ) -> int:
         if num_decode_reqs <= 0 or total_tokens <= 0:
             return 0
-        spec_width = int(getattr(ctx.attn_backend, "spec_num_tokens", 1) or 1)
+        # The configured backend width is buffer capacity. A mixed forward
+        # can verify one token while retaining six-token buffers; using their
+        # capacity here would incorrectly consume prefill rows as decode rows.
+        active_width = getattr(ctx, "decode_input_tokens", None)
+        if active_width is None:
+            active_width = getattr(ctx.attn_backend, "prepared_decode_width", None)
+        if active_width is None:
+            active_width = getattr(ctx.attn_backend, "spec_num_tokens", 1)
+        spec_width = int(active_width or 1)
         expected_decode_tokens = num_decode_reqs * spec_width
         return min(int(total_tokens), int(expected_decode_tokens))
 

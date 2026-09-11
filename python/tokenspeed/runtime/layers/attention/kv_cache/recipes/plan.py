@@ -137,6 +137,22 @@ def _split_cache_field_id(field_id: str) -> tuple[int, str]:
     return layer_id, parts[2]
 
 
+def cache_field_consumer_id(field_id: str) -> str | None:
+    """Return a named non-layer consumer, or None for a model-layer field.
+
+    Named fields use ``consumer.<name>.<plane>``. All other spellings retain
+    the strict layer parser, so an accidental malformed layer cannot silently
+    disappear from cache transfer or pool binding.
+    """
+    parts = field_id.split(".", 2)
+    if len(parts) == 3 and parts[0] == "consumer":
+        if parts[1] and parts[2]:
+            return parts[1]
+        raise ValueError(f"cache field {field_id!r} has an invalid consumer id")
+    _split_cache_field_id(field_id)
+    return None
+
+
 def cache_field_layer_id(field_id: str) -> int:
     """Return the owning model layer encoded in a cache field ID."""
     return _split_cache_field_id(field_id)[0]

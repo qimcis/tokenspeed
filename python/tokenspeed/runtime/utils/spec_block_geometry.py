@@ -20,9 +20,9 @@
 
 """Block geometry shared by the DSpark and DFlash speculative families.
 
-A block drafter's width is fixed by the checkpoint it was trained at. DSpark
-stores the drafted-token count; DFlash/DFlash2 store the verify width, which is
-the drafts plus the anchor row.
+A block drafter's native width is fixed by its checkpoint. DSpark stores the
+drafted-token count; DFlash/DFlash2 store the anchor-plus-proposals width.
+The target may consume a shorter prefix without changing the native forward.
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ __all__ = [
     "BLOCK_SPEC_RULES",
     "read_checkpoint_block_size",
     "resolve_block_widths",
+    "resolve_verify_width",
     "validate_block_widths",
 ]
 
@@ -139,3 +140,29 @@ def validate_block_widths(
         f"--speculative-num-draft-tokens {int(num_draft_tokens)}. "
         f"{BLOCK_SPEC_RULES}"
     )
+
+
+def resolve_verify_width(native_width: int, verify_width: int | None) -> int:
+    """Resolve the consumed target prefix independently of native drafting.
+
+    Args:
+        native_width: Anchor plus all proposals produced by the checkpoint.
+        verify_width: Anchor plus proposals consumed by the target, or None
+            to consume the whole native block.
+
+    Returns:
+        The configured target verification width. Runtime fallback width one
+        is selected per forward, not by changing this configured maximum.
+
+    Raises:
+        ValueError: Either width would have no proposal, or the target asks
+            for more proposals than the checkpoint produces.
+    """
+    native_width = int(native_width)
+    selected = native_width if verify_width is None else int(verify_width)
+    if native_width < 2 or not 2 <= selected <= native_width:
+        raise ValueError(
+            "--speculative-verify-tokens must be between 2 and the native "
+            f"draft width {native_width}; got {selected}."
+        )
+    return selected

@@ -68,3 +68,29 @@ def test_agent_uses_kvv_runtime_parameters(monkeypatch, tmp_path) -> None:
     install_spec = agent.install_spec()
     assert install_spec.version == "0.29.0"
     assert install_spec.steps[0].run == "true"
+
+
+def test_agent_respects_workload_model_and_context_limits(
+    monkeypatch, tmp_path
+) -> None:
+    agent = KimiCodeAgent(
+        logs_dir=tmp_path,
+        model_name="openai/example-target",
+        version="0.29.0",
+        extra_env={
+            "KIMI_MODEL_BASE_URL": "http://127.0.0.1/v1",
+            "KIMI_MODEL_MAX_CONTEXT_SIZE": "16384",
+            "KIMI_MODEL_MAX_COMPLETION_TOKENS": "4096",
+        },
+    )
+    captured = {}
+
+    async def capture_exec(environment, command, env) -> None:
+        captured.update(env)
+
+    monkeypatch.setattr(agent, "exec_as_agent", capture_exec)
+    asyncio.run(agent.run("solve it", object(), object()))
+
+    assert captured["KIMI_MODEL_NAME"] == "example-target"
+    assert captured["KIMI_MODEL_MAX_CONTEXT_SIZE"] == "16384"
+    assert captured["KIMI_MODEL_MAX_COMPLETION_TOKENS"] == "4096"

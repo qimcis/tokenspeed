@@ -62,6 +62,7 @@ class _Metrics:
 
 
 class _ForwardOp:
+    decode_input_tokens = 1
     request_ids = ["prefill", "decode"]
     request_pool_indices = [0, 1]
     input_lengths = [4, 1]
@@ -197,6 +198,7 @@ def test_nan_flag_keeps_single_sanitized_token():
     processor.rid_to_state["decode"] = decode_state
 
     class _SpecForwardOp:
+        decode_input_tokens = 4
         request_ids = ["decode"]
         request_pool_indices = [0]
         input_lengths = [1]
@@ -323,6 +325,7 @@ def test_log_request_stats_disabled_by_default():
         processor.rid_to_state["d"] = state
 
         class _DecodeOp:
+            decode_input_tokens = 1
             request_ids = ["d"]
             request_pool_indices = [0]
             input_lengths = [1]
@@ -410,6 +413,8 @@ def test_log_request_stats_aborted_with_spec_acceptance():
         rs = _state([1, 2, 3, 4])
         rs.created_time = 1000.0
         rs.spec_verify_ct = 10
+        rs.spec_verify_tokens = 40
+        rs.spec_output_tokens = 30
         rs.accept_draft_tokens = 3.0
         rs.finished_reason = FINISH_ABORT("client abort")
         rs.stats = RequestStatsTracker()
@@ -495,6 +500,7 @@ def test_log_request_stats_records_timestamps_through_forward():
         state.stats.mark_scheduled(time.time())  # event loop does this pre-forward
 
         class _DecodeOp:
+            decode_input_tokens = 1
             request_ids = ["d"]
             request_pool_indices = [0]
             input_lengths = [1]
@@ -556,6 +562,7 @@ def test_log_request_stats_logs_on_each_dp_replica_leader():
 
 
 class _PrefillForwardOp:
+    decode_input_tokens = 0
     request_ids = ["prefill"]
     request_pool_indices = [3]
     input_lengths = [4]
@@ -735,3 +742,98 @@ def test_pd_multi_token_request_continues_after_remote_prefill_done():
     assert processor.rid_to_state["decode"] is state
     assert events == []
     assert sender.items == []
+
+
+@pytest.mark.parametrize("mixed_first_step", [False, True])
+def test_remote_width_switch_preserves_rows_logprobs_and_terminal_frontier(
+    mixed_first_step,
+):
+    from types import SimpleNamespace
+
+    class Metrics(_Metrics):
+        enabled = True
+
+        def __init__(self):
+            super().__init__()
+            self.steps = []
+
+        def record_spec_decode_step(self, **values):
+            self.steps.append(values)
+
+    metrics = Metrics()
+    processor = OutputProcesser(
+        _Sender(),
+        attn_tp_rank=0,
+        spec_algorithm="dflash",
+        spec_num_tokens=6,
+        metrics=metrics,
+    )
+    first = _state([1, 2, 3], computed_length=3)
+    second = _state([4, 5, 6], computed_length=3)
+    for state, anchor in ((first, 90), (second, 91)):
+        state.output_ids = [anchor]
+        state.return_logprob = True
+        state.output_token_logprobs_val = []
+        state.output_token_logprobs_idx = []
+    first.sampling_params.max_new_tokens = 5
+    processor.rid_to_state.update(first=first, second=second)
+    if mixed_first_step:
+        processor.rid_to_state["prefill"] = _state([7, 8, 9])
+
+    rounds = (
+        (6, [11, 12], [21, 22, 23]),
+        (1, [13], [24]),
+        (6, [14, 15, 16], [25, 26]),
+    )
+    for index, (width, first_tokens, second_tokens) in enumerate(rounds):
+        num_extends = int(mixed_first_step and index == 0)
+        forward = SimpleNamespace(
+            request_ids=(["prefill"] if num_extends else []) + ["first", "second"],
+            request_pool_indices=list(range(num_extends + 2)),
+            input_lengths=([3] if num_extends else []) + [width, width],
+            extend_prefix_lens=[0] if num_extends else [],
+            prefill_lengths=[3] if num_extends else [],
+            decode_input_tokens=width,
+            num_extends=lambda: num_extends,
+        )
+        packed_tokens = [71] if num_extends else []
+        for tokens in (first_tokens, second_tokens):
+            packed_tokens += tokens + [999] * (width - len(tokens))
+        result = _ExecutionResult()
+        result.output_tokens = torch.tensor(packed_tokens, dtype=torch.int32)
+        result.output_lengths = torch.tensor(
+            ([1] if num_extends else []) + [len(first_tokens), len(second_tokens)],
+            dtype=torch.int32,
+        )
+        result.output_logprobs = -result.output_tokens.to(torch.float32)
+        events = processor.post_process_forward_op(
+            forward, result, is_prefill_instance=False
+        )
+
+    assert first.output_ids == [90, 11, 12, 13, 14]
+    assert second.output_ids == [91, 21, 22, 23, 24, 25, 26]
+    assert first.output_token_logprobs_idx == [11, 12, 13, 14]
+    assert first.output_token_logprobs_val == [-11.0, -12.0, -13.0, -14.0]
+    assert second.output_token_logprobs_val == [
+        -21.0,
+        -22.0,
+        -23.0,
+        -24.0,
+        -25.0,
+        -26.0,
+    ]
+    assert first.finished and not second.finished
+    committed = {
+        event.request_id: list(event.tokens)
+        for event in events
+        if type(event).__name__ == "ExtendResult"
+    }
+    assert committed == {"first": [14], "second": [25, 26]}
+    assert first.spec_verify_ct == second.spec_verify_ct == 2
+    assert first.spec_verify_tokens == second.spec_verify_tokens == 12
+    assert first.spec_output_tokens == 3
+    assert second.spec_output_tokens == 5
+    assert first.accept_draft_tokens == 1.5
+    assert [step["draft_width"] for step in metrics.steps] == (
+        [6] if mixed_first_step else [6, 6]
+    )

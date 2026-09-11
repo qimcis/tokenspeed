@@ -112,8 +112,14 @@ class KimiCodeAgent(BaseInstalledAgent):
                 "KIMI_MODEL_API_KEY": "EMPTY",
                 "KIMI_MODEL_PROVIDER_TYPE": "kimi",
                 "KIMI_MODEL_BASE_URL": base_url,
-                "KIMI_MODEL_MAX_CONTEXT_SIZE": KIMI_MODEL_MAX_CONTEXT_SIZE,
-                "KIMI_MODEL_MAX_COMPLETION_TOKENS": (KIMI_MODEL_MAX_COMPLETION_TOKENS),
+                "KIMI_MODEL_MAX_CONTEXT_SIZE": (
+                    self._get_env("KIMI_MODEL_MAX_CONTEXT_SIZE")
+                    or KIMI_MODEL_MAX_CONTEXT_SIZE
+                ),
+                "KIMI_MODEL_MAX_COMPLETION_TOKENS": (
+                    self._get_env("KIMI_MODEL_MAX_COMPLETION_TOKENS")
+                    or KIMI_MODEL_MAX_COMPLETION_TOKENS
+                ),
                 "KIMI_MODEL_CAPABILITIES": "thinking,always_thinking,tool_use",
                 "KIMI_MODEL_THINKING_EFFORT": "max",
             }

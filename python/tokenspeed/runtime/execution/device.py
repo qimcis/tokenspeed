@@ -74,6 +74,8 @@ from __future__ import annotations
 import contextlib
 import enum
 import os
+import queue
+import threading
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -154,6 +156,7 @@ class DeviceSpecs:
     supports_pd_layerwise_finalization: bool
     cache_state_group_ids: tuple[str, ...]
     num_host_pages: int
+    native_draft_tokens: int
 
 
 @dataclass(frozen=True)
@@ -200,6 +203,32 @@ class DeviceRole(enum.Enum):
     #: Decodes prompts another node prefilled; ``plan.remote_prefill`` pulls
     #: an admitted prompt's KV in.
     PD_DECODE = "decode"
+
+
+@dataclass(frozen=True)
+class _RemoteFeatureSnapshot:
+    ticket_id: int
+    session_id: str
+    start: int
+    endpoint: int
+    anchor_id: int
+    block_table: tuple[int, ...]
+
+
+class _RemoteFeatureLease:
+    """Return a source pin through scheduler feedback, never from GPU code."""
+
+    def __init__(self, ticket_id: int, released: queue.SimpleQueue) -> None:
+        self._ticket_id = ticket_id
+        self._released = released
+        self._lock = threading.Lock()
+        self._done = False
+
+    def release(self) -> None:
+        with self._lock:
+            if not self._done:
+                self._done = True
+                self._released.put(self._ticket_id)
 
 
 def _settle(submissions: deque, failure: str) -> None:
@@ -258,6 +287,31 @@ class DeviceHandle:
         # The transfer peer's submissions, settled at the next round's
         # execute (see ``_settle``).
         self._transfer_submissions: deque = deque()
+        self._remote_exports: deque = deque()
+        self._remote_active_sessions: set[str] = set()
+        self._remote_export_submissions: deque = deque()
+        self._remote_released: queue.SimpleQueue = queue.SimpleQueue()
+        self._remote_exporter = None
+        self._remote_feature_cache = None
+        capture = getattr(executor, "remote_feature_capture", None)
+        if capture is not None:
+            from tokenspeed.runtime.draft_pool.controller import (
+                REMOTE_DRAFT_EXPORT_SLOTS,
+            )
+            from tokenspeed.runtime.draft_pool.features import AsyncFeatureExporter
+
+            self._remote_feature_cache = capture.cache
+            self._remote_exporter = AsyncFeatureExporter(
+                hidden_size=capture.cache.hidden_size,
+                window_left=capture.cache.window_left,
+                max_pending=REMOTE_DRAFT_EXPORT_SLOTS,
+                max_pending_bytes=REMOTE_DRAFT_EXPORT_SLOTS
+                * capture.cache.window_left
+                * capture.cache.hidden_size
+                * 2,
+                device_module=executor.device_module,
+                copy_stream=executor.device_module.Stream(),
+            )
 
     # ------------------------------------------------------------------
     # Per-round work
@@ -306,6 +360,7 @@ class DeviceHandle:
         )
 
         executor = self._executor
+        self._submit_remote_draft_exports()
         l2 = self._l2 if execution_plan.cache else None
         if l2 is not None:
             # Ahead of the zeroing: a stream-ordered store's sources may be
@@ -421,6 +476,136 @@ class DeviceHandle:
             )
 
         return PendingExecution(self._thread.submit(_forward))
+
+    def queue_remote_draft_exports(self, snapshots: list) -> None:
+        """Freeze pinned CPU descriptors for the next existing plan dispatch."""
+        if snapshots and self._remote_exporter is None:
+            raise RuntimeError("feature exports require remote draft capture")
+        for snapshot in snapshots:
+            self._remote_active_sessions.add(str(snapshot.session_id))
+            self._remote_exports.append(
+                _RemoteFeatureSnapshot(
+                    ticket_id=int(snapshot.ticket_id),
+                    session_id=str(snapshot.session_id),
+                    start=int(snapshot.start),
+                    endpoint=int(snapshot.endpoint),
+                    anchor_id=int(snapshot.anchor_id),
+                    block_table=tuple(
+                        snapshot.block_tables[self._remote_feature_cache.group_id]
+                    ),
+                )
+            )
+
+    def _submit_remote_draft_exports(self) -> None:
+        """Issue gathers/copies on the FIFO independently from token commits."""
+        exporter = self._remote_exporter
+        cache = self._remote_feature_cache
+        executor = self._executor
+        while self._remote_exports:
+            snapshot = self._remote_exports.popleft()
+            lease = _RemoteFeatureLease(snapshot.ticket_id, self._remote_released)
+
+            def _export(snapshot=snapshot, lease=lease):
+                from tokenspeed.runtime.draft_pool.features import (
+                    FeatureExportDescriptor,
+                )
+
+                if not exporter.has_capacity(snapshot.endpoint - snapshot.start):
+                    return False
+                try:
+                    with executor.device_module.stream(executor.execution_stream):
+                        table = torch.tensor(
+                            [snapshot.block_table], dtype=torch.int32, device="cpu"
+                        )
+                        rows = cache.gather(
+                            block_table=table,
+                            request_index=0,
+                            start=snapshot.start,
+                            end=snapshot.endpoint,
+                            logical_column_offset=0,
+                        )
+                        submitted = exporter.submit(
+                            descriptor=FeatureExportDescriptor(
+                                ticket_id=snapshot.ticket_id,
+                                session_id=snapshot.session_id,
+                                start=snapshot.start,
+                                end=snapshot.endpoint,
+                                anchor_token=snapshot.anchor_id,
+                            ),
+                            features=rows,
+                            prerequisite_stream=executor.execution_stream,
+                            lease=lease,
+                        )
+                    if not submitted:
+                        # A single data-plane producer checked admission before
+                        # the gather; a concurrent shutdown is the remaining
+                        # reason submission may decline ownership.
+                        executor.execution_stream.synchronize()
+                        return False
+                    return True
+                except BaseException:
+                    if not exporter.owns_ticket(snapshot.ticket_id):
+                        # Failed launches may still have source reads queued.
+                        # A failed fence retains the pin for process teardown.
+                        executor.execution_stream.synchronize()
+                        lease.release()
+                    raise
+
+            self._remote_export_submissions.append(
+                (snapshot, self._thread.submit(_export))
+            )
+
+    def poll_remote_draft_exports(self) -> tuple[list, list[int]]:
+        """Poll event completion and released source pins without GPU dispatch."""
+        if self._remote_exporter is None:
+            return [], []
+        self._settle_remote_draft_exports()
+        completed = self._remote_exporter.poll()
+        released = []
+        while True:
+            try:
+                released.append(self._remote_released.get_nowait())
+            except queue.Empty:
+                break
+        return completed, released
+
+    def cancel_remote_draft_exports(self, session_id: str) -> None:
+        """Cancel delivery while retaining every submitted GPU source lifetime."""
+        if self._remote_exporter is None:
+            return
+        retained = deque()
+        while self._remote_exports:
+            snapshot = self._remote_exports.popleft()
+            if snapshot.session_id == session_id:
+                self._remote_released.put(snapshot.ticket_id)
+            else:
+                retained.append(snapshot)
+        self._remote_exports = retained
+        self._remote_active_sessions.discard(session_id)
+        self._remote_exporter.cancel(session_id)
+
+    def _settle_remote_draft_exports(self) -> None:
+        while (
+            self._remote_export_submissions
+            and self._remote_export_submissions[0][1].done()
+        ):
+            snapshot, future = self._remote_export_submissions.popleft()
+            submitted = future.result()
+            if not submitted:
+                if snapshot.session_id in self._remote_active_sessions:
+                    self._remote_exports.append(snapshot)
+                else:
+                    self._remote_released.put(snapshot.ticket_id)
+
+    def close_remote_draft_exports(self) -> None:
+        """Drain queued device work and the dedicated copy stream at shutdown."""
+        if self._remote_exporter is None:
+            return
+        while self._remote_exports:
+            self._remote_released.put(self._remote_exports.popleft().ticket_id)
+        self._remote_active_sessions.clear()
+        self._thread.run(self._remote_exporter.shutdown)
+        self._settle_remote_draft_exports()
 
     def poll_cache_results(self) -> list:
         """Collect completed L2 cache ops; never blocks.
@@ -697,6 +882,28 @@ def build_device_side(
     target, draft = create_model_runner(
         server_args, model_config, draft_model_config, gpu_id, global_rank
     )
+    remote_projector = None
+    if server_args.remote_draft_endpoint is not None:
+        from tokenspeed.runtime.configs.load_config import LoadConfig
+        from tokenspeed.runtime.draft_pool.features import load_target_projection
+
+        remote_projector = load_target_projection(
+            config=draft_model_config.hf_config,
+            model_path=server_args.speculative_draft_model_path,
+            revision=(
+                getattr(draft_model_config.hf_config, "_commit_hash", None)
+                or server_args.speculative_draft_model_revision
+            ),
+            load_config=LoadConfig(
+                load_format=server_args.load_format,
+                download_dir=server_args.download_dir,
+                ext_yaml=server_args.ext_yaml,
+                weight_loader_prefetch_checkpoints=server_args.weight_loader_prefetch_checkpoints,
+                weight_loader_prefetch_num_threads=server_args.weight_loader_prefetch_num_threads,
+            ),
+            device=f"{server_args.device}:{gpu_id}",
+            target_model=target.model,
+        )
     if server_args.disaggregation_mode in ("null", "prefill"):
         target.prepare_multimodal_runtime()
     max_forward_tokens = (
@@ -749,6 +956,24 @@ def build_device_side(
             )
             server_args.chunked_prefill_size = aligned
 
+    remote_feature_capture_factory = None
+    if remote_projector is not None:
+        from tokenspeed.runtime.draft_pool.features import RemoteFeatureCapture
+        from tokenspeed.runtime.layers.attention.kv_cache.projected_features import (
+            ProjectedFeatureCache,
+        )
+
+        feature_cache = ProjectedFeatureCache(pool=token_to_kv_pool)
+
+        def remote_feature_capture_factory(input_buffers):
+            return RemoteFeatureCapture(
+                projector=remote_projector,
+                cache=feature_cache,
+                input_buffers=input_buffers,
+                max_context_tokens=model_config.context_len
+                + server_args.spec_context_pad,
+            )
+
     executor = create_model_executor(
         server_args=server_args,
         config=ModelExecutorConfig.from_server_args(
@@ -766,6 +991,7 @@ def build_device_side(
         token_to_kv_pool=token_to_kv_pool,
         draft_attn_backend=draft_attn_backend,
         draft_token_to_kv_pool=draft_token_to_kv_pool,
+        remote_feature_capture_factory=remote_feature_capture_factory,
     )
 
     # Per-rank GPU memory breakdown (weights by group, KV/graph/non-torch).
@@ -827,6 +1053,7 @@ def build_device_side(
         num_host_pages=(
             l2_cache_executor.num_host_pages if l2_cache_executor is not None else 0
         ),
+        native_draft_tokens=int(getattr(executor.drafter, "draft_query_width", 0)),
     )
 
     def encoder_model_facts() -> EncoderModelFacts:

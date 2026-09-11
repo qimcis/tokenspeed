@@ -375,7 +375,79 @@ moment its remainder dipped under the window — exactly when it needs a new
 page — and once every resident request looked covered, retraction would have
 no victim and nothing could free that page.
 
-## 5. Invariants a change must preserve
+## 5. Optional remote proposals within the decode phase
+
+Remote drafting adds an orthogonal request record to the existing request/KV
+FSM: session identity, confirmed endpoint and anchor, pending/ready state, and
+finite deferral bookkeeping. It does not introduce a separate admission queue
+or replace the role-specific prefill and readmission priorities above.
+
+The scheduler can preserve request A's confirmed prefix while the target runs
+request B. Only requests with `ResultsInFlight() == 0` are eligible for remote
+candidate selection. This is per-request quiescence, not a global pipeline
+drain. The worker produces candidates; the target still owns acceptance,
+sampling, stopping and every published output token.
+
+### Geometry is selected before reservation
+
+For the initial DFlash2 configuration, the model drafts its native eight-position
+block. A ready proposal supplies an explicit anchor plus the first five
+candidates to a **width-six** target forward. A miss produces a **width-one**
+forward. Executing six target positions and accepting one is not width-one
+fallback.
+
+The request tracks its committed/computed endpoint separately from reserved
+headroom and selected width. A 1-to-6 transition must acquire sufficient pages
+before planning the forward; a 6-to-1 transition must not publish the unused
+reserved positions as computed tokens. The final accepted output remains the
+next anchor. The selected width and candidate IDs are immutable in the forward
+operation, and a matching proposal is consumed at most once. Retraction,
+maximum context, prefix publication and page-boundary checks use the actual
+endpoint and reservation, not a fixed-width subtraction from token count.
+
+One attention-cohort batch has one width. Width is communicated after local
+reservation planning; another cohort cannot rewrite it. The executor selects
+a globally compatible eager/graph route for the complete cohort-width vector.
+
+### Bounded deferral, without waiting on the worker
+
+Within the existing decode phase, the deterministic remote policy is:
+
+1. Service the oldest request whose deferral budget expired, at width six if
+   ready and otherwise at width one.
+2. Otherwise select a width-six batch when the ready count meets the configured
+   minimum.
+3. Otherwise use width-one work from unassigned or unavailable requests, leaving
+   valid pending and ready prefixes unchanged.
+4. If only ready/pending requests remain, run an underfilled ready width-six
+   batch.
+5. If all are pending, release one request for width-one progress while holding
+   the others. Do not immediately reacquire its remote job until a held job
+   resolves or expires.
+
+Worker-admission opportunities rotate fairly. The minimum ready count and
+maximum deferral are deployment parameters calibrated to the workload; neither
+is a mandatory service cadence. The target must not idle merely to fill a
+remote batch when eligible fallback work exists. More admitted requests count
+as capacity only when the same required work and completion constraints hold.
+
+### Session invalidation and recovery
+
+OPEN/reset creates a globally unique session. Retraction, request-slot reuse,
+abort and finish invalidate the old session and its candidates. A reconnect or
+lost worker state needs a fresh session and bounded feature snapshot. Healthy
+width-one fallback advances the target endpoint without automatically erasing
+worker context; a valid context ACK can still be useful after a proposal times
+out. Only contiguous acknowledged history permits an incremental update.
+
+Late or duplicate replies cannot resurrect a request or free a resource still
+owned by an export or forward. A timeout invalidates candidate eligibility,
+not an otherwise healthy worker's installed context. When required history is
+no longer retained, reset and bootstrap through the ordinary cache contract.
+Missing or unavailable remote state always leaves width-one target progress
+available.
+
+## 6. Invariants a change must preserve
 
 - Admission never grants pages for tokens beyond the chunk being scheduled,
   except the state-checkpoint tail (1.2), which is banked for exactly one round

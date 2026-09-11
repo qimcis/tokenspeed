@@ -108,7 +108,10 @@ Information crosses to the data plane **only** inside the submitted closure,
 and is frozen once submitted: no attribute rebinding, no in-place edit, no
 releasing a resource the closure captured. Capture plain values or a snapshot,
 and bind at capture time rather than closing over a variable the caller will
-rebind. Results cross back **only** through `PendingExecution.result()`.
+rebind. Model-forward results cross back **only** through
+`PendingExecution.result()`. Independent cache/export operations report
+completion through their named tickets; they do not attach network or snapshot
+completion to the model result's commit wait.
 
 `execution/forward_thread.py` states this in full, including the single
 registered exception — grammar matchers, whose ownership is split by path and
@@ -144,7 +147,8 @@ the scheduler's state advances, and why.
 There are exactly two call sites, each with a documented reason:
 
 * **Head of the round** — completed L2 cache-op events
-  (`_cache_hooks.poll_ready_events()`). These must advance *before*
+  (`_cache_hooks.poll_ready_events()`) and ordered remote-proposal events.
+  These must advance *before*
   `next_execution_plan`, otherwise cache-gated admissions are delayed by a
   full round.
 * **Tail of the round** — forward results and PD transfer events, funneled
@@ -220,6 +224,7 @@ Current inventory:
 | `_epd_hooks`   | `EpdPrefillHooks` — `epd/prefill_hooks.py`    | glue (EpdPrefillAdmission decides)          | `try_stage`, `drain_ready_embeddings`, `assert_embeddings_received` |
 | `_pd_hooks`    | `PdTransferHooks` — `pd/transfer_hooks.py`    | glue (transfer executors decide)            | `poll_transfer_events` |
 | `_cache_hooks` | `L2CacheHooks` — `engine/cache_hooks.py`      | glue-ish (handed the `DeviceHandle`: submission rides `execute`; polling stays control-side event queries) | `count_plan_ops`, `poll_ready_events` |
+| `_remote_draft` | `RemoteDraftController` — `draft_pool/controller.py` | self-contained protocol state; device capability injected | `poll_ready_events`, `queue_exports`, `after_commit` |
 
 `_pause_hooks` and `_pd_hooks` are also handed the `DeviceHandle`: both have
 work that must land on the data plane — the DP idle forward and the KV repair
@@ -246,14 +251,63 @@ before Mooncake WRITE — that CUDA copy is data-plane work, not loop work.
 All hooks obey Principle 3: they return events or decisions; they never call
 `advance_scheduler`.
 
+## Remote proposals preserve the control-plane boundary
+
+Remote drafting is an optional candidate source for the existing scheduler and
+target executor. It does not add a second event loop, target engine, or public
+request API. The private worker is outside the target's process groups; its
+transport carries CPU metadata and projected feature payloads, not target KV
+page identifiers or device objects.
+
+The attention-cohort leader polls worker replies and makes timeout decisions.
+It broadcasts the same ordered scheduler events to the mirrored ranks before
+the head advance. A proposal can affect only a future plan. Session identity,
+confirmed feature endpoint and explicit anchor must match; a late reply cannot
+modify a queued forward or commit output. Worker acknowledgements and proposal
+eligibility are separate: a valid context ACK still advances the worker's
+installed endpoint when the accompanying candidate has become obsolete.
+
+Publish a new remote job only after target commit post-processing has applied
+EOS, stop, abort, NaN and finish decisions. The tail integration uses that
+finalized state; transport receipt is never a second token-authority path.
+`after_commit` closes terminal worker sessions after tail feedback has landed;
+the next head poll derives eligible work from the scheduler's updated request
+descriptors. After the head advance, `queue_exports` drains the scheduler's
+pinned snapshot descriptors into the device handle for that round's execution.
+Remote-managed requests become draftable only with no result of their own in
+flight. Unrelated requests and queued forwards continue normally: waiting for
+a candidate is not a reason to drain the whole execution queue.
+
+Feature capture, projection, cache access and device-to-host copies run behind
+named device operations on the data-plane thread. Export completion has its own
+ticket and polling path, so a cold feature snapshot cannot extend the target's
+token-commit wait. A CPU encoder must reject CUDA tensors before a generic
+serializer can implicitly call `.cpu()`.
+
+Export tickets hold source pages until the copy finishes, and hold CPU staging
+until the copied transport send has consumed it. Logical cancellation only
+invalidates use of the result; it does not make those resources reusable early.
+Shutdown stops admissions, invalidates jobs and drops unsent updates, then
+retires outstanding copy tickets before releasing memory. Socket linger and
+worker session leases are bounded. Worker loss leaves target requests on the
+same execution path with real width-one progress.
+
+The round still issues exactly one `DeviceHandle.execute`. Post-plan DP metadata
+includes the immutable selected width. Every attention cohort participates in
+the same width/graph decision, including all eight in the TP1/DPA8 recipe and
+any idle cohorts. Disagreement between active widths selects eager execution
+on every rank. See
+[the width contract](unified_path.md#native-draft-width-and-active-target-width).
+
 ## Anatomy of a round
 
 For orientation, one iteration of `event_loop`:
 
 1. Receive and admit new requests (`_process_new_requests`), with the pause
    and EPD admission hooks inline as single lines.
-2. Poll completed L2 cache ops; **advance the scheduler (head call site)** so
-   this round's plan sees them.
+2. Poll completed L2 cache ops and ordered remote-proposal events;
+   **advance the scheduler (head call site)** so this round's plan sees them.
+   Queue any resulting pinned remote-export descriptors through the handle.
 3. Frozen (`PAUSED_ALL`)? Drain the in-flight queue and run the paused idle
    step. Otherwise: plan (`next_execution_plan`), derive the forward op,
    record metrics, DP-sync, and gather per-batch state (draining the

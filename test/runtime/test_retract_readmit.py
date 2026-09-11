@@ -99,6 +99,8 @@ class _Results:
 class _ForwardOp:
     """Forward-op stub exposing per-slot ``prefill_lengths``."""
 
+    decode_input_tokens = 1
+
     def __init__(
         self,
         request_ids,

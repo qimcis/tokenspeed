@@ -34,6 +34,27 @@ if TYPE_CHECKING:
     )
 
 
+def resolve_decode_input_tokens(forward_op, maximum_width: int) -> int:
+    """Validate one cohort's uniform decode width against its reserved inputs.
+
+    Prefill-only operations retain the configured width for output capacity;
+    their ragged input lengths do not imply a decode geometry.
+    """
+    num_extends = forward_op.num_extends()
+    lengths = tuple(int(n) for n in forward_op.input_lengths[num_extends:])
+    if not lengths:
+        return maximum_width
+    width = lengths[0]
+    if width < 1 or width > maximum_width or any(n != width for n in lengths):
+        raise ValueError(
+            f"invalid homogeneous decode widths {lengths}, maximum {maximum_width}"
+        )
+    declared = getattr(forward_op, "decode_input_tokens", width)
+    if declared is not None and int(declared) != width:
+        raise ValueError("planned decode width differs from reserved input lengths")
+    return width
+
+
 @dataclass(frozen=True)
 class DpForwardMetadata:
     """CPU-only DP metadata, gathered by the event loop before each forward.
@@ -49,6 +70,9 @@ class DpForwardMetadata:
     all_decode_or_idle: bool
     all_extend: bool
     need_idle_forward: bool
+    global_decode_input_tokens: list[int] | None = None
+    # Common active cohort width; None forbids replay when widths differ.
+    decode_graph_width: int | None = None
 
 
 @dataclass(frozen=True)

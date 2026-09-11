@@ -176,12 +176,18 @@ class RequestStats:
             else 0.0
         )
 
-        # spec acceptance; None when spec decode is off
+        # Width-one fallback contributes no speculative rounds or query slots.
+        # Keep the legacy rate denominator (verify slots INCLUDING the anchor),
+        # but sum actual widths rather than assuming one launch-time width.
         if spec_algorithm is not None and rs.spec_verify_ct > 0:
-            acc_len = rs.accept_draft_tokens or 0.0
+            acc_len = rs.spec_output_tokens / rs.spec_verify_ct
             acc_rate = (
-                round(max(0.0, acc_len - 1.0) / spec_num_tokens, 4)
-                if spec_num_tokens
+                round(
+                    max(0, rs.spec_output_tokens - rs.spec_verify_ct)
+                    / rs.spec_verify_tokens,
+                    4,
+                )
+                if rs.spec_verify_tokens > 0
                 else 0.0
             )
             acc_len = round(acc_len, 2)

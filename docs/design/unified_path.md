@@ -122,14 +122,16 @@ wasted FLOPs);
 `actual_bs == 0` is the idle replay. Eager idle bypasses the wrapper entirely
 (`execute_idle_forward` calls `model_runner.forward(IDLE)` directly).
 
-### Pointer-stable per-bs views from one builder
+### Pointer-stable geometry views from one builder
 
-Per-bs metadata objects (each leaf's `_decode_views_by_bs[bs]`, the router's
-`decode_write_locations` views) are views over the persistent buffers, built
-by a single per-bs builder shared by capture and refresh, cached per bs. A bs
-never captured (above-ladder decode, enforce-eager) builds its views lazily
-on first refresh — no new storage, one-time cost. Views must be
-pointer-stable: a captured graph holds their addresses forever.
+Metadata objects (the leaves' decode views and the router's
+`decode_write_locations` views) are views over persistent buffers, built by
+the same builder for capture and refresh. Fixed-width leaves can key by batch
+size alone; a variable-width leaf includes the active width in its geometry
+key. A batch size never captured (above-ladder decode, enforce-eager) builds
+its views lazily on first refresh — no new storage, one-time cost. Views must
+be pointer-stable: a captured graph holds their addresses forever. Visiting a
+different width must preserve the old geometry's views for later replay.
 
 Helpers that memoize tensors created inside capture must not return those
 tensors to eager callers. Keeping a Python reference preserves the allocation,
@@ -313,22 +315,95 @@ pinned by `test/runtime/sampling/test_greedy_route_equivalence.py`.
 
 One sampling rule for every batch: **prefill requests sample, decode
 requests verify** (`ModelExecutor._run_sampling`). The decode candidate
-window is always `[num_decodes, output_length]` (`_decode_candidates`, a
-persistent
+window is `[num_decodes, active_width]` (`_decode_candidates`, a persistent
 `input_ids_buf` view): column 0 the last verified token, columns 1.. the
-draft candidates. Without a drafter, `output_length == 1` — a one-column
+draft candidates. Ordinary serving without proposals uses a one-column
 window that accepts nothing and resolves to exactly one sampled token
 through the same pool kernels, `accept_length == 1`
 (`test_decode_verify_n1_equivalence.py`; triton is bitwise identical to the
 old `sample()` route, flashinfer stochastic draws the same distribution
-through the coin stream). `future_input_map` is `[pool, output_length]` for
-the same reason: single-token decode is a width-1 candidate window.
+through the coin stream). `future_input_map` reserves `[pool, maximum_width]`;
+single-token decode consumes its width-one candidate view. A remote proposal
+can make the target's active width greater than one even when no local drafter
+exists. Sampling, grammar verification, feature capture and output processing
+therefore depend on the selected target geometry, not on `drafter is None`.
 
 Backends express verify geometry as a **floor**, not a mode: seq_lens clamp
 to `clamp_min(q_len)` unconditionally (drafts and plain decode have floor 1,
 where the clamp is the identity). What legitimately remains conditional on
 the drafter is the *draft model's existence* — draft backend refresh and the
 drafter loop itself — not the sampling or metadata shape of the target.
+
+### Native draft width and active target width
+
+Native proposal geometry and target verification geometry are separate values.
+The initial remote DFlash2 pair uses native draft width **8**, target verification
+width **6** (anchor plus five candidate tokens), and fallback width **1**. Run
+the full trained draft block and selector before taking the selected prefix;
+changing the checkpoint's block size to six is not equivalent. A local DFlash2
+comparator also needs eight real temporary draft-write positions even when its
+target consumes six, not merely an eight-column scratch tensor. Those eight
+writes follow the six-position target window: local reservation must cover
+both intervals, not take only the larger width.
+
+The scheduler selects active width before reserving pages and freezes it in the
+plan and forward metadata. All target input expansion, candidate indexing,
+logits selection, accepted-output slicing and cache updates use this width.
+Gather candidate columns with the physical row stride: flattening a maximum-
+width map and taking a short prefix reads the wrong anchors for multiple
+width-one requests. Preserve the final accepted output as the next anchor.
+
+Width-specific persistent views and graph variants share the same metadata
+refresh contract. Graph identity includes sampling variant, active width and
+batch size; do not rebind shared executor configuration between queued
+forwards. Maximum-width allocation is capacity, not permission to execute that
+many target rows on a width-one fallback. Padded requests still resolve to null
+pages on every width.
+
+`PagedAttentionBackend.prepare_decode_width(tokens_per_req)` selects metadata
+geometry through `prepared_decode_width`; it does not mutate configured
+`spec_num_tokens`. The router calls it before refresh, capture and mixed
+initialization, using the explicit `decode_input_tokens` or validated packed
+token count after removing prefill rows. Leaves that do not implement variable
+width reject a change. DSA and TRTLLM MLA opt in; dense metadata views are keyed
+by `(batch_size, verify_floor)` and retain an immutable `q_len_per_req`.
+
+DSA allocates its sequence-length storage at initialization and retains
+pure-decode sparse plans in backend-private `_dsa_decode_plans[(bs, width)]`.
+Mixed batches construct fresh eager plans without caching every extend/decode
+split, which would accumulate quadratic plan state across batch sizes. Only
+the selected plan is exposed as `metadata._dsa_plan` to graph-visible metadata.
+Prepare pure-decode shapes during warmup before CUDA capture; creating a new
+sparse plan during capture is an error. A width-six forward followed by width
+one, mixed width-six work and another width-six replay must recover the exact
+prior plan and view pointers. The backend's plan cache survives those
+intervening forwards without making every cached plan part of each graph's
+metadata walk.
+
+One attention cohort uses one homogeneous width per batch. The existing
+post-plan DP metadata exchange carries token count, batch size, forward mode and
+planned decode width across **all** cohorts. Idle cohorts advertise width zero.
+`DpForwardMetadata.decode_graph_width` is the common positive width only when
+all active cohorts are decoding and agree on width; otherwise it is `None`.
+Idle execution adopts the common width when one exists, or one for the eager
+path. `all_decode_or_idle` retains its mode-only meaning for communication
+backends; graph eligibility additionally requires a common width.
+
+If active widths differ, every rank uses the token-count-aware eager collective
+path. An idle rank cannot choose a graph independently of active ranks. This
+decision never changes a width already reserved by the C++ scheduler. For
+TP1/DPA8 with EP8, all eight cohorts share this decision; they are not eight
+independent target replicas.
+
+### Remote capture does not require a local draft model
+
+A remote-only target retains the capture/projector component and its feature
+cache group. It does not retain the complete draft model for fallback.
+Per-forward capture follows the same context-attachment contract as local
+capture, and runs for prefill, width-six verification and width-one progress.
+Commit processing makes only the accepted input prefix visible to export.
+Worker-side KV is independent of target KV and is built from projected history.
+See [feature history ownership](cache-concepts.md#projected-feature-history-is-a-cache-group).
 
 ### Outputs are persistent-buffer slices on both paths
 
@@ -552,6 +627,11 @@ down to the router and V4).
 
 ## Regression gates
 
+* `test/runtime/test_remote_decode_width_metadata.py` — width selection does
+  not mutate configured geometry; variable-width dense and DSA views retain
+  their captured addresses across width-six, width-one and mixed forwards;
+  retained pure-decode sparse plans are keyed by batch size and width while
+  mixed plans remain uncached.
 * `test/runtime/test_unified_decode_path.py` — eager refresh and padded
   replay refresh produce identical live-request contents over the same
   buffers; lazy above-ladder views are pointer-stable; the graph_ptr_guard

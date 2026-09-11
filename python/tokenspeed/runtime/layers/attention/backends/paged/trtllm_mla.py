@@ -139,6 +139,7 @@ class TRTLLMMLADecodeMetadata:
 class TRTLLMMLABackend(PagedAttentionBackend):
     """trtllm_mla leaf using fused kernels."""
 
+    supports_variable_decode_width = True
     default_kernel_page_size = TRTLLM_MLA_DEFAULT_PAGE_SIZE
 
     def __init__(self, config: AttnConfig, spec: MLAConfig, *, kernel_page_size: int):
@@ -287,12 +288,13 @@ class TRTLLMMLABackend(PagedAttentionBackend):
     # ---- CUDA Graph ----
 
     def _decode_views(self, bs: int) -> TRTLLMMLADecodeMetadata:
-        """Per-bs decode metadata views over the persistent buffers.
+        """Per-(batch, width) metadata views over the persistent buffers.
 
-        One builder for capture and refresh; cached per bs — pointer-stable,
+        One builder for capture and refresh; cached per shape — pointer-stable,
         no storage allocated.
         """
-        metadata = self._decode_views_by_bs.get(bs)
+        key = (bs, self.verify_floor)
+        metadata = self._decode_views_by_bs.get(key)
         if metadata is not None:
             return metadata
         metadata = TRTLLMMLADecodeMetadata(
@@ -302,7 +304,7 @@ class TRTLLMMLABackend(PagedAttentionBackend):
             seq_lens_k=self.seq_lens_buf[:bs],
             q_len_per_req=self.verify_floor,
         )
-        self._decode_views_by_bs[bs] = metadata
+        self._decode_views_by_bs[key] = metadata
         return metadata
 
     # Capture is inherited (the leaf default: idle refresh over the same buffers).

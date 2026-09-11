@@ -36,6 +36,12 @@ def _env(args: argparse.Namespace) -> None:
     env_main()
 
 
+def _draft_worker(args: argparse.Namespace) -> None:
+    from tokenspeed.cli.draft_worker import run_draft_worker_from_args
+
+    run_draft_worker_from_args(args)
+
+
 def _merge_traces(args: argparse.Namespace) -> None:
     from tokenspeed.cli.trace_merge import main as merge_traces_main
 
@@ -76,6 +82,17 @@ def main() -> None:
         "--skip-tokenizer-init.",
     )
     serve_parser.set_defaults(func=_serve)
+
+    from tokenspeed.cli.draft_worker import add_draft_worker_args
+
+    worker_parser = subparsers.add_parser(
+        "draft-worker",
+        help="Launch the private TP1 GLM-5.3 DFlash2 worker.",
+        description="Launch an independently batched DFlash2 worker on a private "
+        "network. The target server retains sampling and output ownership.",
+    )
+    add_draft_worker_args(worker_parser)
+    worker_parser.set_defaults(func=_draft_worker)
 
     env_parser = subparsers.add_parser(
         "env",

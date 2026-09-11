@@ -269,6 +269,86 @@ and the runtime refuses an op with nothing to copy; neither side dedups or
 invents an acknowledgement, because an op that never completes a copy would
 hold its tickets forever.
 
+## Projected feature history is a cache group
+
+Remote DFlash2 needs a recoverable window of target features in addition to
+target KV. Declare it through `CacheRecipe.groups()`, `CacheGroupSpec` and
+`CacheFieldSpec`: the ordinary arena and C++ scheduler own its allocation,
+prefix matching, retention, retraction and release. A Python dictionary of
+per-request feature tensors is not an alternative cache owner.
+
+The feature field is a **non-layer consumer**. It is not attention KV and must
+not be assigned a fake attention layer to satisfy an ordinary-pool helper.
+Consumer selection and ordinary L2 write-back/load-back include it explicitly.
+Its first read or write after restore must observe its load completion fence,
+just as a layer consumer fences its first access. Joint prefix matching backs
+off when target KV survives but the required feature history does not; normal
+prefill then rebuilds the missing history.
+
+The logical feature field is named under `consumer.dflash2.projected_features`
+in group `dflash2_projected_features`. `CachePool.cache_transfer_layout` appends
+its consumer after the layer consumers, includes every physical feature chunk,
+and `wait_for_non_layer_consumer` fences access after a restore. The feature
+view uses explicit absolute intervals and table-column offsets; it does not
+allocate its own request history.
+
+The GLM recipe packs feature chunks into the existing KV/index planes. Each
+allocated LCM parent belongs to exactly one cache group, so target fields and
+feature fields never have live values in the same parent. This ownership makes
+the physical alias safe without enlarging every parent's byte extent. Feature
+parents still consume ordinary cache capacity: account for their packing and
+rounding as well as the target group's demand. Gather/scatter address scratch
+also counts; an int64 address per BF16 feature value is four times the logical
+payload size. The wire remains contiguous BF16 projected rows regardless of
+their physical layout.
+
+`RemoteFeatureCapture.prepare_batch` calls the feature consumer's `wait_ready`
+on the data plane before graph execution. A fence recorded during graph capture
+cannot cover a later L2 restore generation. This conservative barrier protects
+the first feature access on replay; any reduced H2D/compute overlap must be
+charged to the remote configuration.
+
+Use the checkpoint's six taps in their declared order, followed by its `fc`
+projection and `hidden_norm`. The transported representation is projected BF16:
+6144 values, or 12 KiB, per context token. It is not the concatenated six-tap
+payload. Keep the projector and group replicated within an attention-TP cohort;
+only its leader exports. TP1/DPA8 has one feature copy per request, while a TP4
+cohort retains four. These copies and projection work belong in memory and
+throughput accounting.
+
+### The feature endpoint is before the anchor
+
+Let `E` be the absolute position of the explicit anchor token. Valid feature
+rows describe target inputs **before** `E`. The newest correction/bonus token
+at `E` has not yet passed through the target. Capture during prefill, width-six
+verification and width-one fallback, but promote only committed input rows
+after acceptance and stop truncation. Evaluating a speculative row or reserving
+its slot does not make that row valid history.
+
+The checkpoint's attention window is 2048 (`window_left=2047`). An LCM sliding
+group with window `W` retains `W - 1` historical tokens. Preserve the interval
+actually required by that attention contract, with absolute positions; a
+window-2048 declaration does not promise 2048 historical rows. The bounded
+bootstrap is approximately 24 MiB of projected features. Worker KV is separately
+allocated and addressed; the wire never exports target cache-page identities.
+
+### Export lifetime is independent of candidate lifetime
+
+Admit a worker session and staging slot before constructing its snapshot. Allow
+one unacknowledged context transfer per session. Later unsent updates coalesce
+from the acknowledged endpoint and must contain every required contiguous row;
+dropping intermediate history is not valid coalescing. A stale candidate may
+accompany a useful context ACK, so acknowledgement processing survives proposal
+invalidation.
+
+An export ticket pins its source pages until D2H completes, independently of the
+model-forward completion ticket. CPU staging remains owned until the copied
+send consumes it. Abort, retraction or session reset may invalidate the payload
+but cannot retire either allocation before its use completes. Bound tickets,
+resident sessions, staging slots, frame bytes and queued bytes together; a ZMQ
+message-count limit alone does not bound host memory. Feature snapshots use the
+same cache ownership and restoration rules as live incremental exports.
+
 ## block vs. page
 
 **`block` is the general concept; `page` is its specialization under

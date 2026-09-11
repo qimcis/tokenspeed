@@ -86,6 +86,9 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
     # Declared here as well as on AttentionBackend: the refactor made the two
     # separate roots, so a paged leaf inherits only this one.
     supports_layer_sliding_window: bool = False
+    # A variable target width requires width-keyed metadata views. Leaves
+    # opt in only after their view builder satisfies that contract.
+    supports_variable_decode_width: bool = False
 
     @classmethod
     def resolve_kernel_page_size(
@@ -114,6 +117,7 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         self.dtype = config.dtype
         self.is_draft = bool(config.is_draft)
         self.spec_num_tokens = max(int(config.speculative_num_draft_tokens or 1), 1)
+        self._prepared_decode_width: int | None = None
         self.max_context_len = int(config.context_len)
         if kernel_page_size <= 0:
             raise ValueError(
@@ -129,7 +133,7 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         # per-bs metadata views over them (each leaf's ``_decode_views``).
         self.page_table_buf: torch.Tensor | None = None
         self.seq_lens_buf: torch.Tensor | None = None
-        self._decode_views_by_bs: dict[int, Any] = {}
+        self._decode_views_by_bs: dict[int | tuple[int, int], Any] = {}
 
     # ------------------------------------------------------------------
     # Static shape / lifecycle
@@ -141,6 +145,7 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         self.page_table_buf = None
         self.seq_lens_buf = None
         self._decode_views_by_bs = {}
+        self._prepared_decode_width = None
 
     def configure_runtime(self, **kwargs) -> None:
         """Post-load configuration hook (e.g. sliding window sizes)."""
@@ -150,6 +155,38 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         leaves keep attention eager at the break points and need none."""
 
     @property
+    def prepared_decode_width(self) -> int:
+        """The width selected for the next metadata publication.
+
+        This is per-forward metadata state, not model configuration. Cached
+        metadata objects retain their own width when another is selected.
+        """
+        width = getattr(self, "_prepared_decode_width", None)
+        return self.spec_num_tokens if width is None else width
+
+    def prepare_decode_width(self, tokens_per_req: int) -> None:
+        """Select query width before capture, refresh, or mixed metadata init.
+
+        Args:
+            tokens_per_req: Actual query rows per request, bounded by the
+                configured persistent-buffer capacity. Unsupported varying
+                widths fail before metadata or write locations are published.
+        """
+        if not 1 <= tokens_per_req <= self.spec_num_tokens:
+            raise ValueError(
+                f"{type(self).__name__}: decode width {tokens_per_req} exceeds "
+                f"the configured range [1, {self.spec_num_tokens}]"
+            )
+        if (
+            tokens_per_req != self.spec_num_tokens
+            and not self.supports_variable_decode_width
+        ):
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support variable decode widths"
+            )
+        self._prepared_decode_width = tokens_per_req
+
+    @property
     def verify_floor(self) -> int:
         """Minimum per-request cache seq_len decode metadata must present.
 
@@ -157,7 +194,7 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         requests need ``seq_len >= N``; plain decode and drafts have floor 1,
         where the clamp is the identity.
         """
-        return self.spec_num_tokens if not self.is_draft else 1
+        return self.prepared_decode_width if not self.is_draft else 1
 
     @property
     def block_decode_active(self) -> bool:

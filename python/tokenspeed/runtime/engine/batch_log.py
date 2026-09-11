@@ -59,7 +59,7 @@ class BatchLogger:
         decode_log_interval: Rounds between two "Decode batch." lines.
         num_total_pages: Device KV pages, for the active/total page ratio.
         spec_num_steps: Draft steps per verify, 0 when speculation is off.
-        spec_num_tokens: Verify width, used by the accept-length debug log.
+        spec_num_tokens: Maximum configured verify width; each commit supplies its actual width.
         cache_state_group_ids: State-family cache-group ids, appended to
             each decode line at DEBUG. Empty for pools with no such group.
         cache_group_pages: ``group_id -> (total, available)`` page counts,
@@ -89,7 +89,9 @@ class BatchLogger:
         self._seen_prefill_ids: set[str] = set()
         # Decode throughput window: committed tokens since the last line.
         self._num_generated_tokens = 0
-        self._num_decode_steps = 0
+        self._num_spec_steps = 0
+        self._num_spec_tokens = 0
+        self._num_candidate_tokens = 0
         self._last_decode_tic = time.time()
 
     def log_dispatch(self, forward_op, stats: dict) -> None:
@@ -139,8 +141,13 @@ class BatchLogger:
         gap = now - self._last_decode_tic
         gen_throughput = self._num_generated_tokens / gap if gap > 0 else 0
         avg_accept = (
-            self._num_generated_tokens / self._num_decode_steps
-            if self._num_decode_steps > 0
+            self._num_spec_tokens / self._num_spec_steps
+            if self._num_spec_steps > 0
+            else 0
+        )
+        accept_rate = (
+            (self._num_spec_tokens - self._num_spec_steps) / self._num_candidate_tokens
+            if self._num_candidate_tokens > 0
             else 0
         )
         num_active_pages = stats["num_active_pages"]
@@ -160,7 +167,7 @@ class BatchLogger:
                 page_ratio,
                 gen_throughput,
                 avg_accept,
-                (avg_accept - 1) / self._spec_num_steps,
+                accept_rate,
                 stats["num_queue_reqs"],
             )
         else:
@@ -179,7 +186,9 @@ class BatchLogger:
             )
         self._log_cache_state_group_pages()
         self._num_generated_tokens = 0
-        self._num_decode_steps = 0
+        self._num_spec_steps = 0
+        self._num_spec_tokens = 0
+        self._num_candidate_tokens = 0
         self._last_decode_tic = now
 
     def _log_cache_state_group_pages(self) -> None:
@@ -201,15 +210,28 @@ class BatchLogger:
             )
         logger.debug("Cache state group pages. %s", "; ".join(parts))
 
-    def record_decode(self, results, bs: int) -> None:
+    def record_decode(self, results, bs: int, *, decode_input_tokens: int) -> None:
         """Fold one committed decode step into the throughput window.
 
-        Reads host tensors of an already-synced result — no GPU sync.
+        Reads host tensors of an already-synced result — no GPU sync. All
+        committed tokens contribute to throughput. Speculative acceptance
+        excludes width-one fallback and divides accepted draft tokens by the
+        actual candidate count, rather than the native drafter horizon.
+
+        Args:
+            results: Already-synchronized CPU output tensors.
+            bs: Number of real request slots in this decode batch.
+            decode_input_tokens: Immutable target width selected by its plan.
         """
         accept_lengths = results.output_lengths
-        self._num_generated_tokens += int(accept_lengths.sum().item())
-        self._num_decode_steps += bs
-        if not (LOG_SPEC_ACCEPT_LENGTHS and self._enabled and self._spec_num_steps):
+        committed_tokens = int(accept_lengths.sum().item())
+        self._num_generated_tokens += committed_tokens
+        if decode_input_tokens <= 1:
+            return
+        self._num_spec_steps += bs
+        self._num_spec_tokens += committed_tokens
+        self._num_candidate_tokens += bs * (decode_input_tokens - 1)
+        if not (LOG_SPEC_ACCEPT_LENGTHS and self._enabled):
             return
         accepted_widths = [int(value) for value in accept_lengths.tolist()]
         logger.info(
@@ -220,7 +242,7 @@ class BatchLogger:
         candidates = results.spec_candidate_tokens
         if candidates is None:
             return
-        verify_width = int(self._spec_num_tokens)
+        verify_width = int(decode_input_tokens)
         candidate_rows = candidates.view(bs, verify_width)
         target_rows = results.output_tokens.view(bs, verify_width)
         # Candidate column j+1 is verified by the target token sampled from

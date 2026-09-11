@@ -51,6 +51,7 @@ from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.spec_block_geometry import (
     read_checkpoint_block_size,
+    resolve_verify_width,
     validate_block_widths,
 )
 
@@ -72,23 +73,61 @@ def _resolve_aux_hidden_stream(cfg) -> str:
     return str(stream or "prefix").lower()
 
 
+def configure_dflash_target_capture(target_model, config) -> list[int]:
+    """Install the checkpoint's ordered taps and residual stream on a target.
+
+    This static wiring is shared by local drafting and projector-only remote
+    serving. It does not arm incremental projection or construct a drafter.
+
+    Args:
+        target_model: Loaded target exposing the DFlash capture contract.
+        config: Draft checkpoint configuration.
+
+    Returns:
+        The target layer IDs, in the order consumed by the projection.
+    """
+    nested = getattr(config, "dflash_config", {}) or {}
+    layers = nested.get("target_layer_ids") or getattr(config, "target_layer_ids", None)
+    layer_ids = [int(layer) for layer in (layers or [])]
+    if not layer_ids:
+        raise ValueError("DFLASH draft config must define target_layer_ids.")
+    if not hasattr(target_model, "set_dflash_layers_to_capture"):
+        raise ValueError(
+            "DFLASH requires the target model to support "
+            "set_dflash_layers_to_capture."
+        )
+    target_model.set_dflash_layers_to_capture(layer_ids)
+    stream = _resolve_aux_hidden_stream(config)
+    setter = getattr(target_model, "set_dflash_aux_hidden_stream", None)
+    if setter is not None:
+        setter(stream)
+    elif stream != "prefix":
+        raise ValueError(
+            f"The draft asks for the {stream!r} target hidden stream but "
+            f"{type(target_model).__name__} does not implement "
+            "set_dflash_aux_hidden_stream, so it can only supply 'prefix'."
+        )
+    return layer_ids
+
+
 def _resolve_block_geometry(
     cfg, spec_num_tokens: int, spec_algorithm: str
 ) -> tuple[int, int]:
-    """Resolve (verify_width, draft_block_size) for a block drafter.
+    """Resolve the native output width and proposal count for a block drafter.
 
     Args:
         cfg: The draft model's config.
-        spec_num_tokens: The verify width, one anchor row plus one row per
+        spec_num_tokens: The native width, one anchor row plus one row per
             drafted token, so ``draft_block_size = spec_num_tokens - 1``.
         spec_algorithm: ``"DFLASH"`` or ``"DSPARK"``; selects which
             ``block_size`` convention the checkpoint is held to.
 
     Returns:
-        ``(verify_width, draft_block_size)``.
+        ``(native_width, draft_block_size)``. Target prefix consumption is
+        resolved independently by ``resolve_verify_width``.
 
     Raises:
-        ValueError: The verify width leaves no room for a draft, or the
+        ValueError: The native width leaves no room for a draft, or the
             checkpoint was trained at a different block size.
     """
     verify_width = int(spec_num_tokens)
@@ -171,14 +210,16 @@ class DFlash(BaseDrafter):
                 "DFLASH draft config must define dflash_config.mask_token_id."
             )
         self.mask_token_id = int(mask_token_id)
-        self.verify_width, self.draft_block_size = _resolve_block_geometry(
-            cfg, int(spec_num_tokens), self.spec_algorithm
+        self.native_spec_num_tokens, self.draft_block_size = _resolve_block_geometry(
+            cfg, int(spec_num_steps) + 1, self.spec_algorithm
+        )
+        self.verify_width = resolve_verify_width(
+            self.native_spec_num_tokens, spec_num_tokens
         )
         self.draft_query_width = _resolve_draft_query_width(
-            self.verify_width, self.sample_from_anchor
+            self.native_spec_num_tokens, self.sample_from_anchor
         )
-        # Legacy alias: callers that predate the verify/draft split.
-        self.block_size = self.verify_width
+        self.block_size = self.native_spec_num_tokens
         self.hidden_size = int(getattr(cfg, "hidden_size"))
         self.idle_forward_steps = 1
         self._init_native_buffers()
@@ -265,6 +306,15 @@ class DFlash(BaseDrafter):
         self.next_tokens_buf = torch.empty(
             (max_bs, self.spec_num_tokens), dtype=torch.int32, device=self.device
         )
+        self.native_next_tokens_buf = (
+            self.next_tokens_buf
+            if self.native_spec_num_tokens == self.verify_width
+            else torch.empty(
+                (max_bs, self.native_spec_num_tokens),
+                dtype=torch.int32,
+                device=self.device,
+            )
+        )
         self.current_tokens_buf = torch.empty(
             (max_bs,), dtype=torch.int32, device=self.device
         )
@@ -281,29 +331,24 @@ class DFlash(BaseDrafter):
         language_model = getattr(target_model, "language_model", target_model)
         self.target_model = target_model
         self.target_language_model = language_model
-        self.embed_tokens = target_model.get_input_embeddings()
-        self.lm_head = target_model.lm_head
-        self.logits_processor = language_model.logits_processor
-        if not hasattr(target_model, "set_dflash_layers_to_capture"):
-            raise ValueError(
-                "DFLASH requires the target model to support "
-                "set_dflash_layers_to_capture."
-            )
-        target_model.set_dflash_layers_to_capture(self.target_layer_ids)
-        self._wire_aux_hidden_stream(target_model)
+        self.bind_vocabulary(
+            target_model.get_input_embeddings(),
+            target_model.lm_head,
+            language_model.logits_processor,
+        )
+        configure_dflash_target_capture(target_model, self.model.config)
 
-    def _wire_aux_hidden_stream(self, target_model) -> None:
-        """Tell the target which residual stream the draft was trained on."""
-        stream = _resolve_aux_hidden_stream(self.model.config)
-        setter = getattr(target_model, "set_dflash_aux_hidden_stream", None)
-        if setter is not None:
-            setter(stream)
-        elif stream != "prefix":
-            raise ValueError(
-                f"The draft asks for the {stream!r} target hidden stream but "
-                f"{type(target_model).__name__} does not implement "
-                "set_dflash_aux_hidden_stream, so it can only supply 'prefix'."
-            )
+    def bind_vocabulary(self, embed_tokens, lm_head, logits_processor) -> None:
+        """Bind independently loaded vocabulary weights for native drafting.
+
+        Args:
+            embed_tokens: TokenSpeed vocabulary embedding module.
+            lm_head: Matching target vocabulary head, with its shard metadata.
+            logits_processor: Processor describing the vocabulary parallel group.
+        """
+        self.embed_tokens = embed_tokens
+        self.lm_head = lm_head
+        self.logits_processor = logits_processor
 
     def _probe_dist_argmax_state(self, dtype: torch.dtype, device: torch.device):
         """Ask for a drafting state, once the head's shard is a fit for one."""
@@ -320,7 +365,7 @@ class DFlash(BaseDrafter):
             return None
         return self.logits_processor.acquire_dist_argmax_state(
             head,
-            max_M=self.input_buffers.max_bs * max(self.spec_num_tokens - 1, 1),
+            max_M=self.input_buffers.max_bs * self.draft_block_size,
             # Back-to-back walk rounds carry no cross-rank sync between them,
             # which skip_ping_pong would require.
             skip_ping_pong=False,
@@ -339,12 +384,12 @@ class DFlash(BaseDrafter):
         """Max element count for the greedy head's tensor-parallel all-gather
         scratch: a full ``max_bs`` decode block.
 
-        The greedy head samples the last ``spec_num_tokens - 1`` block
+        The greedy head samples the last ``native_spec_num_tokens - 1`` block
         positions per request and all-gathers them across the TP group, so the
-        worst case is ``tp_size * max_bs * (spec_num_tokens - 1)``.
+        worst case is ``tp_size * max_bs * draft_block_size``.
         """
         tp_size = int(self.logits_processor.tp_size)
-        return tp_size * self.input_buffers.max_bs * max(self.spec_num_tokens - 1, 1)
+        return tp_size * self.input_buffers.max_bs * self.draft_block_size
 
     def _ensure_greedy_gather_buffers(
         self,
@@ -541,12 +586,13 @@ class DFlash(BaseDrafter):
             )
 
         bs = base_ctx.bs
-        # The target verify forward emits spec_num_tokens hidden states per
+        # The target forward emits its active width of hidden states per
         # decode request (the candidate block); input_lengths_buf only tracks
         # the committed-token count there, so split decode rows by
-        # spec_num_tokens. Prefill rows keep their real chunk lengths.
+        # active width. Prefill rows keep their real chunk lengths.
+        verify_width = self._target_verify_width(base_ctx)
         lengths = self.input_buffers.input_lengths_buf[:bs].to(torch.int64).clone()
-        lengths[base_ctx.num_extends :] = self.spec_num_tokens
+        lengths[base_ctx.num_extends :] = verify_width
         req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
         positions = self.input_buffers.positions_buf[: base_ctx.input_num_tokens]
         # The TARGET round's write vector, from the target router (the pools
@@ -588,7 +634,7 @@ class DFlash(BaseDrafter):
             takes[base_ctx.num_extends :] = (
                 accept_lengths[base_ctx.num_extends : bs]
                 .to(torch.int64)
-                .clamp(min=0, max=self.spec_num_tokens)
+                .clamp(min=0, max=verify_width)
             )
         last_row = (starts + takes - 1).clamp(min=0, max=base_ctx.input_num_tokens - 1)
         old_lens = self.runtime_states.valid_cache_lengths.index_select(
@@ -1161,6 +1207,7 @@ class DFlash(BaseDrafter):
         return current
 
     def draft(self, current_tokens: torch.Tensor) -> torch.Tensor:
+        self.block_ids_buf[: current_tokens.shape[0], 0].copy_(current_tokens)
         return self._draft_native(current_tokens)
 
     @nvtx_range("dflash_native_draft", color="purple")
@@ -1222,6 +1269,7 @@ class DFlash(BaseDrafter):
             bs=bs,
             num_extends=metadata_num_extends,
             input_num_tokens=bs * self.draft_query_width,
+            decode_input_tokens=self.draft_query_width,
             forward_mode=ForwardMode.DECODE,
             capture_hidden_mode=CaptureHiddenMode.FULL,
         )
@@ -1246,8 +1294,20 @@ class DFlash(BaseDrafter):
             )
         draft_hidden = draft_hidden.view(bs, self.draft_query_width, self.hidden_size)
 
+        native_tokens = self.native_next_tokens_buf[:bs]
+        self._sample_block(draft_hidden, block_ids, native_tokens)
+        if self.native_spec_num_tokens == self.verify_width:
+            return native_tokens
+        # Complete the trained block and selector before consuming a prefix.
+        # A compact target buffer preserves the request-major row stride.
         next_tokens = self.next_tokens_buf[:bs]
-        return self._sample_block(draft_hidden, block_ids, next_tokens)
+        next_tokens.copy_(native_tokens[:, : self.verify_width])
+        return next_tokens
+
+    def _target_verify_width(self, ctx: ForwardContext) -> int:
+        """Read this forward's immutable target width, including N1 fallback."""
+        width = getattr(ctx, "decode_input_tokens", None)
+        return self.spec_num_tokens if width is None else int(width)
 
     def _sample_block(
         self,
@@ -1298,7 +1358,7 @@ class DFlash(BaseDrafter):
                 draft_seq_lens=self.draft_seq_lens_buf[:bs],
                 block_ids=self.block_ids_buf[:bs],
                 block_positions=self.block_positions_buf[:bs],
-                verify_width=self.spec_num_tokens,
+                verify_width=self._target_verify_width(base_ctx),
                 draft_query_width=self.draft_query_width,
                 max_draft_prefix=max_draft_prefix,
             )
@@ -1308,7 +1368,7 @@ class DFlash(BaseDrafter):
             output_tokens,
             accept_lengths,
             base_ctx.num_extends,
-            self.spec_num_tokens,
+            self._target_verify_width(base_ctx),
             out=current_tokens,
         )
         return self.draft(current_tokens)
@@ -1342,7 +1402,7 @@ class DFlash(BaseDrafter):
             draft_seq_lens=self.draft_seq_lens_buf[:bs],
             block_ids=self.block_ids_buf[:bs],
             block_positions=self.block_positions_buf[:bs],
-            verify_width=self.spec_num_tokens,
+            verify_width=self._target_verify_width(base_ctx),
             draft_query_width=self.draft_query_width,
             max_draft_prefix=max_draft_prefix,
         )

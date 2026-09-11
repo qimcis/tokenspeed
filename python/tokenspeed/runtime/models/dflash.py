@@ -363,7 +363,47 @@ class DFlashDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class DFlashDraftModel(nn.Module):
+class DFlashTargetProjection(nn.Module):
+    """Checkpoint-exact target feature projection without the draft backbone.
+
+    Args:
+        config: Draft checkpoint configuration containing hidden size, ordered
+            target taps and normalization epsilon. Parameters retain the
+            checkpoint's ``fc.weight`` and ``hidden_norm.weight`` names.
+    """
+
+    def __init__(self, config) -> None:
+        super().__init__()
+        self.config = config
+        self.hidden_size = int(config.hidden_size)
+        eps = float(getattr(config, "rms_norm_eps", 1e-6))
+        target_layer_ids = (getattr(config, "dflash_config", {}) or {}).get(
+            "target_layer_ids"
+        ) or (getattr(config, "target_layer_ids", None) or [])
+        self.target_layer_ids = [int(layer) for layer in target_layer_ids]
+        self.num_context_features = len(target_layer_ids)
+        self.fc = ReplicatedLinear(
+            self.num_context_features * int(config.hidden_size),
+            int(config.hidden_size),
+            bias=False,
+            prefix="fc",
+        )
+        self.hidden_norm = RMSNorm(int(config.hidden_size), eps=eps)
+
+    def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
+        """Project concatenated ordered target taps into normalized features."""
+        return self.hidden_norm(self.fc(target_hidden)[0])
+
+    @property
+    def context_in_features(self) -> int:
+        return int(self.fc.input_size)
+
+    @property
+    def context_dtype(self) -> torch.dtype:
+        return self.fc.weight.dtype
+
+
+class DFlashDraftModel(DFlashTargetProjection):
     decoder_layer_cls = DFlashDecoderLayer
 
     def __init__(
@@ -373,8 +413,7 @@ class DFlashDraftModel(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
-        super().__init__()
-        self.config = config
+        super().__init__(config)
         self.mapping = mapping
         eps = float(getattr(config, "rms_norm_eps", 1e-6))
         self.layers = nn.ModuleList(
@@ -390,23 +429,8 @@ class DFlashDraftModel(nn.Module):
             ]
         )
         self.norm = RMSNorm(int(config.hidden_size), eps=eps)
-        target_layer_ids = (getattr(config, "dflash_config", {}) or {}).get(
-            "target_layer_ids"
-        ) or (getattr(config, "target_layer_ids", None) or [])
-        self.num_context_features = len(target_layer_ids)
-        self.fc = ReplicatedLinear(
-            self.num_context_features * int(config.hidden_size),
-            int(config.hidden_size),
-            bias=False,
-            prefix=add_prefix("fc", prefix),
-        )
-        self.hidden_norm = RMSNorm(int(config.hidden_size), eps=eps)
-        # Name the DFlash drafter reads off the draft model.
         self.block_size = read_checkpoint_block_size(config)
         self._residual_buffer: torch.Tensor | None = None
-
-    def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
-        return self.hidden_norm(self.fc(target_hidden)[0])
 
     # ------------------------------------------------------------------
     # Context-injection contract
@@ -416,14 +440,6 @@ class DFlashDraftModel(nn.Module):
     # KV is laid out. An MLA draft writes one latent row per token; this GQA
     # draft writes separate K and V.
     # ------------------------------------------------------------------
-
-    @property
-    def context_in_features(self) -> int:
-        return int(self.fc.input_size)
-
-    @property
-    def context_dtype(self) -> torch.dtype:
-        return self.fc.weight.dtype
 
     def write_context_kv(
         self,

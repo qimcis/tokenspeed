@@ -100,6 +100,36 @@ class OrdinaryRecipe(CacheRecipe):
             draft = (FULL_ATTENTION,) * self.num_draft_layers
         return target + draft
 
+    @property
+    def remote_feature_cache_enabled(self) -> bool:
+        return bool(getattr(self.server_args, "remote_draft_endpoint", None))
+
+    @override
+    def groups(self) -> tuple[CacheGroupDeclaration, ...]:
+        groups = super().groups()
+        if not self.remote_feature_cache_enabled:
+            return groups
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.projected_features import (
+            PROJECTED_FEATURE_BLOCKS_PER_PARENT,
+            aliased_projected_feature_group,
+        )
+
+        if self.draft_attn_config is not None:
+            raise ValueError("remote drafting must not allocate local draft KV layers")
+        if self.draft_model_config is None:
+            raise ValueError("remote feature cache requires the draft model config")
+        if len(groups) != 1:
+            raise ValueError("remote features require one target history group")
+        return groups + (
+            aliased_projected_feature_group(
+                target_group=groups[0],
+                blocks_per_parent=PROJECTED_FEATURE_BLOCKS_PER_PARENT,
+                block_granularity=self.prefix_granularity,
+                hidden_size=int(self.model_config.hidden_size),
+                sliding_window=int(self.draft_model_config.hf_config.sliding_window),
+            ),
+        )
+
     # ---- geometry ----
 
     @property
@@ -114,8 +144,22 @@ class OrdinaryRecipe(CacheRecipe):
 
     @override
     def packing(self, groups: tuple[CacheGroupDeclaration, ...]) -> Mapping[str, int]:
-        """One CacheBlock per parent: the block span is the identity grain."""
-        return {spec.group_id: 1 for spec, _ in groups}
+        """Keep layer blocks at one per parent; derive non-layer packing."""
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.projected_features import (
+            PROJECTED_FEATURE_BLOCKS_PER_PARENT,
+            PROJECTED_FEATURE_GROUP,
+        )
+
+        # LCM parents are group-exclusive. Feature blocks alias existing
+        # target planes at fixed packing without enlarging target parents.
+        return {
+            spec.group_id: (
+                PROJECTED_FEATURE_BLOCKS_PER_PARENT
+                if spec.group_id == PROJECTED_FEATURE_GROUP
+                else 1
+            )
+            for spec, _ in groups
+        }
 
     # ---- fields ----
 
@@ -139,6 +183,15 @@ class OrdinaryRecipe(CacheRecipe):
 
     @override
     def num_lcm_blocks(self, layout: CacheLayout) -> int:
+        if self.remote_feature_cache_enabled:
+            # Projected features are another physical consumer: the old
+            # attention-only profiled cell size would overrun this budget.
+            budgeted = self._budgeted_parents(
+                self.cache_budget_bytes - self.workspace_bytes(), layout.lcm_block_bytes
+            )
+            if self.token_limit is None:
+                return budgeted
+            return min(budgeted, self.parents_needed(layout, self.token_limit))
         bytes_per_token = self.attn_config.cache_cell_size() * _storage_layers(
             self.attn_config, self.num_target_layers
         )
@@ -159,6 +212,66 @@ class OrdinaryRecipe(CacheRecipe):
                 self.cache_budget_bytes, bytes_per_token * parent_tokens
             ),
             parent_tokens=parent_tokens,
+        )
+
+    @override
+    def workspace_bytes(self) -> int:
+        if not self.remote_feature_cache_enabled:
+            return super().workspace_bytes()
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.projected_features import (
+            projected_feature_workspace_bytes,
+        )
+
+        decode_tokens = self.attn_config.max_bs * self.decode_input_tokens
+        forward_tokens = max(int(self.server_args.chunked_prefill_size), decode_tokens)
+        graph_enabled = not self.server_args.enforce_eager
+        prefill_graph_enabled = (
+            graph_enabled
+            and not self.server_args.disable_prefill_graph
+            and self.server_args.all2all_backend in (None, "none")
+            and self.server_args.prefill_graph_max_tokens != 0
+        )
+        # The configured chunk is an upper bound on every prefill graph bucket.
+        # Avoid depending on execution's default-bucket policy in the cache recipe.
+        prefill_graph_tokens = (
+            min(
+                (
+                    int(self.server_args.prefill_graph_max_tokens)
+                    if self.server_args.prefill_graph_max_tokens is not None
+                    else forward_tokens
+                ),
+                forward_tokens,
+            )
+            if prefill_graph_enabled
+            else 0
+        )
+        address_workspace = projected_feature_workspace_bytes(
+            hidden_size=int(self.model_config.hidden_size),
+            window_left=int(self.draft_model_config.hf_config.sliding_window) - 1,
+            max_forward_tokens=forward_tokens,
+            max_decode_graph_tokens=decode_tokens if graph_enabled else 0,
+            max_prefill_graph_tokens=prefill_graph_tokens,
+        )
+        feature_table_columns = (
+            self.attn_config.context_len + self.prefix_granularity - 1
+        ) // self.prefix_granularity
+        feature_metadata_bytes = self.attn_config.max_bs * (
+            feature_table_columns * 4 + 1
+        )
+        return address_workspace + feature_metadata_bytes
+
+    @override
+    def token_capacity(self, layout: CacheLayout, num_lcm_blocks: int) -> int:
+        if not self.remote_feature_cache_enabled:
+            return super().token_capacity(layout, num_lcm_blocks)
+        # Attention history and the feature window acquire distinct group
+        # blocks from the same LCM allocator. Charge both demands, including
+        # live windows, prefill chunks and overlapped decode reservations.
+        upper_bound = super().token_capacity(layout, num_lcm_blocks)
+        if self.token_limit is not None:
+            upper_bound = min(upper_bound, self.token_limit)
+        return self._capacity_from_parents(
+            layout, num_lcm_blocks, upper_bound=upper_bound
         )
 
 

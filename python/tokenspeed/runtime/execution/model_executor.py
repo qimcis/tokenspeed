@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -57,6 +57,7 @@ from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
     ModelExecutionResult,
+    resolve_decode_input_tokens,
 )
 from tokenspeed.runtime.execution.workspace import workspace_pool
 from tokenspeed.runtime.grammar.capturable_grammar import (
@@ -92,6 +93,7 @@ from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.draft_pool.features import RemoteFeatureCapture
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
@@ -190,9 +192,10 @@ class ModelExecutorConfig:
     pp_group: tuple[int, ...] | None = None
 
     # ====== SPEC =========
+    remote_draft: bool = False
     spec_algo: str | None = None
     spec_num_steps: int | None = None
-    # spec_num_tokens == spec_num_steps + 1 for now (without Tree Attention)
+    # Maximum target verification width; native proposal width belongs to the drafter.
     spec_num_tokens: int | None = None
     overlap_schedule_depth: int = 0
     dp_sampling: bool = False
@@ -224,7 +227,10 @@ class ModelExecutorConfig:
         overlap_schedule_depth: int = 0,
     ) -> ModelExecutorConfig:
         output_length = (
-            server_args.speculative_num_draft_tokens
+            (
+                getattr(server_args, "speculative_verify_tokens", None)
+                or server_args.speculative_num_draft_tokens
+            )
             if server_args.speculative_algorithm
             else 1
         )
@@ -292,7 +298,8 @@ class ModelExecutorConfig:
             ),
             spec_algo=server_args.speculative_algorithm,
             spec_num_steps=server_args.speculative_num_steps,
-            spec_num_tokens=server_args.speculative_num_draft_tokens,
+            spec_num_tokens=output_length,
+            remote_draft=bool(getattr(server_args, "remote_draft_endpoint", None)),
             overlap_schedule_depth=overlap_schedule_depth,
             dp_sampling=server_args.dp_sampling,
             dp_sampling_min_bs=server_args.dp_sampling_min_bs,
@@ -317,6 +324,10 @@ class ModelExecutor:
         draft_model_runner: ModelRunner | None = None,
         draft_attn_backend: AttentionBackend | None = None,
         draft_token_to_kv_pool: CachePool | None = None,
+        *,
+        remote_feature_capture_factory: (
+            Callable[[InputBuffers], RemoteFeatureCapture] | None
+        ),
     ):
         self.device = config.device
         self.config = config
@@ -347,6 +358,13 @@ class ModelExecutor:
             state_write_padding_pool_index=config.max_req_pool_size,
             device=self.device,
         )
+        self.remote_feature_capture = (
+            remote_feature_capture_factory(self.input_buffers)
+            if remote_feature_capture_factory is not None
+            else None
+        )
+        if config.remote_draft and self.remote_feature_capture is None:
+            raise ValueError("remote drafting requires target feature capture")
         self.runtime_states = RuntimeStates(
             req_pool_size=config.max_req_pool_size,
             vocab_size=config.vocab_size,
@@ -359,7 +377,7 @@ class ModelExecutor:
             max_bs,
             self.device,
         )
-        if self.config.spec_algo is not None:
+        if self.config.spec_algo is not None and not config.remote_draft:
             # Model-to-model wiring (shared embed/head, eagle3 capture ids)
             # already happened in create_model_runner, right after both
             # models loaded. Here only the drafter instance is built and
@@ -382,15 +400,37 @@ class ModelExecutor:
         else:
             self.drafter = None
 
-        self.grammar_runtime = create_grammar_runtime(
-            grammar_backend=config.grammar_backend,
-            disable_capturable=config.disable_capturable_grammar,
-            is_nvidia=current_platform().is_nvidia,
-            max_bs=max_bs,
-            vocab_size=config.vocab_size,
-            max_tokens_per_req=spec_num_tokens,
-            device=self.device,
+        self.decode_widths = (
+            tuple(sorted({1, config.output_length}))
+            if config.remote_draft
+            else (config.output_length,)
         )
+        self.grammar_runtimes = {
+            width: create_grammar_runtime(
+                grammar_backend=config.grammar_backend,
+                disable_capturable=config.disable_capturable_grammar,
+                is_nvidia=current_platform().is_nvidia,
+                max_bs=max_bs,
+                vocab_size=config.vocab_size,
+                max_tokens_per_req=width,
+                device=self.device,
+            )
+            for width in self.decode_widths
+        }
+        self.grammar_runtime = self.grammar_runtimes[config.output_length]
+        self.mixed_grammar_runtimes = {
+            width: create_grammar_runtime(
+                grammar_backend=config.grammar_backend,
+                disable_capturable=True,
+                is_nvidia=current_platform().is_nvidia,
+                max_bs=max_bs,
+                vocab_size=config.vocab_size,
+                max_tokens_per_req=width,
+                device=self.device,
+            )
+            for width in self.decode_widths
+            if width > 1
+        }
 
         attn_backend.configure_runtime(
             cache_group_specs=tuple(token_to_kv_pool.arena.cache_group_specs),
@@ -459,6 +499,12 @@ class ModelExecutor:
             sampling_backend=self.sampling_backend,
             runtime_states=self.runtime_states,
             decode_graph_supported=graph_support.decode_graph,
+            grammar_runtimes=self.grammar_runtimes,
+            prepare_target_capture=(
+                self.remote_feature_capture.prepare_batch
+                if self.remote_feature_capture is not None
+                else None
+            ),
         )
         # Eager warmup can be DP-asymmetric; prewarm RSAG under uniform dummy inputs.
         if config.enforce_eager:
@@ -602,6 +648,26 @@ class ModelExecutor:
         torch.get_device_module(self.device).synchronize()
         dist.barrier()
         logger.info(f"Kernel tuning finished in {time.time() - tic:.1f}s")
+
+    def _grammar_for_context(self, ctx: ForwardContext):
+        width = getattr(ctx, "decode_input_tokens", None) or self.config.output_length
+        if 0 < ctx.num_extends < ctx.bs and width > 1:
+            return self.mixed_grammar_runtimes[width]
+        return getattr(self, "grammar_runtimes", {}).get(width, self.grammar_runtime)
+
+    def _grammar_candidate_inputs(self, ctx: ForwardContext) -> torch.Tensor:
+        """Pack mixed candidate rows for the existing uniform grammar walker.
+
+        Only the first mask of each prefill row is consumed. Decode rows keep
+        the full selected candidate window. Mixed forwards are eager, so this
+        temporary cannot become a captured address.
+        """
+        width = ctx.decode_input_tokens or self.config.output_length
+        if not (width > 1 and 0 < ctx.num_extends < ctx.bs):
+            return self.input_buffers.input_ids_buf
+        rows = self.input_buffers.input_ids_buf.new_ones((ctx.bs, width))
+        rows[ctx.num_extends :] = self._decode_candidates(ctx)
+        return rows.reshape(-1)
 
     @property
     def capturable_grammar(self):
@@ -760,7 +826,7 @@ class ModelExecutor:
         num_decodes = ctx.bs - ctx.num_extends
         if num_decodes == 0:
             return None
-        n = self.config.output_length
+        n = getattr(ctx, "decode_input_tokens", None) or self.config.output_length
         num_prefill_tokens = ctx.input_num_tokens - num_decodes * n
         return self.input_buffers.input_ids_buf[
             num_prefill_tokens : ctx.input_num_tokens
@@ -798,8 +864,15 @@ class ModelExecutor:
 
         logits = logits_output.next_token_logits
         prefill_out = LogitsProcessorOutput(next_token_logits=logits[:num_extends])
+        prefill_info = sampling_info[:num_extends]
+        decode_info = sampling_info[num_extends:]
+        if sampling_info.vocab_mask is not None:
+            width = ctx.decode_input_tokens or self.config.output_length
+            masks = sampling_info.vocab_mask.reshape(ctx.bs, width, -1)
+            prefill_info.vocab_mask = masks[:num_extends, 0].contiguous()
+            decode_info.vocab_mask = masks[num_extends:].reshape(-1, masks.shape[-1])
         prefill_tokens, prefill_accept = self.sampling_backend.sample(
-            prefill_out, sampling_info[:num_extends]
+            prefill_out, prefill_info
         )
         # sample() lands its outputs (tokens, accept lengths and, with output
         # logprobs on, the selected logprobs) in the backend's packed output
@@ -812,7 +885,7 @@ class ModelExecutor:
             prefill_out.next_token_logprobs = prefill_out.next_token_logprobs.clone()
         decode_out = LogitsProcessorOutput(next_token_logits=logits[num_extends:])
         decode_tokens, decode_accept = self.sampling_backend.verify(
-            decode_out, sampling_info[num_extends:], candidates
+            decode_out, decode_info, candidates
         )
         decode_accept = self._apply_force_single_token_verify(
             decode_accept, num_extends, num_decodes, ctx.decode_input_ids
@@ -877,20 +950,34 @@ class ModelExecutor:
         ctx: ForwardContext,
         sampling_info: SamplingBatchInfo,
     ):
+        grammar_runtime = self._grammar_for_context(ctx)
+        from tokenspeed.runtime.grammar.capturable_grammar import (
+            CapturableGrammarExecutor,
+        )
+
+        capturable_grammar = (
+            grammar_runtime
+            if isinstance(grammar_runtime, CapturableGrammarExecutor)
+            else None
+        )
         # Fork grammar onto its side stream so fill + H2D overlap with
         # attention/MoE. Rejoined at wait_bitmask() before apply_mask.
-        if self.capturable_grammar is not None:
-            n = self.capturable_grammar.max_tokens_per_req
+        if capturable_grammar is not None:
+            n = capturable_grammar.max_tokens_per_req
             is_spec_verify = n > 1 and ctx.forward_mode.is_decode()
             slice_ = (
                 self.input_buffers.input_ids_buf[: bs * n] if is_spec_verify else None
             )
-            self.capturable_grammar.schedule_fill(input_ids_buf_slice=slice_)
+            capturable_grammar.schedule_fill(input_ids_buf_slice=slice_)
 
         if self.drafter is not None:
             self.drafter.prepare_target_forward(ctx)
 
+        if getattr(self, "remote_feature_capture", None) is not None:
+            self.remote_feature_capture.prepare_target_forward(ctx)
         logits_output = self._run_target_forward(ctx)
+        if getattr(self, "remote_feature_capture", None) is not None:
+            self.remote_feature_capture.capture(ctx, logits_output)
 
         if self.config.pp_size > 1 and not self._pp_is_last_stage:
             # Mid-pipeline stage: the model returned the boundary bundle, not
@@ -906,8 +993,8 @@ class ModelExecutor:
 
         candidates = self._decode_candidates(ctx)
 
-        if self.capturable_grammar is not None:
-            self.capturable_grammar.wait_bitmask()
+        if capturable_grammar is not None:
+            capturable_grammar.wait_bitmask()
 
         output_tokens, accept_lengths = self._run_sampling(
             logits_output, sampling_info, ctx, candidates
@@ -920,8 +1007,8 @@ class ModelExecutor:
 
         # Fork sampler-output D2H onto the grammar side stream so the
         # next step's build hostfunc can advance the matcher.
-        if self.capturable_grammar is not None:
-            self.capturable_grammar.schedule_post_sampler(output_tokens, accept_lengths)
+        if capturable_grammar is not None:
+            capturable_grammar.schedule_post_sampler(output_tokens, accept_lengths)
 
         if self.drafter is not None:
             next_round_input_ids = self.drafter.run(
@@ -956,15 +1043,8 @@ class ModelExecutor:
         explicit stream synchronization (see execute_forward_op).
         """
         if self.drafter is None:
-            # Without drafter, store output tokens for next round.
-            # With drafter, _forward_step already wrote the drafter's
-            # next-round input (verified + draft tokens) to future_input_map.
-            tokens_per_req = self.config.output_length if num_extends == 0 else 1
-            next_round_input_ids = output_tokens.to(torch.int32).reshape(
-                -1, tokens_per_req
-            )
-            self.runtime_states.future_input_map[req_pool_indices, :tokens_per_req] = (
-                next_round_input_ids
+            self.runtime_states.update_next_anchors(
+                req_pool_indices, output_tokens, accept_lengths, num_extends
             )
 
         bs = req_pool_indices.shape[0]
@@ -993,6 +1073,19 @@ class ModelExecutor:
         ranks do. The MoE all-to-all is a collective that requires ALL
         ranks to participate.
         """
+        width = dp_metadata.decode_graph_width or (
+            1 if self.config.remote_draft else self.config.output_length
+        )
+        grammar_runtime = self.grammar_runtimes[width]
+        from tokenspeed.runtime.grammar.capturable_grammar import (
+            CapturableGrammarExecutor,
+        )
+
+        capturable_grammar = (
+            grammar_runtime
+            if isinstance(grammar_runtime, CapturableGrammarExecutor)
+            else None
+        )
         graph_forward_mode = ForwardMode.DECODE
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
@@ -1004,6 +1097,9 @@ class ModelExecutor:
             global_num_tokens=dp_metadata.global_num_tokens,
             global_bs=dp_metadata.global_batch_size,
             all_decode_or_idle=dp_metadata.all_decode_or_idle,
+            decode_input_tokens=width,
+            global_decode_input_tokens=dp_metadata.global_decode_input_tokens,
+            decode_graph_width=dp_metadata.decode_graph_width,
         )
         sampling_info = SamplingBatchInfo(
             req_pool_indices=self.input_buffers.req_pool_indices_buf[:0],
@@ -1015,12 +1111,12 @@ class ModelExecutor:
             padded_bs = self.forward_step.padded_bs(bs=0, ctx=ctx)
             self.input_buffers.fill_dummy_decode_buffers(
                 batch_size=padded_bs,
-                total_tokens=padded_bs * self.config.output_length,
+                total_tokens=padded_bs * width,
             )
             # Captured hostfunc pops one entry per replay; push a dummy
             # for this idle replay, same as run_once.
-            if self.capturable_grammar is not None:
-                self.capturable_grammar.add_batch(
+            if capturable_grammar is not None:
+                capturable_grammar.add_batch(
                     grammars=[None] * padded_bs, bs=padded_bs, has_candidates=False
                 )
             # IDLE doesn't produce tokens, so no sampler/drafter call here —
@@ -1225,6 +1321,22 @@ class ModelExecutor:
         self.log_step += 1
         num_extends = forward_op.num_extends()
         total_tokens = sum(forward_op.input_lengths)
+        decode_width = resolve_decode_input_tokens(
+            forward_op, self.config.output_length
+        )
+        if self.config.remote_draft and num_extends < len(forward_op.request_ids):
+            if decode_width not in self.decode_widths:
+                raise ValueError("unsupported remote verification width")
+            if decode_width > 1 and (
+                len(forward_op.spec_candidate_ids)
+                != len(forward_op.request_ids) - num_extends
+                or any(
+                    len(row) != decode_width for row in forward_op.spec_candidate_ids
+                )
+            ):
+                raise ValueError(
+                    "remote verification requires candidates for every decode row"
+                )
         self._active_multimodal_context = multimodal_context
         self._active_positions_override = None
         timing_enabled = LOG_MM_TIMING
@@ -1299,10 +1411,10 @@ class ModelExecutor:
                 gather_ids = None
                 if num_extends > 0:
                     num_decodes = bs - num_extends
-                    if self.drafter is not None and num_decodes > 0:
+                    if decode_width > 1 and num_decodes > 0:
                         # MIXED + spec: prefill rows pruned to last token,
                         # decode block kept full at verify width.
-                        num_decode_tokens = num_decodes * self.config.spec_num_tokens
+                        num_decode_tokens = num_decodes * decode_width
                         num_prefill_tokens = total_tokens - num_decode_tokens
                         gather_ids = torch.empty(
                             num_extends + num_decode_tokens,
@@ -1342,10 +1454,12 @@ class ModelExecutor:
                     capture_hidden_mode=(
                         CaptureHiddenMode.FULL
                         if self.drafter is not None
+                        or self.remote_feature_capture is not None
                         else CaptureHiddenMode.NULL
                     ),
                     gather_ids=gather_ids,
                     decode_input_ids=decode_input_ids,
+                    decode_input_tokens=decode_width,
                 )
                 if self.config.data_parallel_size > 1:
                     if dp_metadata is None:
@@ -1357,17 +1471,21 @@ class ModelExecutor:
                     ctx.global_bs = dp_metadata.global_batch_size
                     ctx.all_decode_or_idle = dp_metadata.all_decode_or_idle
                     ctx.all_extend = dp_metadata.all_extend
+                    ctx.global_decode_input_tokens = (
+                        dp_metadata.global_decode_input_tokens
+                    )
+                    ctx.decode_graph_width = dp_metadata.decode_graph_width
                 with nvtx_range("sampling_prep", color="yellow"):
                     sampling_start = time.perf_counter() if timing_enabled else 0.0
                     sampling_info = self._build_sampling_info(bs)
                     grammar_completion = setup_grammar_step(
                         sampling_info=sampling_info,
                         bs=bs,
-                        is_spec_decode=self.drafter is not None and num_extends < bs,
-                        spec_num_tokens=self.config.spec_num_tokens or 1,
+                        is_spec_decode=decode_width > 1 and num_extends < bs,
+                        spec_num_tokens=decode_width,
                         grammar_inputs=grammar_inputs,
-                        grammar_runtime=self.grammar_runtime,
-                        input_ids_buf=self.input_buffers.input_ids_buf,
+                        grammar_runtime=self._grammar_for_context(ctx),
+                        input_ids_buf=self._grammar_candidate_inputs(ctx),
                         grammar_backend=self.config.grammar_backend,
                     )
                     extend_with_prefix = num_extends > 0 and any(
@@ -1382,7 +1500,7 @@ class ModelExecutor:
                         request_ids=forward_op.request_ids,
                         request_pool_indices=forward_op.request_pool_indices,
                         sampling_params_list=sampling_params_list,
-                        num_tokens_per_req=self.config.output_length,
+                        num_tokens_per_req=decode_width,
                     )
                     if timing_enabled:
                         sampling_prep_ms = (
@@ -1454,7 +1572,7 @@ class ModelExecutor:
                     and num_extends == 0
                 ):
                     spec_candidate_tokens = self.input_buffers.input_ids_buf[
-                        : bs * self.config.spec_num_tokens
+                        : bs * decode_width
                     ].to("cpu", non_blocking=True)
 
                 # Defensive clamp into the valid vocab range (kept from the

@@ -47,6 +47,28 @@
 
 namespace tokenspeed {
 
+struct RemoteDraftRequest {
+    std::string request_id;
+    std::string session_id;
+    std::string status;
+    std::int32_t endpoint{-1};
+    std::int32_t anchor_id{-1};
+    std::int32_t computed_endpoint{0};
+    std::int32_t reserved_endpoint{0};
+    std::int32_t results_in_flight{0};
+    bool admission_allowed{false};
+};
+
+struct RemoteDraftSnapshot {
+    std::uint64_t ticket_id{0};
+    std::string request_id;
+    std::string session_id;
+    std::int32_t endpoint{-1};
+    std::int32_t anchor_id{-1};
+    std::int32_t start{0};
+    std::map<std::string, std::vector<std::int32_t>> block_tables;
+};
+
 class Scheduler {
 public:
     explicit Scheduler(SchedulerConfig config);
@@ -55,6 +77,8 @@ public:
 
     ExecutionPlan NextExecutionPlan();
     void Advance(const ExecutionEvent& event);
+    std::vector<RemoteDraftRequest> RemoteDraftRequests() const;
+    std::vector<RemoteDraftSnapshot> RemoteDraftSnapshots();
     std::vector<KvCacheEvent> DrainKvEvents();
     // Testing/control-plane operation. A successful return means the complete
     // Device L1 prefix cache was removed; Host L2 is never touched.
@@ -84,6 +108,7 @@ public:
     std::int32_t HostPoolPinnedBlocks() const { return coordinator_.NumPinnedHostCachedBlocks(); }
 
 private:
+    struct PlanBuild;
     bool clearCache(bool include_host);
     struct AdmissionMatch {
         CacheCoordinator::PrefixProbe probe;
@@ -160,6 +185,16 @@ private:
     void handleEvent(const forward::Abort& event);
     void handleEvent(const forward::Finish& event);
     void handleEvent(const forward::UpdateReserveNumTokens& event);
+    void handleEvent(const forward::RemoteDraftTick& event);
+    void handleEvent(const forward::RemoteDraftPending& event);
+    void handleEvent(const forward::RemoteDraftReady& event);
+    void handleEvent(const forward::RemoteDraftUnavailable& event);
+    void handleEvent(const forward::RemoteDraftExport& event);
+    void handleEvent(const forward::ReleaseRemoteDraftSnapshot& event);
+    bool matchesRemotePrefix(const Request& request, const std::string& session_id, std::int32_t endpoint,
+                             std::int32_t anchor_id) const;
+    void releaseRemoteEscapes();
+    std::vector<Request*> selectRemoteDecodeBatch(std::span<Request* const> candidates, const PlanBuild& build);
 
     // Mutable state of one plan-building pass: the output plan, the model
     // batch under construction, the transfer peer's two streams, and the
@@ -287,6 +322,15 @@ private:
     // on every rank because the mirrored schedulers receive identical
     // batches. The unique_ptr keeps each Request's address stable across
     // vector reshuffles, so the id index below never dangles.
+    struct RemoteSnapshotPins {
+        std::string request_id;
+        std::vector<CacheBlockRef> blocks;
+    };
+    std::int64_t remote_now_ms_{0};
+    std::uint64_t remote_admission_order_{0};
+    std::uint64_t next_remote_snapshot_ticket_{1};
+    std::unordered_map<std::uint64_t, RemoteSnapshotPins> remote_snapshot_pins_;
+    std::vector<RemoteDraftSnapshot> remote_snapshot_operations_;
     std::vector<std::unique_ptr<Request>> requests_;
     std::unordered_map<std::string, Request*> requests_by_id_;
     std::vector<KvCacheEvent> kv_events_;

@@ -323,11 +323,20 @@ class CacheRecipe(ABC):
         The one place a recipe reads the scheduler's limits, so per-group page
         demand and the capacity search cannot size against different numbers.
         """
+        reservation_tokens = self.decode_input_tokens
+        if (
+            self.draft_attn_config is not None
+            and getattr(self.server_args, "speculative_algorithm", None) == "DFLASH"
+        ):
+            # A local DFlash block runs after the accepted target inputs. Its
+            # native query rows therefore need additional destination slots,
+            # even when the target consumes a shorter proposal prefix.
+            reservation_tokens += int(self.server_args.speculative_num_steps) + 1
         return {
             "max_live_requests": self.attn_config.max_bs,
             "max_scheduled_tokens": max(0, int(self.server_args.chunked_prefill_size)),
             "max_context_len": self.attn_config.context_len,
-            "decode_input_tokens": self.decode_input_tokens,
+            "decode_input_tokens": reservation_tokens,
             "overlap_schedule_depth": self.overlap_schedule_depth,
         }
 

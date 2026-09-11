@@ -20,7 +20,9 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "cache/core/cache_config.h"
@@ -49,6 +51,13 @@ struct SchedulerConfig {
     std::int32_t max_scheduled_tokens{};
     std::int32_t max_batch_size{};
     std::int32_t decode_input_tokens{1};
+    // Native local draft writes may exceed the target verification width.
+    std::int32_t draft_input_tokens{0};
+    bool remote_draft_enabled{false};
+    std::int32_t remote_draft_min_ready{1};
+    std::int64_t remote_draft_max_defer_ms{0};
+    std::string remote_draft_feature_group;
+    std::int32_t DecodeReservationWidth() const { return std::max(decode_input_tokens, draft_input_tokens); }
     // Number of scheduler iterations that may be dispatched before the
     // accepted decode length is committed. The current event loop supports
     // only the non-overlapped (0) and one-step-overlapped (1) contracts.

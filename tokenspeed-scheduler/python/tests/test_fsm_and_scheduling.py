@@ -415,7 +415,7 @@ class TestPrefillFirst:
 class TestDecodeBatch:
     def _get_to_decoding(
         self,
-        scheduler: Scheduler,
+        scheduler: "Scheduler",
         request_id: str,
         tokens: list[int],
         decoding_peers: list[str] = (),

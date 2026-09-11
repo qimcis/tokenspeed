@@ -37,6 +37,19 @@
 
 namespace tokenspeed {
 
+enum class RemoteDraftStatus { kUnavailable, kPending, kReady };
+
+struct RemoteDraftState {
+    std::string session_id;
+    std::int32_t endpoint{-1};
+    std::int32_t anchor_id{-1};
+    RemoteDraftStatus status{RemoteDraftStatus::kUnavailable};
+    std::int64_t deferred_since_ms{0};
+    std::uint64_t admission_order{0};
+    std::vector<std::int32_t> candidate_ids;
+    bool escape{false};
+};
+
 class Request {
 public:
     Request(const RequestSpec& spec, std::int32_t prefix_granularity, Role role);
@@ -63,7 +76,18 @@ public:
     std::int32_t AdmissionHeadroom(std::int32_t safe_steps) const {
         return std::min(RemainingNewTokens(), safe_steps * (1 + retraction_count_));
     }
-    void NoteRetracted() { ++retraction_count_; }
+    void NoteRetracted() {
+        ++retraction_count_;
+        remote_draft = {};
+        computed_endpoint = 0;
+        reserved_endpoint = 0;
+        selected_decode_width = 0;
+    }
+    RemoteDraftState remote_draft;
+    // Confirmed target input history and admitted write frontier are distinct.
+    std::int32_t computed_endpoint{0};
+    std::int32_t reserved_endpoint{0};
+    std::int32_t selected_decode_width{0};
 
     // True when the last admission's headroom already covers every token
     // this request could still generate. Retracting such a request is pure

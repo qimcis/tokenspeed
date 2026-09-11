@@ -99,11 +99,17 @@ class ForwardContext:
     # Normalized explicit decode input overrides for this forward, if any.
     decode_input_ids: list[int] | None = None
 
+    # Immutable geometry selected by the submitted scheduler operation. None
+    # denotes the configured width for older callers constructing contexts.
+    decode_input_tokens: int | None = None
+
     # --- dp attention ---
     global_num_tokens: list[int] | None = None
     global_bs: list[int] | None = None
     all_decode_or_idle: bool = False
     all_extend: bool = False
+    global_decode_input_tokens: list[int] | None = None
+    decode_graph_width: int | None = None
     # Models that need specific collective sizing (e.g. draft models whose
     # first-step forward narrows activations) report these via
     # ``report_collective_sizing``. Unset (None) means comm sizing falls

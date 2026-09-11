@@ -36,7 +36,7 @@ def build_summary(data: dict[str, Any], minimum_score: float) -> tuple[str, list
     score = _reward_score(data)
 
     lines = [
-        "### B300 Kimi K3 DeepSWE",
+        "### DeepSWE",
         "",
         f"- Trials completed: {completed}/{total}",
         f"- Trial errors: {errors}",

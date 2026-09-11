@@ -20,7 +20,11 @@
 
 #include "scheduler/scheduler.h"
 
+#include <algorithm>
+#include <ranges>
 #include <stdexcept>
+
+#include "scheduler/operations/cache.h"
 #include <string>
 #include <utility>
 #include <vector>
@@ -127,8 +131,10 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
 }
 
 void Scheduler::handleEvent(const forward::UpdateReserveNumTokens& event) {
-    if (Request* request = findRequest(event.request_id)) {
-        request->Apply(fsm::UpdateReserveNumTokensEvent{event.reserve_num_tokens_in_next_schedule_event});
+    if (!config_.remote_draft_enabled) {
+        if (Request* request = findRequest(event.request_id)) {
+            request->Apply(fsm::UpdateReserveNumTokensEvent{event.reserve_num_tokens_in_next_schedule_event});
+        }
     }
 }
 
@@ -136,6 +142,11 @@ void Scheduler::handleEvent(const forward::ExtendResult& event) {
     if (Request* request = findRequest(event.request_id)) {
         request->NoteResultLanded();
         request->Apply(fsm::ExtendResultEvent{event.tokens});
+        if (config_.remote_draft_enabled && !request->Is<fsm::Finished>() && !event.tokens.empty()) {
+            request->computed_endpoint = request->TokenSize() - 1;
+            request->remote_draft.status = RemoteDraftStatus::kUnavailable;
+            request->remote_draft.candidate_ids.clear();
+        }
         if (!event.spec_candidate_ids.empty()) {
             request->StoreSpecCandidates(event.spec_candidate_ids);
         }
@@ -155,6 +166,160 @@ void Scheduler::handleEvent(const cache::WriteBackDone& event) {
 
 void Scheduler::handleEvent(const cache::LoadBackDone& event) {
     tier_transfers_.CompleteLoadBack(event.op_id);
+}
+
+bool Scheduler::matchesRemotePrefix(const Request& request, const std::string& session_id, std::int32_t endpoint,
+                                    std::int32_t anchor_id) const {
+    return config_.remote_draft_enabled && (request.Is<fsm::PrefillDone>() || request.Is<fsm::Decoding>()) &&
+           request.ResultsInFlight() == 0 && request.TokenSize() - 1 == endpoint &&
+           request.computed_endpoint == endpoint && request.LastToken() == anchor_id &&
+           request.remote_draft.session_id == session_id && request.remote_draft.endpoint == endpoint &&
+           request.remote_draft.anchor_id == anchor_id;
+}
+
+void Scheduler::releaseRemoteEscapes() {
+    for (const auto& request : requests_) {
+        request->remote_draft.escape = false;
+    }
+}
+
+void Scheduler::handleEvent(const forward::RemoteDraftTick& event) {
+    if (event.now_ms < remote_now_ms_) {
+        throw std::invalid_argument("Remote draft clock must be monotonic");
+    }
+    remote_now_ms_ = event.now_ms;
+}
+
+void Scheduler::handleEvent(const forward::RemoteDraftPending& event) {
+    Request* request = findRequest(event.request_id);
+    if (!config_.remote_draft_enabled || request == nullptr || event.session_id.empty() ||
+        (!request->Is<fsm::PrefillDone>() && !request->Is<fsm::Decoding>()) || request->ResultsInFlight() != 0 ||
+        request->remote_draft.escape || request->remote_draft.status != RemoteDraftStatus::kUnavailable ||
+        request->computed_endpoint != event.endpoint || request->TokenSize() - 1 != event.endpoint ||
+        request->LastToken() != event.anchor_id) {
+        return;
+    }
+    handleEvent(forward::RemoteDraftTick{event.now_ms});
+    request->remote_draft = RemoteDraftState{
+        .session_id = event.session_id,
+        .endpoint = event.endpoint,
+        .anchor_id = event.anchor_id,
+        .status = RemoteDraftStatus::kPending,
+        .deferred_since_ms = event.now_ms,
+        .admission_order = ++remote_admission_order_,
+    };
+}
+
+void Scheduler::handleEvent(const forward::RemoteDraftReady& event) {
+    Request* request = findRequest(event.request_id);
+    if (request == nullptr || !matchesRemotePrefix(*request, event.session_id, event.endpoint, event.anchor_id) ||
+        request->remote_draft.status != RemoteDraftStatus::kPending) {
+        return;
+    }
+    if (event.candidate_ids.size() != static_cast<std::size_t>(config_.decode_input_tokens - 1) ||
+        std::ranges::any_of(event.candidate_ids, [](std::int32_t id) { return id < 0; })) {
+        throw std::invalid_argument("Remote draft reply must contain exactly five non-negative proposal IDs");
+    }
+    request->remote_draft.status = RemoteDraftStatus::kReady;
+    request->remote_draft.candidate_ids = event.candidate_ids;
+    releaseRemoteEscapes();
+}
+
+void Scheduler::handleEvent(const forward::RemoteDraftUnavailable& event) {
+    Request* request = findRequest(event.request_id);
+    if (request == nullptr || !config_.remote_draft_enabled || request->remote_draft.session_id != event.session_id ||
+        request->remote_draft.endpoint != event.endpoint || request->remote_draft.anchor_id != event.anchor_id) {
+        return;
+    }
+    request->remote_draft.status = RemoteDraftStatus::kUnavailable;
+    request->remote_draft.candidate_ids.clear();
+    releaseRemoteEscapes();
+}
+
+void Scheduler::handleEvent(const forward::RemoteDraftExport& event) {
+    Request* request = findRequest(event.request_id);
+    if (request == nullptr || !matchesRemotePrefix(*request, event.session_id, event.endpoint, event.anchor_id) ||
+        request->remote_draft.status == RemoteDraftStatus::kUnavailable) {
+        return;
+    }
+    const std::size_t index = groupIndex(config_.remote_draft_feature_group);
+    const auto& group = config_.cache_groups[index];
+    const std::int32_t window = *group.sliding_window_tokens;
+    if (event.start < std::max(0, event.endpoint - window + 1) || event.start > event.endpoint) {
+        throw std::invalid_argument("Remote feature export must lie within retained confirmed history");
+    }
+    for (const auto& [_, pins] : remote_snapshot_pins_) {
+        if (pins.request_id == event.request_id) {
+            return;
+        }
+    }
+    const auto& table = request->BlockTablesRef()[index];
+    const std::int32_t begin = event.start / group.block_granularity;
+    const std::int32_t end = (event.endpoint + group.block_granularity - 1) / group.block_granularity;
+    RemoteSnapshotPins pins{.request_id = event.request_id};
+    for (std::int32_t page = begin; page < end; ++page) {
+        if (page >= table.NumBlocks() || !table.Blocks()[page]) {
+            throw std::logic_error("Remote feature snapshot contains a missing retained cache page");
+        }
+        pins.blocks.push_back(table.Blocks()[page]);
+    }
+    const std::uint64_t ticket = next_remote_snapshot_ticket_++;
+    auto tables = BuildBlockTables(coordinator_, request->BlockTablesRef(), cache_group_ids_);
+    auto feature_table = std::move(tables.at(config_.remote_draft_feature_group));
+    remote_snapshot_pins_.emplace(ticket, std::move(pins));
+    remote_snapshot_operations_.push_back(RemoteDraftSnapshot{
+        .ticket_id = ticket,
+        .request_id = event.request_id,
+        .session_id = event.session_id,
+        .endpoint = event.endpoint,
+        .anchor_id = event.anchor_id,
+        .start = event.start,
+        .block_tables = {{config_.remote_draft_feature_group, std::move(feature_table)}},
+    });
+}
+
+void Scheduler::handleEvent(const forward::ReleaseRemoteDraftSnapshot& event) {
+    remote_snapshot_pins_.erase(event.ticket_id);
+}
+
+std::vector<RemoteDraftRequest> Scheduler::RemoteDraftRequests() const {
+    if (!config_.remote_draft_enabled) {
+        return {};
+    }
+    std::vector<const Request*> ordered;
+    for (const auto& request : requests_) {
+        if (request->Is<fsm::PrefillDone>() || request->Is<fsm::Decoding>()) {
+            ordered.push_back(request.get());
+        }
+    }
+    std::stable_sort(ordered.begin(), ordered.end(), [](const Request* left, const Request* right) {
+        return left->remote_draft.admission_order < right->remote_draft.admission_order;
+    });
+    std::vector<RemoteDraftRequest> result;
+    for (const Request* request : ordered) {
+        const auto& remote = request->remote_draft;
+        const bool quiescent =
+            request->ResultsInFlight() == 0 && request->computed_endpoint == request->TokenSize() - 1;
+        const char* status = remote.status == RemoteDraftStatus::kReady     ? "ready"
+                             : remote.status == RemoteDraftStatus::kPending ? "pending"
+                                                                            : "unavailable";
+        result.push_back(RemoteDraftRequest{
+            .request_id = request->Id(),
+            .session_id = remote.session_id,
+            .status = status,
+            .endpoint = request->TokenSize() - 1,
+            .anchor_id = request->LastToken(),
+            .computed_endpoint = request->computed_endpoint,
+            .reserved_endpoint = request->reserved_endpoint,
+            .results_in_flight = request->ResultsInFlight(),
+            .admission_allowed = quiescent && remote.status == RemoteDraftStatus::kUnavailable && !remote.escape,
+        });
+    }
+    return result;
+}
+
+std::vector<RemoteDraftSnapshot> Scheduler::RemoteDraftSnapshots() {
+    return std::exchange(remote_snapshot_operations_, {});
 }
 
 }  // namespace tokenspeed

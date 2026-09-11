@@ -950,14 +950,15 @@ def create_attn_components(
     dict | None,
 ]:
     target = _resolve_attn_side(model_config, server_args.attention_backend)
+    has_local_draft = draft_model_config is not None and not getattr(
+        server_args, "remote_draft_endpoint", None
+    )
     draft = (
         _resolve_attn_side(draft_model_config, server_args.drafter_attention_backend)
-        if draft_model_config is not None
+        if has_local_draft
         else None
     )
-    _check_pd_support(
-        server_args, target, draft, has_draft_model=draft_model_config is not None
-    )
+    _check_pd_support(server_args, target, draft, has_draft_model=has_local_draft)
     _apply_backend_overrides(server_args, target, draft)
 
     config = _create_attn_config(server_args, model_config)

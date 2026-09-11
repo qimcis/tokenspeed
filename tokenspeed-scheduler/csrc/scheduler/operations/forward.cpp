@@ -236,6 +236,7 @@ PrefillOperation applyPrefillEvent(Request& request, Event& event, const CacheCo
                                    std::span<const std::string> group_ids) {
     request.Apply(event);
     const PrefillInfo info = request.CurrentPrefillInfo();
+    request.reserved_endpoint = info.already_scheduled_len + info.extend_len;
 
     PrefillOperation operation;
     operation.request_id = request.Id();
@@ -393,7 +394,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     const std::int32_t headroom = config_.role == Role::kP ? 0 : request->AdmissionHeadroom(kRetractionSafeSteps);
     const PrefillReserve reserve{
         .split_tail_tokens = split_tail_tokens,
-        .decode_input_tokens = decode_input_tokens,
+        .decode_input_tokens = std::max(decode_input_tokens, config_.draft_input_tokens),
         .completes_prefill = completes_prefill,
         .prompt_headroom_tokens = headroom > 0 ? unscheduled - tokens_this_round + headroom : 0,
         // A remote landing always finishes the shaping; the P role never
@@ -501,7 +502,7 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     // The prompt headroom was prepaid at first-chunk admission.
     const PrefillReserve reserve{
         .split_tail_tokens = checkpoint_tail_reserve,
-        .decode_input_tokens = reserve_num_tokens_in_next_schedule_event,
+        .decode_input_tokens = std::max(reserve_num_tokens_in_next_schedule_event, config_.draft_input_tokens),
         .completes_prefill = completes_prefill,
         .prompt_headroom_tokens = 0,
         // The round that spends a banked tail got its growth block with the
@@ -542,32 +543,38 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
 
 std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                                   Request* request) {
-    std::vector<BlockTable>& tables = request->BlockTablesRef();
-    const std::int32_t reserve_tokens = request->ReserveNumTokensInNextScheduleEvent();
-    fsm::CacheProgress cache_progress = request->CacheProgress();
-    std::int32_t num_computed_tokens = 0;
-    if (request->Is<fsm::PrefillDone>()) {
-        const PrefillInfo previous = request->CurrentPrefillInfo();
-        num_computed_tokens = previous.already_scheduled_len + previous.extend_len;
-    } else {
-        num_computed_tokens = request->TokenSize() - config_.decode_input_tokens;
+    const bool remote = config_.remote_draft_enabled;
+    if (remote && (request->ResultsInFlight() != 0 || request->selected_decode_width == 0)) {
+        return std::nullopt;
     }
-
+    const std::int32_t width = remote ? request->selected_decode_width : config_.decode_input_tokens;
+    std::vector<BlockTable>& tables = request->BlockTablesRef();
+    const std::int32_t num_computed_tokens = remote ? request->computed_endpoint
+                                             : request->Is<fsm::PrefillDone>()
+                                                 ? request->PrefillSize()
+                                                 : request->TokenSize() - config_.decode_input_tokens;
+    const std::int32_t desired_endpoint = num_computed_tokens + width;
+    // A narrower forward can reuse already-admitted speculative write slots.
+    // This frontier is capacity bookkeeping; only computed_endpoint publishes history.
+    const std::int32_t consume_tokens = remote ? std::max(0, desired_endpoint - request->reserved_endpoint)
+                                               : request->ReserveNumTokensInNextScheduleEvent();
+    const std::int32_t scratch_reserve = config_.draft_input_tokens;
+    fsm::CacheProgress cache_progress = request->CacheProgress();
     const CompletedPrefixPages completed =
         updateCompletedPrefixHashes(*request, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity());
-
     if (completed.first_new_prefix_page == static_cast<std::int32_t>(cache_progress.prefix_hashes.size()) &&
-        canConsumeReservedTokensInPlace(coordinator_, tables, reserve_tokens, num_computed_tokens)) {
-        coordinator_.ConsumeReservedTokens(tables, reserve_tokens);
+        canConsumeReservedTokensInPlace(coordinator_, tables, consume_tokens + scratch_reserve, num_computed_tokens)) {
+        coordinator_.ConsumeReservedTokens(tables, consume_tokens);
     } else {
         std::vector<GroupDemand> demands = makeGroupDemands(
             tables,
             GroupDemand{
-                .num_tokens = reserve_tokens,
+                .num_tokens = consume_tokens,
                 .prefix_hashes = cache_progress.prefix_hashes,
                 .new_prefix_hash_begin = completed.first_new_prefix_page,
                 .completed_boundary_kind = completed.boundary_kind,
                 .num_computed_tokens = num_computed_tokens,
+                .reserve_tokens = scratch_reserve,
                 .stream_completed_to_host = config_.StreamsDeviceCacheToHost() && request->Is<fsm::PrefillDone>(),
             });
         if (!admitWithKvEventTracking(plan, feedback, *request, cache_progress, completed.first_new_prefix_page,
@@ -575,8 +582,10 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
             return std::nullopt;
         }
     }
-
-    return fsm::ScheduleDecodeEvent{config_.decode_input_tokens, std::move(cache_progress)};
+    if (remote) {
+        request->reserved_endpoint = std::max(request->reserved_endpoint, desired_endpoint);
+    }
+    return fsm::ScheduleDecodeEvent{width, std::move(cache_progress)};
 }
 
 PrefillOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::SchedulePrefillFirstChunkEvent event,
@@ -596,6 +605,23 @@ PrefillOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::S
 }
 
 DecodeOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::ScheduleDecodeEvent event) {
+    if (config_.remote_draft_enabled) {
+        const std::int32_t width = request->selected_decode_width;
+        const std::int32_t anchor = request->LastToken();
+        DecodeOperation operation = applyDecodeEvent(*request, std::move(event), width, coordinator_, cache_group_ids_);
+        operation.decode_input_id = anchor;
+        if (width > 1) {
+            _assert(request->remote_draft.status == RemoteDraftStatus::kReady);
+            operation.spec_candidate_ids.push_back(anchor);
+            operation.spec_candidate_ids.insert(operation.spec_candidate_ids.end(),
+                                                request->remote_draft.candidate_ids.begin(),
+                                                request->remote_draft.candidate_ids.end());
+        }
+        request->remote_draft.status = RemoteDraftStatus::kUnavailable;
+        request->remote_draft.candidate_ids.clear();
+        request->selected_decode_width = 0;
+        return operation;
+    }
     // A decode op carries its token when its executor cannot otherwise know
     // it: the D side's first decode (the token crossed the wire with
     // RemotePrefillDoneEvent) and the P side's remote decode (the peer sends
@@ -673,7 +699,6 @@ Request* Scheduler::chooseVictim(std::span<Request* const> candidates) const {
 }
 
 void Scheduler::retractVictim(Request& victim, std::vector<WriteBackOperation>& write_back_operations) {
-    victim.NoteRetracted();
     // A host cache turns the retraction into an L2 snapshot the readmission
     // loads back; without one the victim re-prefills from scratch. On the
     // fused role that means competing for admission like a newcomer, but a
@@ -693,7 +718,8 @@ void Scheduler::retractVictim(Request& victim, std::vector<WriteBackOperation>& 
             if (const auto* prefilling = victim.GetIf<fsm::Prefilling>()) {
                 return prefilling->window.begin + prefilling->window.size;
             }
-            return victim.TokenSize() - config_.decode_input_tokens;
+            return config_.remote_draft_enabled ? victim.computed_endpoint
+                                                : victim.TokenSize() - config_.decode_input_tokens;
         }();
         const CompletedPrefixPages completed =
             updateCompletedPrefixHashes(victim, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity());
@@ -711,6 +737,7 @@ void Scheduler::retractVictim(Request& victim, std::vector<WriteBackOperation>& 
             write_back_operations.push_back(std::move(*write_back));
         }
     }
+    victim.NoteRetracted();
     victim.Apply(fsm::RetractEvent{&coordinator_, next_retraction_epoch_++, recovers_as_readmission,
                                    victim.HasGeneratedOutput()});
     spdlog::info("[Scheduler] retract: released request {} ({} tokens){}", victim.Id(), victim.TokenSize(),
@@ -923,11 +950,68 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
 // (its first decode) and Decoding candidate. The budget guard protects the
 // mamba state reserve of a prefill scheduled beside them in mixed mode; on
 // the D role decodes consume no budget, so it never binds there.
+std::vector<Request*> Scheduler::selectRemoteDecodeBatch(std::span<Request* const> candidates, const PlanBuild& build) {
+    std::vector<Request*> eligible;
+    std::vector<Request*> ready;
+    std::vector<Request*> unavailable;
+    Request* expired = nullptr;
+    for (Request* request : candidates) {
+        request->selected_decode_width = 0;
+        if ((!request->Is<fsm::PrefillDone>() && !request->Is<fsm::Decoding>()) || build.Scheduled(*request) ||
+            request->ResultsInFlight() != 0 || request->computed_endpoint != request->TokenSize() - 1) {
+            continue;
+        }
+        eligible.push_back(request);
+        const auto& remote = request->remote_draft;
+        if (remote.status == RemoteDraftStatus::kReady) ready.push_back(request);
+        if (remote.status == RemoteDraftStatus::kUnavailable) unavailable.push_back(request);
+        if (remote.status != RemoteDraftStatus::kUnavailable &&
+            remote_now_ms_ - remote.deferred_since_ms >= config_.remote_draft_max_defer_ms &&
+            (expired == nullptr || remote.deferred_since_ms < expired->remote_draft.deferred_since_ms)) {
+            expired = request;
+        }
+    }
+    std::vector<Request*> selected;
+    std::int32_t width = 1;
+    if (expired != nullptr) {
+        releaseRemoteEscapes();
+        width = expired->remote_draft.status == RemoteDraftStatus::kReady ? config_.decode_input_tokens : 1;
+        selected.push_back(expired);
+        const auto& fill = width > 1 ? ready : unavailable;
+        for (Request* request : fill) {
+            if (request != expired) selected.push_back(request);
+        }
+    } else if (ready.size() >= static_cast<std::size_t>(config_.remote_draft_min_ready)) {
+        width = config_.decode_input_tokens;
+        selected = std::move(ready);
+    } else if (!unavailable.empty()) {
+        selected = std::move(unavailable);
+    } else if (!ready.empty()) {
+        width = config_.decode_input_tokens;
+        selected = std::move(ready);
+    } else if (!eligible.empty() && std::ranges::none_of(requests_, [](const auto& request) {
+                   return !request->template Is<fsm::Finished>() && request->remote_draft.escape;
+               })) {
+        // Keep one request advancing until a held job completes or expires.
+        // No new remote admission may reacquire this escape immediately.
+        eligible.front()->remote_draft.escape = true;
+        selected.push_back(eligible.front());
+    }
+    for (Request* request : selected) request->selected_decode_width = width;
+    return selected;
+}
+
 void Scheduler::scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build,
                                     std::span<Request* const> candidates) {
+    std::vector<Request*> remote_candidates;
+    if (config_.remote_draft_enabled) {
+        remote_candidates = selectRemoteDecodeBatch(candidates, build);
+        candidates = remote_candidates;
+    }
     for (Request* request : candidates) {
-        if (build.Full(config_.max_batch_size) ||
-            build.token_budget < build.state_prefill_reserve + config_.decode_input_tokens) {
+        const std::int32_t width =
+            config_.remote_draft_enabled ? request->selected_decode_width : config_.decode_input_tokens;
+        if (build.Full(config_.max_batch_size) || build.token_budget < build.state_prefill_reserve + width) {
             return;
         }
         if ((!request->Is<fsm::PrefillDone>() && !request->Is<fsm::Decoding>()) || build.Scheduled(*request)) {

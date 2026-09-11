@@ -42,6 +42,7 @@ import torch
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.utils.server_args import ServerArgs
+from tokenspeed.runtime.utils.spec_block_geometry import resolve_verify_width
 
 ComponentT = TypeVar("ComponentT", bound="AttnComponentSpec")
 
@@ -51,11 +52,15 @@ def resolve_speculative_num_tokens(
 ) -> int:
     """Return the query width seen by this attention backend.
 
-    Target verification consumes the full candidate window. DSpark's draft
+    Target verification consumes the selected candidate prefix. DSpark's draft
     model samples from its anchor row, so seven draft queries produce the seven
     proposals in an eight-token verify window.
     """
     width = int(server_args.speculative_num_draft_tokens)
+    if not is_draft and server_args.speculative_algorithm == "DFLASH":
+        return resolve_verify_width(
+            width, getattr(server_args, "speculative_verify_tokens", None)
+        )
     if is_draft and server_args.speculative_algorithm == "DSPARK":
         return width - 1
     return width

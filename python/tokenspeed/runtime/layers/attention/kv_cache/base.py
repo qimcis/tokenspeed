@@ -28,6 +28,7 @@ import torch
 
 from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+    cache_field_consumer_id,
     cache_field_layer_id,
     cache_field_plane,
 )
@@ -47,6 +48,8 @@ def _layer_plane(
 
     Returns None for fields outside the view's layer window.
     """
+    if cache_field_consumer_id(field_id) is not None:
+        return None
     local_layer = cache_field_layer_id(field_id) - first_layer
     if not 0 <= local_layer < num_layers:
         return None
@@ -314,6 +317,7 @@ class CachePool(ABC):
         """Return the transfer layout consumed by this compute view."""
         from tokenspeed.runtime.cache.transfer.layout import (
             select_layer_fields,
+            select_non_layer_fields,
         )
 
         try:
@@ -322,9 +326,33 @@ class CachePool(ABC):
                 first_layer=self._field_layer_offset,
                 num_layers=self.layer_num,
             )
+            if self._field_layer_offset == 0:
+                extra_fields, _, extra_consumers = select_non_layer_fields(
+                    self.arena.plan.fields
+                )
+                field_ids = field_ids | extra_fields
+                consumers = consumers + extra_consumers
         except (AttributeError, IndexError, ValueError) as exc:
             raise RuntimeError(str(exc)) from exc
         return self._build_cache_transfer_layout(field_ids, consumers)
+
+    def non_layer_consumer_index(self, consumer_id: str) -> int:
+        """Return the L2 transfer consumer index for a named target field."""
+        from tokenspeed.runtime.cache.transfer.layout import select_non_layer_fields
+
+        if self._field_layer_offset != 0:
+            raise ValueError("non-layer consumers belong to the target cache view")
+        _, names, _ = select_non_layer_fields(self.arena.plan.fields)
+        try:
+            return self.layer_num + names.index(consumer_id)
+        except ValueError:
+            raise ValueError(f"cache consumer {consumer_id!r} is not planned") from None
+
+    def wait_for_non_layer_consumer(self, consumer_id: str) -> None:
+        """Fence the current L2 restore before a named consumer touches storage."""
+        index = self.non_layer_consumer_index(consumer_id)
+        if self.layerwise_load_tracker is not None:
+            self.layerwise_load_tracker.wait_for_layer(index)
 
     def _build_cache_transfer_layout(self, field_ids, consumers):
         from tokenspeed.runtime.cache.transfer.layout import layout_from_lcm_plan

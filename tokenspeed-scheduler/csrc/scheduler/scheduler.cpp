@@ -109,7 +109,8 @@ std::int64_t Scheduler::singleRequestLcmBlocksRequired(std::int32_t token_limit)
     const std::int64_t decode_width = config_.role == Role::kP ? 0 : config_.decode_input_tokens;
     // An overlapped forward protects one additional decode reservation that
     // cannot yet be reclaimed from the request table.
-    const std::int64_t protected_tokens = static_cast<std::int64_t>(config_.overlap_schedule_depth) * decode_width;
+    const std::int64_t protected_tokens = static_cast<std::int64_t>(config_.overlap_schedule_depth) * decode_width +
+                                          (config_.role == Role::kP ? 0 : config_.draft_input_tokens);
     // The largest accepted prompt must still leave the first decode/MTP
     // reservation inside token_limit.
     const std::int64_t max_prompt_tokens =
@@ -353,7 +354,8 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
             throw std::invalid_argument("Scheduler: max_new_tokens must be non-negative");
         }
         const std::int64_t generation_reserve =
-            config_.role == Role::kP ? 0 : std::max<std::int64_t>(spec.max_new_tokens, config_.decode_input_tokens);
+            config_.role == Role::kP ? 0
+                                     : std::max<std::int64_t>(spec.max_new_tokens, config_.DecodeReservationWidth());
         const std::int64_t token_limit = static_cast<std::int64_t>(spec.tokens.size()) + generation_reserve;
         if (token_limit > std::numeric_limits<std::int32_t>::max()) {
             throw std::invalid_argument("Scheduler: request token limit exceeds int32 range");

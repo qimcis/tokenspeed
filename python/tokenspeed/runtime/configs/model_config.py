@@ -49,6 +49,7 @@ from tokenspeed.runtime.utils.spec_block_geometry import (
     BLOCK_SPEC_ALGORITHMS,
     read_checkpoint_block_size,
     resolve_block_widths,
+    resolve_verify_width,
     validate_block_widths,
 )
 
@@ -351,6 +352,11 @@ def _apply_block_spec_widths(
     num_steps, num_draft_tokens = resolve_block_widths(algorithm, block_size)
     server_args.speculative_num_steps = num_steps
     server_args.speculative_num_draft_tokens = num_draft_tokens
+    verify_width = getattr(server_args, "speculative_verify_tokens", None)
+    if verify_width is not None:
+        if algorithm != "DFLASH":
+            raise ValueError("--speculative-verify-tokens requires DFLASH.")
+        resolve_verify_width(num_draft_tokens, verify_width)
     return block_size
 
 
@@ -426,10 +432,14 @@ class ModelConfig:
             ),
             **kwargs,
         )
+        if getattr(server_args, "remote_draft_endpoint", None):
+            # The handshake and the subsequently loaded weights must name the
+            # same immutable checkpoint, even if config loading resolved a ref.
+            self.revision = getattr(self.hf_config, "_commit_hash", None) or revision
         self.hf_generation_config = get_generation_config(
             self.model_path,
             trust_remote_code=trust_remote_code,
-            revision=revision,
+            revision=self.revision,
             **kwargs,
         )
 

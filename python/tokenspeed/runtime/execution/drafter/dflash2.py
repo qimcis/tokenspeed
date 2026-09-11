@@ -66,10 +66,49 @@ def _walk_greedy_path(
     return _greedy_path_torch(candidate_ids, scores, anchor_token_ids, out)
 
 
+def select_dflash2_block(
+    candidate_selector,
+    candidate_ids: torch.Tensor,
+    unary_logits: torch.Tensor,
+    draft_hidden: torch.Tensor,
+    anchor_token_ids: torch.Tensor,
+    out: torch.Tensor,
+    vocab_size: int,
+) -> torch.Tensor:
+    """Select the full native proposal block for local or remote drafting.
+
+    Args:
+        candidate_selector: Loaded checkpoint transition selector.
+        candidate_ids: Vocabulary candidates shaped [batch, native_width-1, k].
+        unary_logits: Corresponding vocabulary scores; promoted to FP32.
+        draft_hidden: Full native backbone output [batch, native_width, hidden].
+        anchor_token_ids: Confirmed anchor IDs [batch].
+        out: Persistent int32 output [batch, native_width], including anchor.
+        vocab_size: Original target vocabulary size.
+
+    Returns:
+        The full selected block in ``out``. Consume a prefix only after this
+        call so the backbone and transition selector retain trained geometry.
+    """
+    if draft_hidden.shape[:2] != out.shape:
+        raise ValueError("DFlash2 selector output must span the full native block.")
+    if candidate_ids.shape[:2] != (out.shape[0], out.shape[1] - 1):
+        raise ValueError("DFlash2 candidates must span every native proposal row.")
+    if unary_logits.shape != candidate_ids.shape:
+        raise ValueError("DFlash2 candidate IDs and scores must have identical shapes.")
+    anchors = anchor_token_ids.to(torch.int64).clamp(0, int(vocab_size) - 1)
+    scores = candidate_selector(
+        candidate_ids, unary_logits.float(), draft_hidden[:, 1:, :], anchors
+    )
+    _walk_greedy_path(candidate_ids, scores, anchors, out)
+    out.clamp_(min=0, max=int(vocab_size) - 1)
+    return out
+
+
 class DFlash2(DFlash):
     """DFlash block runtime with the DFlash2 top-k transition selector."""
 
-    #: Built in wire_target from the wired head's shard geometry.
+    #: Built in bind_vocabulary from the wired head's shard geometry.
     candidate_topk: VocabParallelTopK | None = None
 
     def __init__(self, *args, **kwargs) -> None:
@@ -79,7 +118,7 @@ class DFlash2(DFlash):
             raise ValueError(
                 "DFlash2 requires a draft model with candidate_selector weights."
             )
-        if self.draft_query_width != self.spec_num_tokens:
+        if self.draft_query_width != self.native_spec_num_tokens:
             raise ValueError("DFlash2 requires the anchor-plus-mask DFlash layout.")
 
         config = self.model.config
@@ -92,8 +131,8 @@ class DFlash2(DFlash):
         self.candidate_logits_processor: LogitsProcessor | None = None
         self.candidate_topk: VocabParallelTopK | None = None
 
-    def wire_target(self, target_model) -> None:
-        super().wire_target(target_model)
+    def bind_vocabulary(self, embed_tokens, lm_head, logits_processor) -> None:
+        super().bind_vocabulary(embed_tokens, lm_head, logits_processor)
         self.candidate_logits_processor = LogitsProcessor(
             self.model.config,
             logit_scale=self.output_multiplier,
@@ -112,7 +151,7 @@ class DFlash2(DFlash):
             tp_group=processor.tp_group,
             vocab_size=self.model.config.vocab_size,
             top_k=self.selector_top_k,
-            max_rows=self.input_buffers.max_bs * max(self.spec_num_tokens - 1, 1),
+            max_rows=self.input_buffers.max_bs * self.draft_block_size,
             logit_scale=processor.logit_scale,
             softcapping=processor.final_logit_softcapping,
             skip_all_gather=processor.skip_all_gather,
@@ -151,17 +190,12 @@ class DFlash2(DFlash):
         )
         candidate_ids = candidate_ids.view(batch_size, num_steps, self.selector_top_k)
         unary_logits = unary_logits.view_as(candidate_ids)
-        anchor_token_ids = (
-            block_ids[:, 0]
-            .to(torch.int64)
-            .clamp(0, int(self.model.config.vocab_size) - 1)
-        )
-        scores = self.candidate_selector(
+        return select_dflash2_block(
+            self.candidate_selector,
             candidate_ids,
             unary_logits,
-            hidden_states,
-            anchor_token_ids,
+            draft_hidden,
+            block_ids[:, 0],
+            next_tokens,
+            int(self.model.config.vocab_size),
         )
-        _walk_greedy_path(candidate_ids, scores, anchor_token_ids, next_tokens)
-        next_tokens.clamp_(min=0, max=int(self.model.config.vocab_size) - 1)
-        return next_tokens

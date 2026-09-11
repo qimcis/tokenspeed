@@ -330,8 +330,47 @@ class CacheGroupRouter(AttentionBackend):
             self._decode_views[key] = views
         self.decode_write_locations = views
 
-    def _refresh_decode_locations(self, bs: int, seq_lens: torch.Tensor) -> None:
-        n = self._decode_tokens_per_req
+    def _prepare_decode_width(
+        self,
+        bs: int,
+        num_extends: int,
+        extend_tokens: int,
+        metadata_kwargs: Mapping,
+    ) -> int:
+        """Select immutable view geometry from this forward's actual inputs.
+
+        The draft's round-entry write window keeps its configured geometry;
+        its in-graph hooks publish later draft windows explicitly. Targets
+        accept an explicit width or infer it from the packed input shape.
+        """
+        width = self._decode_tokens_per_req
+        if not self.is_draft:
+            explicit = metadata_kwargs.get("decode_input_tokens")
+            num_tokens = metadata_kwargs.get("num_tokens")
+            num_decodes = bs - num_extends
+            if explicit is not None:
+                width = int(explicit)
+            elif num_tokens is not None and num_decodes > 0:
+                decode_tokens = int(num_tokens) - extend_tokens
+                if decode_tokens <= 0 or decode_tokens % num_decodes:
+                    raise ValueError(
+                        "decode input shape does not contain a homogeneous "
+                        f"query width: tokens={decode_tokens}, requests={num_decodes}"
+                    )
+                width = decode_tokens // num_decodes
+            if not 1 <= width <= self.spec_num_tokens:
+                raise ValueError(
+                    f"decode width {width} exceeds configured capacity "
+                    f"{self.spec_num_tokens}"
+                )
+        for leaf in self.leaves.values():
+            leaf.prepare_decode_width(width)
+        return width
+
+    def _refresh_decode_locations(
+        self, bs: int, seq_lens: torch.Tensor, tokens_per_req: int
+    ) -> None:
+        n = tokens_per_req
         self.stacks.compute_decode_locations(bs, seq_lens, n)
         self._publish_decode_locations(bs, n)
 
@@ -442,7 +481,10 @@ class CacheGroupRouter(AttentionBackend):
         or chunked prefix) travels with the extend lengths: leaves size their
         paged-prefix metadata by it, so it must reach them unchanged.
         """
-        del kwargs
+        extend_tokens = int(
+            sum(int(x) for x in extend_seq_lens_cpu[:num_extends].tolist())
+        )
+        width = self._prepare_decode_width(bs, num_extends, extend_tokens, kwargs)
         # A new forward: the sparse layers' shared top-k is per forward.
         self.sparse_topk.clear()
         if not (forward_mode.is_extend_or_mixed() or forward_mode.is_idle()):
@@ -456,15 +498,16 @@ class CacheGroupRouter(AttentionBackend):
         self._extend_write_locations = None
         self._decode_request_offset = 0
         if forward_mode.is_extend_or_mixed() and num_extends > 0:
-            total = int(sum(int(x) for x in extend_seq_lens_cpu[:num_extends].tolist()))
             self._extend_write_locations = self.stacks.extend_locations(
-                extend_prefix_lens[:num_extends], extend_seq_lens[:num_extends], total
+                extend_prefix_lens[:num_extends],
+                extend_seq_lens[:num_extends],
+                extend_tokens,
             )
         if forward_mode.is_mixed():
             # The decode requests follow the extend requests; their verify
             # window is the same math as a pure decode over every request,
             # sliced.
-            self._refresh_decode_locations(bs, seq_lens)
+            self._refresh_decode_locations(bs, seq_lens, width)
             self._decode_request_offset = num_extends
         for gid, leaf in self.leaves.items():
             leaf.init_forward_metadata(
@@ -496,7 +539,7 @@ class CacheGroupRouter(AttentionBackend):
     ) -> None:
         """The single decode path: fill the stacks from this step's tables,
         derive the decode write window, refresh every leaf in place."""
-        del kwargs
+        width = self._prepare_decode_width(bs, 0, 0, kwargs)
         self.sparse_topk.clear()
         if forward_mode.is_extend_or_mixed():
             raise RuntimeError(
@@ -508,7 +551,7 @@ class CacheGroupRouter(AttentionBackend):
         # requests a MIXED round's draft refresh carries (num_extends is 0 on
         # targets).
         self._decode_request_offset = num_extends
-        self._refresh_decode_locations(bs, seq_lens)
+        self._refresh_decode_locations(bs, seq_lens, width)
         for gid, leaf in self.leaves.items():
             leaf.refresh_decode_metadata(
                 bs,
@@ -533,7 +576,7 @@ class CacheGroupRouter(AttentionBackend):
         """Capture seeding: the idle fill over the same stacks replay
         refreshes, then each leaf's own capture hook (the leaf default is
         its idle refresh; FlashMLA installs its recorded tile schedule)."""
-        del kwargs
+        width = self._prepare_decode_width(bs, 0, 0, kwargs)
         self.sparse_topk.clear()
         if not forward_mode.is_decode_or_idle():
             raise NotImplementedError(
@@ -541,7 +584,7 @@ class CacheGroupRouter(AttentionBackend):
             )
         self.stacks.fill(bs, 0, block_tables)
         self._decode_request_offset = 0
-        self._refresh_decode_locations(bs, seq_lens)
+        self._refresh_decode_locations(bs, seq_lens, width)
         for gid, leaf in self.leaves.items():
             leaf.init_forward_metadata_capture_cuda_graph(
                 bs, seq_lens, self.stacks.table(gid, bs)

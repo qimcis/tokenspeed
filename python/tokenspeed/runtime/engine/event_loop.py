@@ -19,6 +19,7 @@
 # SOFTWARE.
 
 import faulthandler
+import math
 import signal
 import threading
 import time
@@ -32,9 +33,14 @@ import zmq
 from tokenspeed_scheduler import Scheduler
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.distributed.dp_forward_metadata import (
+    common_decode_width,
+    planned_decode_width,
+)
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
+from tokenspeed.runtime.draft_pool.controller import build_remote_draft_controller
 from tokenspeed.runtime.engine.batch_log import BatchLogger
 from tokenspeed.runtime.engine.cache_hooks import L2CacheHooks
 from tokenspeed.runtime.engine.generation_output_processor import OutputProcesser
@@ -155,6 +161,10 @@ class EventLoop:
             )
         else:
             draft_model_config = None
+        if server_args.remote_draft_endpoint is not None:
+            server_args.validate_remote_draft_model_configs(
+                self.model_config.hf_config, draft_model_config.hf_config
+            )
 
         prefix_replay_tokens = resolve_dspark_prefix_replay_tokens(
             speculative_algorithm=server_args.speculative_algorithm,
@@ -185,7 +195,10 @@ class EventLoop:
             self.in_flight_depth = int(self.use_overlap_schedule)
 
         decode_input_tokens = (
-            server_args.speculative_num_draft_tokens
+            (
+                server_args.speculative_verify_tokens
+                or server_args.speculative_num_draft_tokens
+            )
             if server_args.speculative_algorithm is not None
             else 1
         )
@@ -237,8 +250,8 @@ class EventLoop:
             self.world_cpu_group = pg_manager.get_process_group(
                 "gloo", mapping.world_group
             )
-            self._dp_local_info = torch.zeros(1, 3, dtype=torch.int32)
-            self._dp_global_info = torch.zeros(mapping.world_size, 3, dtype=torch.int32)
+            self._dp_local_info = torch.zeros(1, 4, dtype=torch.int32)
+            self._dp_global_info = torch.zeros(mapping.world_size, 4, dtype=torch.int32)
         num_host_pages = specs.num_host_pages
         # L2 cache-op accounting + rank-synced completion tracking (see
         # cache_hooks.py); a no-op shell when kvstore is disabled. The hooks
@@ -315,6 +328,20 @@ class EventLoop:
             cache_groups=cache_groups,
             enable_mixed_prefill_decode=server_args.enable_mixed_batch,
         )
+        scheduler_cfg.draft_input_tokens = specs.native_draft_tokens
+        scheduler_cfg.remote_draft_enabled = (
+            server_args.remote_draft_endpoint is not None
+        )
+        if scheduler_cfg.remote_draft_enabled:
+            from tokenspeed.runtime.layers.attention.kv_cache.recipes.projected_features import (
+                PROJECTED_FEATURE_GROUP,
+            )
+
+            scheduler_cfg.remote_draft_min_ready = server_args.remote_draft_min_ready
+            scheduler_cfg.remote_draft_max_defer_ms = math.ceil(
+                server_args.remote_draft_max_defer_ms
+            )
+            scheduler_cfg.remote_draft_feature_group = PROJECTED_FEATURE_GROUP
         logger.info(
             "Scheduler config: prefix_granularity=%s num_device_pages=%s "
             "max_scheduled_tokens=%s decode_input_tokens=%s "
@@ -445,7 +472,7 @@ class EventLoop:
             attn_tp_rank=attn_tp_rank,
             spec_algorithm=self.server_args.speculative_algorithm,
             spec_num_tokens=(
-                self.server_args.speculative_num_draft_tokens
+                decode_input_tokens
                 if self.server_args.speculative_algorithm is not None
                 else None
             ),
@@ -456,6 +483,17 @@ class EventLoop:
             ),
             metrics=self.metrics,
             defer_to_device=self._device.run_multimodal_work,
+        )
+        self._remote_draft = build_remote_draft_controller(
+            server_args=server_args,
+            model_config=self.model_config,
+            draft_model_config=draft_model_config,
+            device=self._device,
+            max_sessions=per_rank_max_batch,
+            attn_tp_rank=attn_tp_rank,
+            attn_tp_size=self.attn_tp_size,
+            attn_tp_cpu_group=self.attn_tp_cpu_group,
+            leader_rank=server_args.mapping.attn.tp_group[0],
         )
         # The peer's control face only — bootstrap register/abort, event
         # polling. Its execution face is inside the handle.
@@ -533,7 +571,11 @@ class EventLoop:
         return ModelConfig(
             model_path,
             trust_remote_code=server_args.trust_remote_code,
-            revision=server_args.revision,
+            revision=(
+                (server_args.speculative_draft_model_revision or server_args.revision)
+                if is_draft_worker
+                else server_args.revision
+            ),
             context_length=server_args.max_model_len,
             model_override_args=server_args.hf_overrides,
             dtype=dtype,
@@ -782,7 +824,9 @@ class EventLoop:
         # reads of the already-synced result; no GPU sync).
         if forward_op.num_extends() <= 0:
             bs = len(forward_op.request_ids)
-            self._batch_logger.record_decode(results, bs)
+            self._batch_logger.record_decode(
+                results, bs, decode_input_tokens=forward_op.decode_input_tokens
+            )
 
         return request_changes
 
@@ -821,6 +865,11 @@ class EventLoop:
         self._dp_local_info[0, 0] = num_tokens
         self._dp_local_info[0, 1] = batch_size
         self._dp_local_info[0, 2] = int(forward_mode)
+        # This exchange observes the C++ reservation decision. Never widen or
+        # shrink an active batch to match another attention cohort's graph.
+        self._dp_local_info[0, 3] = (
+            planned_decode_width(forward_op) if executes_model_forward else 0
+        )
         dist.all_gather_into_tensor(
             self._dp_global_info,
             self._dp_local_info,
@@ -829,6 +878,7 @@ class EventLoop:
         global_num_tokens = self._dp_global_info[:, 0].tolist()
         global_batch_size = self._dp_global_info[:, 1].tolist()
         global_forward_mode = self._dp_global_info[:, 2].tolist()
+        global_decode_input_tokens = self._dp_global_info[:, 3].tolist()
         any_rank_has_work = max(global_num_tokens) > 0
         need_idle_forward = num_tokens == 0 and any_rank_has_work
         all_decode_or_idle = all(
@@ -843,6 +893,14 @@ class EventLoop:
         all_extend = all(
             mode == int(ForwardMode.EXTEND) for mode in global_forward_mode
         )
+        # Idle cohorts adopt this width on the data plane. Mixed active widths
+        # force every rank onto eager execution, with actual token counts.
+        # Keep all_decode_or_idle mode-only: MoE dispatch also reads that flag.
+        decode_graph_width = (
+            common_decode_width(global_decode_input_tokens)
+            if all_decode_or_idle
+            else None
+        )
         return DpForwardMetadata(
             global_num_tokens=global_num_tokens,
             global_batch_size=global_batch_size,
@@ -850,6 +908,8 @@ class EventLoop:
             all_decode_or_idle=all_decode_or_idle,
             all_extend=all_extend,
             need_idle_forward=need_idle_forward,
+            global_decode_input_tokens=global_decode_input_tokens,
+            decode_graph_width=decode_graph_width,
         )
 
     def _num_running(self) -> int:
@@ -876,6 +936,10 @@ class EventLoop:
             num_total_pages=self._scheduler_cache_geometry.num_usable_pages,
             num_iteration_tokens=num_iteration_tokens,
         )
+        if self.metrics.enabled:
+            remote_stats = self._remote_draft.get_stats(self.scheduler)
+            if remote_stats is not None:
+                self.metrics.record_remote_draft_snapshot(**remote_stats)
 
     # ------------------------------------------------------------------
     # Event loops
@@ -883,6 +947,16 @@ class EventLoop:
 
     def _shutdown_complete(self) -> bool:
         return self.shutdown_event.is_set()
+
+    def _remote_live_request_ids(self) -> set[str]:
+        """Live authoritative output state, after stop/abort processing."""
+        if self.server_args.remote_draft_endpoint is None:
+            return set()
+        return {
+            request_id
+            for request_id, state in self.output_processor.rid_to_state.items()
+            if not state.finished and not state.to_abort
+        }
 
     def _drain_in_flight(self, in_flight) -> list:
         """Commit every queued forward, oldest first; return their changes."""
@@ -950,12 +1024,20 @@ class EventLoop:
                 # controller (every non-EPD deployment).
                 self._epd_hooks.drain_ready_embeddings()
                 cache_events = self._cache_hooks.poll_ready_events()
+                cache_events.extend(
+                    self._remote_draft.poll_ready_events(
+                        self.scheduler,
+                        self._remote_live_request_ids(),
+                        self._pause.forward_blocked,
+                    )
+                )
                 if cache_events:
                     # Advanced at the HEAD of the round (not funneled into the
                     # tail advance) so completed cache ops are visible to this
                     # round's next_execution_plan — deferring them would delay
                     # cache-gated admissions by a full round.
                     advance_scheduler(self.scheduler, cache_events)
+                self._remote_draft.queue_exports(self.scheduler)
 
                 # Every path in this round appends its committed results here;
                 # they feed back into the scheduler through the single
@@ -1065,6 +1147,7 @@ class EventLoop:
                 # the only caller of scheduler.advance.)
                 if request_changes:
                     advance_scheduler(self.scheduler, request_changes)
+                self._remote_draft.after_commit(self._remote_live_request_ids())
 
                 self._publish_scheduler_kv_events()
 
@@ -1131,6 +1214,7 @@ class EventLoop:
         return GrammarStepInputs(grammars=grammars, advance_mask=advance_mask)
 
     def close(self) -> None:
+        self._remote_draft.close()
         self.load_reporter.close()
         # Best-effort: tell an attached SMG frontend this engine is going away
         # (msgpack mode only; the pickle sender has no such helper) so the

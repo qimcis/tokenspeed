@@ -93,7 +93,9 @@ def test_decode_rounds_log_once_per_interval_with_committed_throughput():
     with mock.patch.object(batch_log_module.logger, "info") as log:
         for _ in range(3):
             logger.record_decode(
-                SimpleNamespace(output_lengths=torch.tensor([2, 2])), 2
+                SimpleNamespace(output_lengths=torch.tensor([2, 2])),
+                2,
+                decode_input_tokens=1,
             )
             logger.log_dispatch(_decode_op(2), STATS)
 
@@ -147,7 +149,9 @@ def test_disabled_rank_still_counts_but_never_logs():
     logger = _logger(enabled=False, decode_log_interval=1)
 
     with mock.patch.object(batch_log_module.logger, "info") as log:
-        logger.record_decode(SimpleNamespace(output_lengths=torch.tensor([3])), 1)
+        logger.record_decode(
+            SimpleNamespace(output_lengths=torch.tensor([3])), 1, decode_input_tokens=1
+        )
         logger.log_dispatch(_decode_op(1), STATS)
 
     log.assert_not_called()
@@ -164,7 +168,7 @@ def test_step_acceptance_log_separates_committed_and_draft_tokens():
         mock.patch.object(batch_log_module, "LOG_SPEC_ACCEPT_LENGTHS", True),
         mock.patch.object(batch_log_module.logger, "info") as log,
     ):
-        logger.record_decode(result, bs=3)
+        logger.record_decode(result, bs=3, decode_input_tokens=8)
 
     log.assert_called_once_with(
         "Spec verify step. accept_lengths=%s, accepted_draft_tokens=%s",
@@ -185,7 +189,7 @@ def test_step_token_log_aligns_drafts_with_predecessor_target_logits():
         mock.patch.object(batch_log_module, "LOG_SPEC_ACCEPT_LENGTHS", True),
         mock.patch.object(batch_log_module.logger, "info") as log,
     ):
-        logger.record_decode(result, bs=1)
+        logger.record_decode(result, bs=1, decode_input_tokens=4)
 
     assert log.call_args_list[1] == mock.call(
         "Spec token compare. anchor=%s, draft=%s, target=%s, match=%s",
@@ -194,3 +198,68 @@ def test_step_token_log_aligns_drafts_with_predecessor_target_logits():
         [[11, 12, 99]],
         [[True, True, False]],
     )
+
+
+def test_width_one_fallback_skips_speculative_debug_and_counts_throughput():
+    logger = _logger(spec_num_steps=7, spec_num_tokens=6)
+    result = SimpleNamespace(
+        output_lengths=torch.tensor([1, 1]),
+        output_tokens=torch.tensor([[91], [92]]),
+        spec_candidate_tokens=torch.tensor([[81], [82]]),
+    )
+    with (
+        mock.patch.object(batch_log_module, "LOG_SPEC_ACCEPT_LENGTHS", True),
+        mock.patch.object(batch_log_module.logger, "info") as log,
+    ):
+        logger.record_decode(result, bs=2, decode_input_tokens=1)
+    log.assert_not_called()
+    assert logger._num_generated_tokens == 2
+    assert logger._num_spec_steps == 0
+    assert logger._num_candidate_tokens == 0
+
+
+def test_native_eight_target_six_rate_excludes_width_one_fallback():
+    logger = _logger(spec_num_steps=7, spec_num_tokens=6)
+    logger._last_decode_tic = 100.0
+    logger.record_decode(
+        SimpleNamespace(output_lengths=torch.tensor([6, 3])),
+        bs=2,
+        decode_input_tokens=6,
+    )
+    logger.record_decode(
+        SimpleNamespace(output_lengths=torch.tensor([1, 1, 1])),
+        bs=3,
+        decode_input_tokens=1,
+    )
+    with (
+        mock.patch.object(batch_log_module.time, "time", return_value=102.0),
+        mock.patch.object(batch_log_module.logger, "info") as log,
+    ):
+        logger._log_decode(5, STATS)
+    values = log.call_args.args
+    assert values[6] == 6.0  # all 12 committed tokens / two seconds
+    assert values[7] == 4.5  # nine committed tokens / two speculative slots
+    assert values[8] == 0.7  # seven accepted proposals / ten actual candidates
+    assert logger._num_spec_steps == logger._num_spec_tokens == 0
+    assert logger._num_candidate_tokens == logger._num_generated_tokens == 0
+
+
+def test_debug_views_use_actual_width_when_maximum_capacity_is_larger():
+    logger = _logger(spec_num_steps=7, spec_num_tokens=8)
+    result = SimpleNamespace(
+        output_lengths=torch.tensor([2, 1]),
+        output_tokens=torch.tensor(
+            [[11, 99, 13, 14, 15, 16], [21, 29, 23, 24, 25, 26]]
+        ),
+        spec_candidate_tokens=torch.tensor(
+            [[10, 11, 12, 13, 14, 15], [20, 21, 22, 23, 24, 25]]
+        ),
+    )
+    with (
+        mock.patch.object(batch_log_module, "LOG_SPEC_ACCEPT_LENGTHS", True),
+        mock.patch.object(batch_log_module.logger, "info") as log,
+    ):
+        logger.record_decode(result, bs=2, decode_input_tokens=6)
+    comparison = log.call_args_list[1]
+    assert comparison.args[1] == [10, 20]
+    assert comparison.args[2] == [[11, 12, 13, 14, 15], [21, 22, 23, 24, 25]]

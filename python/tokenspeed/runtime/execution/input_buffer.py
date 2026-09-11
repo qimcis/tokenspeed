@@ -27,6 +27,7 @@ from tokenspeed_kernel.ops.metadata import PrepTape, Reg
 
 from tokenspeed.runtime.execution.cache_loc_kernel import fused_decode_input_prep
 from tokenspeed.runtime.execution.forward_batch_info import compute_position_triton
+from tokenspeed.runtime.execution.types import resolve_decode_input_tokens
 from tokenspeed.runtime.multimodal.inputs import Modality, substitute_mm_pad_
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
@@ -168,6 +169,33 @@ class InputBuffers:
     ):
         batch_size = len(forward_op.request_ids)
         num_extends = forward_op.num_extends()
+        decode_width = resolve_decode_input_tokens(
+            forward_op, runtime_states.future_input_map.shape[1]
+        )
+        self.force_single_token_verify_buf.zero_()
+
+        # The immutable operation carries complete [anchor, candidates] rows.
+        # Install them before applying explicit anchors so readiness survives
+        # the bootstrap/recovery guard below. Empty rows use existing state.
+        candidate_rows = getattr(forward_op, "spec_candidate_ids", ())
+        if candidate_rows:
+            if len(candidate_rows) != batch_size - num_extends:
+                raise ValueError("candidate rows must match the decode requests")
+            for row, candidates in enumerate(candidate_rows):
+                if candidates:
+                    if len(candidates) != decode_width:
+                        raise ValueError(
+                            "candidate row differs from selected decode width"
+                        )
+                    anchor = forward_op.decode_input_ids[row]
+                    if anchor >= 0 and int(candidates[0]) != anchor:
+                        raise ValueError(
+                            "candidate anchor differs from the planned anchor"
+                        )
+                    runtime_states.write_remote_spec_candidate_ids(
+                        forward_op.request_pool_indices[num_extends + row],
+                        list(candidates),
+                    )
 
         # CPU-side fast path: when the scheduler always emits a decode_input_ids
         # list (even though every entry is -1, meaning "no override").
@@ -357,9 +385,9 @@ class InputBuffers:
                         batch_size - num_extends,
                         "mixed forward",
                     )
-                decode_ids = runtime_states.future_input_map[
-                    decode_req_pool_indices
-                ].flatten()
+                decode_ids = runtime_states.gather_candidate_ids(
+                    decode_req_pool_indices, decode_width
+                )
                 self.input_ids_buf[prefill_token_count:total_tokens].copy_(
                     decode_ids,
                     non_blocking=True,
@@ -381,7 +409,9 @@ class InputBuffers:
                     "decode forward",
                 )
             self.input_ids_buf[:total_tokens].copy_(
-                runtime_states.future_input_map[req_pool_indices_device].flatten(),
+                runtime_states.gather_candidate_ids(
+                    req_pool_indices_device, decode_width
+                ),
                 non_blocking=True,
             )
 

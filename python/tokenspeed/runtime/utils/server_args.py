@@ -23,6 +23,7 @@
 import argparse
 import dataclasses
 import json
+import math
 import os
 import random
 import socket
@@ -32,6 +33,11 @@ from tokenspeed_kernel.ops.attention.gdn.triton import CHUNK_SIZE as FLA_CHUNK_S
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.mapping import Mapping, _resolve_parallelism_sizes
+from tokenspeed.runtime.draft_pool.config import (
+    validate_remote_model_pair,
+    validate_remote_revision,
+    validate_remote_tcp_endpoint,
+)
 from tokenspeed.runtime.utils import (
     get_amdgpu_memory_capacity,
     get_colorful_logger,
@@ -276,10 +282,19 @@ class ServerArgs:
     speculative_config: str | None = None
     speculative_algorithm: str | None = None
     speculative_draft_model_path: str | None = None
+    speculative_draft_model_revision: str | None = None
     speculative_draft_model_quantization: str | None = "unquant"
     speculative_num_steps: int = 3
     speculative_eagle_topk: int = 1
     speculative_num_draft_tokens: int | None = None
+    # Native proposal width remains checkpoint-defined. This is only the
+    # target query width, including the anchor token.
+    speculative_verify_tokens: int | None = None
+    remote_draft_endpoint: str | None = None
+    # Deployment policy is explicit in remote mode; local serving retains its
+    # existing defaults and never consults these values.
+    remote_draft_min_ready: int | None = None
+    remote_draft_max_defer_ms: float | None = None
     enable_replay_ssm: bool = False
     eagle3_layers_to_capture: str | None = None
     # Logprob support flags — all OFF by default. Enabling extends the
@@ -463,7 +478,14 @@ class ServerArgs:
                     self.speculative_num_steps = num_speculative_tokens
 
         if self.speculative_num_draft_tokens is None:
-            self.speculative_num_draft_tokens = self.speculative_num_steps + 1
+            if self.remote_draft_endpoint and not self._speculative_widths_explicit:
+                self.speculative_num_steps = 7
+                self.speculative_num_draft_tokens = 8
+            else:
+                self.speculative_num_draft_tokens = self.speculative_num_steps + 1
+
+        if self.remote_draft_endpoint and self.speculative_verify_tokens is None:
+            self.speculative_verify_tokens = 6
 
     def resolve_memory_and_scheduling(self):
         if current_platform().is_amd:
@@ -707,6 +729,8 @@ class ServerArgs:
         self.validate_cache_options()
 
     def resolve_speculative_decoding(self):
+        self.validate_remote_draft_options()
+
         # Keep drafter backend consistent with the main model unless explicitly set.
         if (
             self.speculative_algorithm is not None
@@ -755,6 +779,103 @@ class ServerArgs:
                 f"supported: {self.speculative_eagle_topk=}. Only chain spec "
                 "(topk=1) is wired end-to-end."
             )
+
+    def validate_remote_draft_options(self) -> None:
+        """Validate launch-only constraints before loading model weights."""
+        if self.speculative_verify_tokens is not None:
+            if self.speculative_algorithm != "DFLASH":
+                raise ValueError("--speculative-verify-tokens requires DFLASH")
+            if self.speculative_verify_tokens < 2:
+                raise ValueError("--speculative-verify-tokens must be at least 2")
+            # Default native widths are resolved again from the checkpoint.
+            # Do not compare against the legacy default of four rows here.
+            if (
+                getattr(self, "_speculative_widths_explicit", False)
+                and self.speculative_verify_tokens > self.speculative_num_draft_tokens
+            ):
+                raise ValueError(
+                    "--speculative-verify-tokens cannot exceed the native "
+                    "--speculative-num-draft-tokens width"
+                )
+
+        if self.remote_draft_endpoint is None:
+            if (
+                self.remote_draft_min_ready is not None
+                or self.remote_draft_max_defer_ms is not None
+            ):
+                raise ValueError(
+                    "Remote drafting policy requires --remote-draft-endpoint"
+                )
+            return
+
+        validate_remote_tcp_endpoint(self.remote_draft_endpoint, allow_wildcard=False)
+        if self.speculative_algorithm != "DFLASH":
+            raise ValueError(
+                "Remote drafting currently requires --speculative-algorithm DFLASH"
+            )
+        if (
+            not self.speculative_draft_model_path
+            or self.draft_model_path_use_base
+            or (self.speculative_draft_model_path == self.model)
+        ):
+            raise ValueError("Remote drafting requires a separate DFlash2 checkpoint")
+        if (
+            self.speculative_num_draft_tokens != 8
+            or self.speculative_verify_tokens != 6
+        ):
+            raise ValueError(
+                "Remote DFlash2 requires native draft width 8 and target verification width 6"
+            )
+        if self.speculative_draft_model_quantization not in (None, "unquant"):
+            raise ValueError("Remote DFlash2 requires unquantized BF16 draft weights")
+        if self.dtype not in ("auto", "bfloat16"):
+            raise ValueError("Remote DFlash2 requires BF16 target hidden states")
+        if self.quantization not in (None, "fp8"):
+            raise ValueError(
+                "Remote GLM-5.3 currently requires the FP8 target checkpoint"
+            )
+        if self.device != "cuda":
+            raise ValueError("Remote DFlash2 currently requires CUDA target execution")
+        if self.pipeline_parallel_size != 1:
+            raise ValueError("Remote drafting does not support pipeline parallelism")
+        if self.mapping is not None and self.mapping.has_attn_cp:
+            raise ValueError(
+                "Remote drafting does not support attention context parallelism"
+            )
+        if self.disaggregation_mode != "null":
+            raise ValueError("Remote drafting does not support PD/EPD disaggregation")
+        if self.dp_sampling:
+            raise ValueError(
+                "Remote drafting does not support --dp-sampling; attention DP is supported"
+            )
+        if self.remote_draft_min_ready is None or self.remote_draft_min_ready < 1:
+            raise ValueError(
+                "Remote drafting requires a positive --remote-draft-min-ready"
+            )
+        if (
+            self.remote_draft_max_defer_ms is None
+            or not math.isfinite(self.remote_draft_max_defer_ms)
+            or self.remote_draft_max_defer_ms < 0
+        ):
+            raise ValueError(
+                "Remote drafting requires a finite, nonnegative --remote-draft-max-defer-ms"
+            )
+        validate_remote_revision(self.revision, "--revision")
+        validate_remote_revision(
+            self.speculative_draft_model_revision, "--speculative-draft-model-revision"
+        )
+
+    def validate_remote_draft_model_configs(
+        self, target_hf_config, draft_hf_config
+    ) -> None:
+        """Check the supported pair after config loading and before weights.
+
+        Args:
+            target_hf_config: Full target checkpoint configuration.
+            draft_hf_config: Native DFlash2 checkpoint configuration.
+        """
+        if self.remote_draft_endpoint is not None:
+            validate_remote_model_pair(target_hf_config, draft_hf_config)
 
     def resolve_communication(self):
         # Auto-enable allreduce fusion on supported single-node TP configurations.
@@ -1795,6 +1916,41 @@ class ServerArgs:
             type=str,
             default=ServerArgs.speculative_draft_model_quantization,
             help="Quantization method for the draft model. Defaults to 'unquant'.",
+        )
+        parser.add_argument(
+            "--speculative-draft-model-revision",
+            type=str,
+            default=ServerArgs.speculative_draft_model_revision,
+            help="Draft checkpoint revision, independent of the target --revision. "
+            "Remote drafting requires an immutable 40-character commit ID.",
+        )
+        parser.add_argument(
+            "--speculative-verify-tokens",
+            type=int,
+            default=ServerArgs.speculative_verify_tokens,
+            help="DFLASH target query width, including the anchor, without changing "
+            "the native checkpoint block. Defaults to native width locally and 6 remotely.",
+        )
+        parser.add_argument(
+            "--remote-draft-endpoint",
+            type=str,
+            default=ServerArgs.remote_draft_endpoint,
+            help="Private tcp://host:port DFlash2 worker endpoint. Enables remote "
+            "proposals with target-only fallback; no full local draft model is loaded.",
+        )
+        parser.add_argument(
+            "--remote-draft-min-ready",
+            type=int,
+            default=ServerArgs.remote_draft_min_ready,
+            help="Minimum ready requests per attention cohort for a preferred remote "
+            "verification batch. Required explicitly in remote mode.",
+        )
+        parser.add_argument(
+            "--remote-draft-max-defer-ms",
+            type=float,
+            default=ServerArgs.remote_draft_max_defer_ms,
+            help="Maximum per-request remote deferral in milliseconds. Required "
+            "explicitly in remote mode; zero permits immediate fallback.",
         )
         parser.add_argument(
             "--speculative-num-steps",

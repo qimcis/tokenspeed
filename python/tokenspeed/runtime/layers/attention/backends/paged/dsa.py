@@ -79,6 +79,7 @@ class DSABackend(PagedAttentionBackend):
     """
 
     default_kernel_page_size = DSA_SPARSE_PAGE_SIZE
+    supports_variable_decode_width = True
 
     # DSA's sparse indexer reads this backend's chunked_prefill_metadata from
     # inside the captured prefill segment, but the prefill graph rebinds only
@@ -101,6 +102,8 @@ class DSABackend(PagedAttentionBackend):
         self.q_data_type = config.dtype
         self.num_local_heads = spec.num_attention_heads // spec.attn_tp_size
         self._prefill_page_table: torch.Tensor | None = None
+        self._dsa_seq_lens_buf: torch.Tensor | None = None
+        self._dsa_decode_plans: dict[tuple[int, int], object] = {}
         self.kpool_runtime = (
             KPoolRuntime(spec.index_kpool, spec.index_topk)
             if spec.index_kpool is not None
@@ -196,6 +199,8 @@ class DSABackend(PagedAttentionBackend):
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
         super()._publish_cache_pool(cache_pool)
         self._prefill_page_table = None
+        self._dsa_seq_lens_buf = None
+        self._dsa_decode_plans = {}
         if self.kpool_runtime is not None:
             self.kpool_runtime.reset_forward(None)
 
@@ -208,6 +213,16 @@ class DSABackend(PagedAttentionBackend):
 
     def init_cuda_graph_state(self, max_bs: int) -> None:
         self._dense_backend.init_cuda_graph_state(max_bs)
+        self._dsa_seq_lens_buf = torch.zeros(
+            (max_bs * self.spec_num_tokens, 1), dtype=torch.int32, device=self.device
+        )
+        self._dsa_decode_plans = {}
+
+    def prepare_decode_width(self, tokens_per_req: int) -> None:
+        # The delegate's immutable metadata view carries q_len_per_req.
+        # Select it explicitly; never rewrite its configured capacity.
+        self._dense_backend.prepare_decode_width(tokens_per_req)
+        super().prepare_decode_width(tokens_per_req)
 
     # Capture is inherited: the leaf default routes through this wrapper's
     # refresh, whose lazy arm builds the piggybacked _dsa_seq_lens_2d /
@@ -235,30 +250,57 @@ class DSABackend(PagedAttentionBackend):
             num_extends=num_extends,
             for_graph_replay=for_graph_replay,
         )
+        self._refresh_sparse_decode_plan(bs, num_extends)
+
+    def _refresh_sparse_decode_plan(self, bs: int, num_extends: int) -> None:
+        """Refresh the width-specific token lengths and retained plan in place.
+
+        Mixed batches have a fresh eager plan for their decode-only suffix,
+        so they cannot replace a captured pure-decode plan at the same size.
+        """
         metadata = self.forward_decode_metadata
+        width = self.prepared_decode_width
+        if self._dsa_seq_lens_buf is None:
+            raise RuntimeError("DSA persistent decode buffers were not initialized")
         if getattr(metadata, "_dsa_seq_lens_2d", None) is None:
-            # First refresh at a lazily-built bs (no capture ran): allocate the
-            # per-token view once; subsequent refreshes update it in place.
-            metadata._dsa_seq_lens_2d = (
-                seq_lens[:bs]
-                .unsqueeze(1)
-                .expand(-1, self.spec_num_tokens)
-                .reshape(-1, 1)
-                .contiguous()
-            )
+            metadata._dsa_seq_lens_2d = self._dsa_seq_lens_buf[: bs * width]
+        metadata._dsa_seq_lens_2d.view(bs, width).copy_(
+            metadata.seq_lens_k[:bs].unsqueeze(1)
+        )
+        seq_lens_2d = metadata._dsa_seq_lens_2d
+        if num_extends < bs:
+            seq_lens_2d = seq_lens_2d[num_extends * width :]
+        if num_extends:
+            # Mixed execution is eager. Retaining every possible split would
+            # accumulate O(max_bs**2) plans without benefiting graph replay.
             metadata._dsa_plan = dsa_plan(
-                seq_lens_2d=metadata._dsa_seq_lens_2d,
-                page_size=self.kernel_page_size,
+                seq_lens_2d=seq_lens_2d, page_size=self.kernel_page_size
             )
             return
-        metadata._dsa_seq_lens_2d.copy_(
-            seq_lens[:bs].unsqueeze(1).expand(-1, self.spec_num_tokens).reshape(-1, 1)
-        )
-        dsa_plan(
-            seq_lens_2d=metadata._dsa_seq_lens_2d,
-            page_size=self.kernel_page_size,
-            out=metadata._dsa_plan,
-        )
+        # Keep other shapes' retained plans off the graph-visible metadata
+        # object: publishing a mixed shape must not add graph pointer paths.
+        plans = self._dsa_decode_plans
+        key = (bs, width)
+        if key not in plans:
+            # Warmup builds plans before capture. Their persistent allocations
+            # must never originate in a CUDA graph's shared private pool.
+            if (
+                seq_lens_2d.device.type == "cuda"
+                and torch.cuda.is_current_stream_capturing()
+            ):
+                raise RuntimeError(
+                    "DSA decode shape must be warmed before CUDA capture"
+                )
+            plans[key] = dsa_plan(
+                seq_lens_2d=seq_lens_2d, page_size=self.kernel_page_size
+            )
+        else:
+            dsa_plan(
+                seq_lens_2d=seq_lens_2d,
+                page_size=self.kernel_page_size,
+                out=plans[key],
+            )
+        metadata._dsa_plan = plans[key]
 
     def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
         metadata = self.forward_decode_metadata
@@ -309,29 +351,7 @@ class DSABackend(PagedAttentionBackend):
         # A draft's plan is rebuilt by the wrapper's refresh_decode_metadata
         # after this init (the unified draft contract).
         if forward_mode.is_mixed() and not self.is_draft:
-            metadata = self.forward_decode_metadata
-            # Per-token context lengths: the paged-MQA-logits kernel only supports
-            # next_n == 1, so each verify token is its own row (bs * spec_num_tokens
-            # rows). The per-token causal bound is applied downstream in the top-k.
-            # See deep_gemm_dsa_decode_topk.
-            metadata._dsa_seq_lens_2d = (
-                seq_lens.unsqueeze(1)
-                .expand(-1, self.spec_num_tokens)
-                .reshape(-1, 1)
-                .contiguous()
-            )
-            if num_extends < bs:
-                # Decode rows only: skip the extend requests' per-token block.
-                seq_lens_2d = metadata._dsa_seq_lens_2d[
-                    num_extends * self.spec_num_tokens :
-                ]
-            else:
-                # The dsa_plan is unused, alias to full-batch seq_lens_2d to
-                # generate dsa_plan as a placeholder
-                seq_lens_2d = metadata._dsa_seq_lens_2d
-            metadata._dsa_plan = dsa_plan(
-                seq_lens_2d=seq_lens_2d, page_size=self.kernel_page_size
-            )
+            self._refresh_sparse_decode_plan(bs, num_extends)
 
         self._prefill_page_table = None
         if num_extends > 0 and forward_mode.is_extend_or_mixed():

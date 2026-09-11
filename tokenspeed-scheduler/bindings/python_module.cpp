@@ -137,6 +137,11 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("max_scheduled_tokens", &tokenspeed::SchedulerConfig::max_scheduled_tokens)
         .def_rw("max_batch_size", &tokenspeed::SchedulerConfig::max_batch_size)
         .def_rw("decode_input_tokens", &tokenspeed::SchedulerConfig::decode_input_tokens)
+        .def_rw("draft_input_tokens", &tokenspeed::SchedulerConfig::draft_input_tokens)
+        .def_rw("remote_draft_enabled", &tokenspeed::SchedulerConfig::remote_draft_enabled)
+        .def_rw("remote_draft_min_ready", &tokenspeed::SchedulerConfig::remote_draft_min_ready)
+        .def_rw("remote_draft_max_defer_ms", &tokenspeed::SchedulerConfig::remote_draft_max_defer_ms)
+        .def_rw("remote_draft_feature_group", &tokenspeed::SchedulerConfig::remote_draft_feature_group)
         .def_rw("overlap_schedule_depth", &tokenspeed::SchedulerConfig::overlap_schedule_depth)
         .def_rw("role", &tokenspeed::SchedulerConfig::role)
         .def_prop_rw(
@@ -179,6 +184,65 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("request_id", &tokenspeed::forward::UpdateReserveNumTokens::request_id)
         .def_rw("reserve_num_tokens_in_next_schedule_event",
                 &tokenspeed::forward::UpdateReserveNumTokens::reserve_num_tokens_in_next_schedule_event);
+
+    nb::class_<tokenspeed::forward::RemoteDraftTick>(forward_event, "RemoteDraftTick")
+        .def(nb::init<>())
+        .def_rw("now_ms", &tokenspeed::forward::RemoteDraftTick::now_ms);
+
+    nb::class_<tokenspeed::forward::RemoteDraftPending>(forward_event, "RemoteDraftPending")
+        .def(nb::init<>())
+        .def_rw("request_id", &tokenspeed::forward::RemoteDraftPending::request_id)
+        .def_rw("session_id", &tokenspeed::forward::RemoteDraftPending::session_id)
+        .def_rw("endpoint", &tokenspeed::forward::RemoteDraftPending::endpoint)
+        .def_rw("anchor_id", &tokenspeed::forward::RemoteDraftPending::anchor_id)
+        .def_rw("now_ms", &tokenspeed::forward::RemoteDraftPending::now_ms);
+
+    nb::class_<tokenspeed::forward::RemoteDraftReady>(forward_event, "RemoteDraftReady")
+        .def(nb::init<>())
+        .def_rw("request_id", &tokenspeed::forward::RemoteDraftReady::request_id)
+        .def_rw("session_id", &tokenspeed::forward::RemoteDraftReady::session_id)
+        .def_rw("endpoint", &tokenspeed::forward::RemoteDraftReady::endpoint)
+        .def_rw("anchor_id", &tokenspeed::forward::RemoteDraftReady::anchor_id)
+        .def_rw("candidate_ids", &tokenspeed::forward::RemoteDraftReady::candidate_ids);
+
+    nb::class_<tokenspeed::forward::RemoteDraftUnavailable>(forward_event, "RemoteDraftUnavailable")
+        .def(nb::init<>())
+        .def_rw("request_id", &tokenspeed::forward::RemoteDraftUnavailable::request_id)
+        .def_rw("session_id", &tokenspeed::forward::RemoteDraftUnavailable::session_id)
+        .def_rw("endpoint", &tokenspeed::forward::RemoteDraftUnavailable::endpoint)
+        .def_rw("anchor_id", &tokenspeed::forward::RemoteDraftUnavailable::anchor_id);
+
+    nb::class_<tokenspeed::forward::RemoteDraftExport>(forward_event, "RemoteDraftExport")
+        .def(nb::init<>())
+        .def_rw("request_id", &tokenspeed::forward::RemoteDraftExport::request_id)
+        .def_rw("session_id", &tokenspeed::forward::RemoteDraftExport::session_id)
+        .def_rw("endpoint", &tokenspeed::forward::RemoteDraftExport::endpoint)
+        .def_rw("anchor_id", &tokenspeed::forward::RemoteDraftExport::anchor_id)
+        .def_rw("start", &tokenspeed::forward::RemoteDraftExport::start);
+
+    nb::class_<tokenspeed::forward::ReleaseRemoteDraftSnapshot>(forward_event, "ReleaseRemoteDraftSnapshot")
+        .def(nb::init<>())
+        .def_rw("ticket_id", &tokenspeed::forward::ReleaseRemoteDraftSnapshot::ticket_id);
+
+    nb::class_<tokenspeed::RemoteDraftRequest>(m, "RemoteDraftRequest")
+        .def_ro("request_id", &tokenspeed::RemoteDraftRequest::request_id)
+        .def_ro("session_id", &tokenspeed::RemoteDraftRequest::session_id)
+        .def_ro("status", &tokenspeed::RemoteDraftRequest::status)
+        .def_ro("endpoint", &tokenspeed::RemoteDraftRequest::endpoint)
+        .def_ro("anchor_id", &tokenspeed::RemoteDraftRequest::anchor_id)
+        .def_ro("computed_endpoint", &tokenspeed::RemoteDraftRequest::computed_endpoint)
+        .def_ro("reserved_endpoint", &tokenspeed::RemoteDraftRequest::reserved_endpoint)
+        .def_ro("results_in_flight", &tokenspeed::RemoteDraftRequest::results_in_flight)
+        .def_ro("admission_allowed", &tokenspeed::RemoteDraftRequest::admission_allowed);
+
+    nb::class_<tokenspeed::RemoteDraftSnapshot>(m, "RemoteDraftSnapshot")
+        .def_ro("ticket_id", &tokenspeed::RemoteDraftSnapshot::ticket_id)
+        .def_ro("request_id", &tokenspeed::RemoteDraftSnapshot::request_id)
+        .def_ro("session_id", &tokenspeed::RemoteDraftSnapshot::session_id)
+        .def_ro("endpoint", &tokenspeed::RemoteDraftSnapshot::endpoint)
+        .def_ro("anchor_id", &tokenspeed::RemoteDraftSnapshot::anchor_id)
+        .def_ro("start", &tokenspeed::RemoteDraftSnapshot::start)
+        .def_ro("block_tables", &tokenspeed::RemoteDraftSnapshot::block_tables);
 
     // ─── ExecutionEvent ─────────────────────────────────────────────
 
@@ -230,6 +294,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
             "prefill_lengths",
             [](const tokenspeed::ForwardBatch& op) -> const std::vector<std::int32_t>& { return op.prefill_lengths; },
             nb::rv_policy::reference_internal)
+        .def_ro("decode_input_tokens", &tokenspeed::ForwardBatch::decode_input_tokens)
         .def_ro("decode_input_ids", &tokenspeed::ForwardBatch::decode_input_ids)
         .def_ro("spec_candidate_ids", &tokenspeed::ForwardBatch::spec_candidate_ids)
         .def_prop_ro(
@@ -318,6 +383,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
             "next_execution_plan", [](tokenspeed::Scheduler& s) { return s.NextExecutionPlan(); },
             nb::call_guard<nb::gil_scoped_release>())
         .def("advance", &tokenspeed::Scheduler::Advance, nb::arg("event"))
+        .def("remote_draft_requests", &tokenspeed::Scheduler::RemoteDraftRequests)
+        .def("remote_draft_snapshots", &tokenspeed::Scheduler::RemoteDraftSnapshots)
         .def("drain_kv_events",
              [](tokenspeed::Scheduler& s) {
                  nb::list result;

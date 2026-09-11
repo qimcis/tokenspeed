@@ -188,7 +188,11 @@ class CacheArena:
             self.field_block_byte_offset(field.field_id, 0) // field.element_size,
         )
         spec = self._cache_group_specs_by_id[field.group_id]
-        if field.shape[0] != self.plan.prefix_granularity or spec.family == "state":
+        if (
+            field.shape[0] != self.plan.prefix_granularity
+            or spec.family == "state"
+            or field.page_stride_bytes != field.payload_bytes
+        ):
             return pages
         return pages.view(-1, *field.shape[1:])
 

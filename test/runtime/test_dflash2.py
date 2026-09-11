@@ -41,6 +41,7 @@ from tokenspeed.runtime.execution.drafter.dflash2 import (
     DFlash2,
     _greedy_path_torch,
     _walk_greedy_path,
+    select_dflash2_block,
 )
 
 # Imported for its register_backend() side effects on _BACKEND_REGISTRY.
@@ -48,7 +49,7 @@ from tokenspeed.runtime.layers.attention import backends  # noqa: F401
 from tokenspeed.runtime.layers.attention.registry import _BACKEND_REGISTRY
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.models import dflash as dflash_model
-from tokenspeed.runtime.models.dflash import DFlashDraftModel
+from tokenspeed.runtime.models.dflash import DFlashDraftModel, DFlashTargetProjection
 from tokenspeed.runtime.models.dflash2 import (
     CandidateSelector,
     DFlash2DraftModel,
@@ -191,26 +192,104 @@ def test_block_drafter_declares_only_its_sliding_mask(
     )
 
 
-def test_candidate_logits_processor_is_created_after_target_wiring() -> None:
+def test_candidate_logits_processor_uses_independently_bound_vocabulary() -> None:
     drafter = DFlash2.__new__(DFlash2)
     drafter.model = SimpleNamespace(config=SimpleNamespace(vocab_size=32))
     drafter.output_multiplier = 1.25
     drafter.final_logit_softcapping = 8.0
     drafter.candidate_logits_processor = None
     drafter.selector_top_k = 4
-    drafter.spec_num_tokens = 8
+    drafter.spec_num_tokens = 6
+    drafter.draft_block_size = 7
     drafter.input_buffers = SimpleNamespace(max_bs=2)
     drafter.lm_head = SimpleNamespace()
     drafter.logits_processor = SimpleNamespace(tp_rank=0, tp_size=1, tp_group=None)
 
-    with mock.patch("tokenspeed.runtime.execution.drafter.dflash2.DFlash.wire_target"):
-        drafter.wire_target(SimpleNamespace())
+    embedding = object()
+    drafter.bind_vocabulary(embedding, drafter.lm_head, drafter.logits_processor)
 
     assert drafter.candidate_logits_processor is not None
     assert drafter.candidate_logits_processor.logit_scale == 1.25
     assert drafter.candidate_logits_processor.final_logit_softcapping == 8.0
     # tp_size == 1 leaves nothing to gather, so the shard-local path stays off.
     assert not drafter.candidate_topk.enabled
+    assert drafter.embed_tokens is embedding
+
+
+def test_short_verify_runs_the_complete_native_backbone_and_selector() -> None:
+    drafter = DFlash2.__new__(DFlash2)
+    drafter.spec_num_tokens = 6
+    drafter.verify_width = 6
+    drafter.native_spec_num_tokens = 8
+    drafter.draft_query_width = 8
+    drafter.hidden_size = 4
+    drafter.selector_top_k = 1
+    drafter.attention_kind = "qwen_mha"
+    drafter.model = SimpleNamespace(config=SimpleNamespace(vocab_size=64))
+    drafter.input_buffers = SimpleNamespace(req_pool_indices_buf=torch.tensor([0, 1]))
+    drafter.draft_seq_lens_buf = torch.tensor([15, 31])
+    drafter.block_offsets = torch.arange(8)
+    drafter.block_ids_buf = torch.zeros(2, 8, dtype=torch.int32)
+    drafter.block_positions_buf = torch.empty(2, 8, dtype=torch.int64)
+    drafter.native_next_tokens_buf = torch.empty(2, 8, dtype=torch.int32)
+    drafter.next_tokens_buf = torch.empty(2, 6, dtype=torch.int32)
+    drafter.round_block_tables = {0: torch.tensor([[1, 2], [3, 4]])}
+    drafter.attn_backend = mock.Mock()
+    drafter.token_to_kv_pool = object()
+    drafter.embed_tokens = lambda ids, reduce_results: torch.zeros(ids.numel(), 4)
+    native_hidden = torch.zeros(16, 4)
+    drafter.draft_model_runner = SimpleNamespace(
+        forward=mock.Mock(return_value=SimpleNamespace(hidden_states=native_hidden))
+    )
+    candidates = torch.tensor(
+        [[10, 11, 12, 13, 14, 15, 16], [20, 21, 22, 23, 24, 25, 26]]
+    ).reshape(14, 1)
+    drafter._compute_candidates = mock.Mock(
+        return_value=(candidates, torch.zeros(14, 1))
+    )
+    drafter.candidate_selector = mock.Mock(return_value=torch.zeros(2, 7, 1, 1))
+
+    actual = drafter.draft(torch.tensor([3, 4], dtype=torch.int32))
+
+    assert actual.tolist() == [[3, 10, 11, 12, 13, 14], [4, 20, 21, 22, 23, 24]]
+    assert actual.is_contiguous()
+    assert drafter.native_next_tokens_buf.tolist() == [
+        [3, 10, 11, 12, 13, 14, 15, 16],
+        [4, 20, 21, 22, 23, 24, 25, 26],
+    ]
+    forward = drafter.draft_model_runner.forward.call_args.kwargs
+    assert forward["ctx"].input_num_tokens == 16
+    assert forward["positions"].tolist() == list(range(15, 23)) + list(range(31, 39))
+    assert drafter.candidate_selector.call_args.args[0].shape == (2, 7, 1)
+    published = drafter.attn_backend.publish_draft_step_locations.call_args.kwargs
+    assert published["num_tokens"] == 8
+    torch.testing.assert_close(published["cache_start"], drafter.draft_seq_lens_buf)
+
+
+def test_selector_rejects_truncation_before_native_walk() -> None:
+    with pytest.raises(ValueError, match="full native block"):
+        select_dflash2_block(
+            mock.Mock(),
+            torch.zeros(2, 7, 1, dtype=torch.int64),
+            torch.zeros(2, 7, 1),
+            torch.zeros(2, 8, 4),
+            torch.zeros(2, dtype=torch.int32),
+            torch.empty(2, 6, dtype=torch.int32),
+            64,
+        )
+
+
+def test_projector_only_component_has_checkpoint_names_without_backbone() -> None:
+    config = SimpleNamespace(hidden_size=4, dflash_config={"target_layer_ids": [1, 3]})
+    projector = DFlashTargetProjection(config)
+    assert set(dict(projector.named_parameters())) == {
+        "fc.weight",
+        "hidden_norm.weight",
+    }
+    assert projector.fc.weight.shape == (4, 8)
+    assert projector.context_in_features == 8
+    assert projector.target_layer_ids == [1, 3]
+    assert issubclass(DFlash2DraftModel, DFlashTargetProjection)
 
 
 def test_candidate_unary_logits_are_promoted_to_fp32() -> None:
@@ -531,6 +610,48 @@ def test_a_mixed_batch_derives_draft_lengths_without_reading_the_device() -> Non
 
     assert drafter.draft_seq_lens_buf.tolist() == [15, 22, 300]
     assert written == [{"decode_only": False}]
+
+
+@pytest.mark.parametrize("active_width", (1, 6))
+def test_context_injection_indexes_each_active_target_width(active_width: int) -> None:
+    drafter = DFlash.__new__(DFlash)
+    drafter.spec_num_tokens = 6
+    drafter.device = torch.device("cpu")
+    positions = torch.cat(
+        (torch.arange(15, 15 + active_width), torch.arange(31, 31 + active_width))
+    )
+    drafter.input_buffers = SimpleNamespace(
+        input_lengths_buf=torch.ones(2, dtype=torch.int32),
+        req_pool_indices_buf=torch.tensor([0, 1]),
+        positions_buf=positions,
+    )
+    drafter.runtime_states = SimpleNamespace(valid_cache_lengths=torch.tensor([15, 31]))
+    drafter.draft_seq_lens_buf = torch.zeros(2, dtype=torch.int32)
+    drafter._write_native_cache = mock.Mock()
+    ctx = SimpleNamespace(
+        bs=2,
+        num_extends=0,
+        decode_input_tokens=active_width,
+        input_num_tokens=2 * active_width,
+        attn_backend=SimpleNamespace(
+            decode_window_locations=lambda: torch.arange(2 * active_width)
+        ),
+    )
+    drafter._update_native_cache_from_target(
+        ctx,
+        SimpleNamespace(hidden_states=torch.zeros(2 * active_width, 8)),
+        torch.tensor([active_width, 1]),
+    )
+    assert drafter.draft_seq_lens_buf.tolist() == [15 + active_width, 32]
+    output = torch.arange(2 * active_width, dtype=torch.int32) + 10
+    anchor = drafter._current_tokens_from_output(
+        output,
+        torch.tensor([active_width, 1]),
+        0,
+        drafter._target_verify_width(ctx),
+        out=None,
+    )
+    assert anchor.tolist() == [10 + active_width - 1, 10 + active_width]
 
 
 def test_the_draft_residual_buffer_is_reused_and_recleared() -> None:

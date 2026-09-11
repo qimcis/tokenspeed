@@ -195,6 +195,9 @@ class ForwardStepRunner:
         sampling_backend: SamplingBackend | None = None,
         runtime_states: RuntimeStates | None = None,
         decode_graph_supported: bool = True,
+        *,
+        grammar_runtimes: dict[int, object] | None,
+        prepare_target_capture: Callable | None,
     ):
         self.config = config
         self.attn_backend = attn_backend
@@ -207,6 +210,8 @@ class ForwardStepRunner:
         self.capturable_grammar = capturable_grammar
         self.eager_grammar_buffers = eager_grammar_buffers
         self.runtime_states = runtime_states
+        self.grammar_runtimes = grammar_runtimes
+        self.prepare_target_capture = prepare_target_capture
         self.disable_padding = config.disable_cuda_graph_padding
         self.enable_cudagraph_gc = config.enable_cudagraph_gc
         self.device = config.device
@@ -232,6 +237,14 @@ class ForwardStepRunner:
         self.max_tokens_per_req = (
             config.spec_num_tokens if config.spec_algo is not None else 1
         )
+        self.decode_widths = (
+            tuple(sorted({1, self.max_tokens_per_req}))
+            if getattr(config, "remote_draft", False)
+            else (self.max_tokens_per_req,)
+        )
+        self.max_draft_tokens_per_req = getattr(
+            drafter, "draft_query_width", self.max_tokens_per_req
+        )
         self.overlap_schedule_depth = config.overlap_schedule_depth
         self.dp_size = config.data_parallel_size
         self.world_size = config.world_size
@@ -255,7 +268,7 @@ class ForwardStepRunner:
                 cache_group_page_counts=(
                     draft_token_to_kv_pool.arena.cache_group_page_counts
                 ),
-                max_tokens_per_req=self.max_tokens_per_req,
+                max_tokens_per_req=self.max_draft_tokens_per_req,
                 overlap_schedule_depth=self.overlap_schedule_depth,
             )
 
@@ -284,13 +297,13 @@ class ForwardStepRunner:
             for spec in token_to_kv_pool.arena.cache_group_specs
         }
 
-        self.graphs: dict[tuple[str, int], object] = {}
-        self.output_buffers: dict[tuple[str, int], tuple] = {}
+        self.graphs: dict[tuple[str, int, int], object] = {}
+        self.output_buffers: dict[tuple[str, int, int], tuple] = {}
         # TOKENSPEED_GRAPH_DEBUG=1: capture-time tensor-identity snapshots,
         # re-verified before every replay (graph_ptr_guard). Off by default —
         # replays then pay a single bool check.
         self._graph_debug = graph_debug_enabled()
-        self._metadata_snapshots: dict[tuple[str, int], dict[str, dict]] = {}
+        self._metadata_snapshots: dict[tuple[str, int, int], dict[str, dict]] = {}
 
         self._forward_func: Callable | None = forward_func
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
@@ -316,14 +329,15 @@ class ForwardStepRunner:
         with freeze_gc(self.enable_cudagraph_gc):
             # Capture backend-declared sampler variants explicitly.
             capture_items = [
-                (variant, bs)
-                for variant in self._cuda_graph_capture_variants()
+                (variant, width, bs)
+                for width in getattr(self, "decode_widths", (self.max_tokens_per_req,))
+                for variant in self._cuda_graph_capture_variants(width)
                 for bs in sorted(self.capture_bs, reverse=True)
             ]
             capture_range = tqdm.tqdm(capture_items) if rank == 0 else capture_items
             if rank == 0:
                 logger.info("Capturing batches: %s", self.capture_bs)
-            for variant, bs in capture_range:
+            for variant, width, bs in capture_range:
                 if rank == 0:
                     avail_mem = get_available_gpu_memory(
                         self.device, self.gpu_id, empty_cache=False
@@ -336,62 +350,69 @@ class ForwardStepRunner:
                     capture_range.set_description(
                         f"Capturing batches ({bs=}{variant_desc} {avail_mem=:.2f} GB)"
                     )
-                graph, output_buffers = self._capture_one(bs, variant=variant)
-                self.graphs[(variant, bs)] = graph
-                self.output_buffers[(variant, bs)] = output_buffers
+                graph, output_buffers = self._capture_one(
+                    bs, variant=variant, decode_width=width
+                )
+                self.graphs[(variant, width, bs)] = graph
+                self.output_buffers[(variant, width, bs)] = output_buffers
 
-    def _cuda_graph_capture_variants(self) -> tuple[str, ...]:
+    def _cuda_graph_capture_variants(self, decode_width: int) -> tuple[str, ...]:
+        width = decode_width or self.max_tokens_per_req
         if self.sampling_backend is None:
             return (CUDA_GRAPH_VARIANT_DEFAULT,)
-        variants = self.sampling_backend.cuda_graph_capture_variants(
-            self.max_tokens_per_req
+        variants = self.sampling_backend.cuda_graph_capture_variants(width)
+        return tuple(dict.fromkeys((CUDA_GRAPH_VARIANT_DEFAULT, *(variants or ()))))
+
+    def _prepare_sampling_capture(
+        self, bs: int, variant: str, decode_width: int
+    ) -> None:
+        if self.sampling_backend is not None:
+            self.sampling_backend.prepare_capture_variant(
+                bs=bs, num_tokens_per_req=decode_width, variant=variant
+            )
+
+    def _cuda_graph_key(self, bs: int, decode_width: int) -> tuple[str, int, int]:
+        width = decode_width or self.max_tokens_per_req
+        variant = (
+            self.sampling_backend.cuda_graph_replay_variant(width)
+            if self.sampling_backend is not None
+            else CUDA_GRAPH_VARIANT_DEFAULT
         )
-        if not variants:
-            return (CUDA_GRAPH_VARIANT_DEFAULT,)
-        deduped = tuple(dict.fromkeys((CUDA_GRAPH_VARIANT_DEFAULT, *variants)))
-        return deduped
-
-    def _prepare_sampling_capture(self, bs: int, variant: str) -> None:
-        if self.sampling_backend is None:
-            return
-        self.sampling_backend.prepare_capture_variant(
-            bs=bs,
-            num_tokens_per_req=self.max_tokens_per_req,
-            variant=variant,
-        )
-
-    def _cuda_graph_replay_variant(self) -> str:
-        if self.sampling_backend is None:
-            return CUDA_GRAPH_VARIANT_DEFAULT
-        return self.sampling_backend.cuda_graph_replay_variant(self.max_tokens_per_req)
-
-    def _cuda_graph_key(self, bs: int) -> tuple[str, int]:
-        variant = self._cuda_graph_replay_variant()
-        key = (variant, bs)
+        key = (variant, width, bs)
         if key in self.graphs:
             return key
         if variant != CUDA_GRAPH_VARIANT_DEFAULT:
-            captured_variants = sorted(
-                graph_variant
-                for graph_variant, graph_bs in self.graphs
-                if graph_bs == bs
-            )
+            captured = sorted(v for v, w, b in self.graphs if w == width and b == bs)
             raise RuntimeError(
-                "Sampling backend requested CUDA graph variant "
-                f"{variant!r} for batch size {bs}, but it was not captured. "
-                f"Captured variants for this batch size: {captured_variants}."
+                f"Sampling backend requested CUDA graph variant {variant!r} "
+                f"for width {width}, batch size {bs}, but it was not captured. "
+                f"Captured variants: {captured}."
             )
-        return (CUDA_GRAPH_VARIANT_DEFAULT, bs)
+        return key
 
-    def _has_cuda_graph_for_bs(self, bs: int) -> bool:
-        return (CUDA_GRAPH_VARIANT_DEFAULT, bs) in self.graphs
+    def _has_cuda_graph_for_bs(self, bs: int, decode_width: int) -> bool:
+        return (CUDA_GRAPH_VARIANT_DEFAULT, decode_width, bs) in self.graphs
 
-    def _verify_graph_metadata(self, graph_key: tuple[str, int]) -> None:
+    def _grammar_for_width(self, decode_width: int):
+        if self.grammar_runtimes is None:
+            return self.capturable_grammar, self.eager_grammar_buffers
+        from tokenspeed.runtime.grammar.capturable_grammar import (
+            CapturableGrammarExecutor,
+            EagerGrammarBuffers,
+        )
+
+        runtime = self.grammar_runtimes[decode_width]
+        return (
+            runtime if isinstance(runtime, CapturableGrammarExecutor) else None,
+            runtime if isinstance(runtime, EagerGrammarBuffers) else None,
+        )
+
+    def _verify_graph_metadata(self, graph_key: tuple[str, int, int]) -> None:
         """Assert the refresh rebound the tensors the captured graph reads."""
         snapshots = self._metadata_snapshots.get(graph_key)
         if snapshots is None:
             return
-        context = f"variant={graph_key[0]!r}, bs={graph_key[1]}"
+        context = f"variant={graph_key[0]!r}, width={graph_key[1]}, bs={graph_key[2]}"
         verify_graph_metadata(
             self.attn_backend, snapshots["target"], context=f"target, {context}"
         )
@@ -400,7 +421,10 @@ class ForwardStepRunner:
                 self.draft_attn_backend, snapshots["draft"], context=f"draft, {context}"
             )
 
-    def _capture_one(self, bs: int, variant: str = CUDA_GRAPH_VARIANT_DEFAULT):
+    def _capture_one(self, bs: int, variant: str, decode_width: int):
+        capturable_grammar, eager_grammar_buffers = self._grammar_for_width(
+            decode_width
+        )
         graph_cls = (
             self.device_module.NPUGraph
             if self.device == "npu"
@@ -414,8 +438,9 @@ class ForwardStepRunner:
             token_to_kv_pool=self.token_to_kv_pool,
             bs=bs,
             num_extends=0,
-            input_num_tokens=bs * self.max_tokens_per_req,
+            input_num_tokens=bs * decode_width,
             forward_mode=capture_forward_mode,
+            decode_input_tokens=decode_width,
             # A decode graph is only ever replayed when every DP rank is
             # decoding or idle (see _can_use_graph), so capture must record that
             # same answer. Leaving the default False would let capture-time code
@@ -425,7 +450,7 @@ class ForwardStepRunner:
             all_decode_or_idle=True,
             capture_hidden_mode=(
                 CaptureHiddenMode.FULL
-                if self.drafter is not None
+                if self.drafter is not None or self.prepare_target_capture is not None
                 else CaptureHiddenMode.NULL
             ),
         )
@@ -434,7 +459,7 @@ class ForwardStepRunner:
         # all-gather comm layers know token counts for all DP ranks.
         # During capture, use uniform dummy counts across ranks.
         if self.dp_size > 1:
-            ctx.global_num_tokens = [bs * self.max_tokens_per_req] * self.world_size
+            ctx.global_num_tokens = [bs * decode_width] * self.world_size
             # global_bs must ALSO be set at capture. The draft first step's
             # collective sizing (reported via report_collective_sizing) reads
             # global_bs; if left None at capture it records a single-rank
@@ -470,10 +495,10 @@ class ForwardStepRunner:
         # eager) — the captured graph reads from the same memory.
         bind_grammar_mask_buf(
             sampling_info,
-            self.eager_grammar_buffers,
+            eager_grammar_buffers,
             bs,
-            spec=self.drafter is not None,
-            capturable=self.capturable_grammar,
+            spec=decode_width > 1,
+            capturable=capturable_grammar,
             grammar_backend=self.grammar_backend,
         )
 
@@ -481,8 +506,8 @@ class ForwardStepRunner:
             # Dummy add_batch keeps the grammar queue 1:1 with replays —
             # fetch_batch pops once per forward, so warmup + capture
             # would otherwise raise queue.Empty.
-            if self.capturable_grammar is not None:
-                self.capturable_grammar.add_batch(
+            if capturable_grammar is not None:
+                capturable_grammar.add_batch(
                     grammars=[None] * bs, bs=bs, has_candidates=False
                 )
             return self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
@@ -496,11 +521,13 @@ class ForwardStepRunner:
             for _ in range(4):
                 self.device_module.synchronize()
                 dist.barrier()
-                self._prepare_sampling_capture(bs=bs, variant=variant)
+                self._prepare_sampling_capture(
+                    bs=bs, variant=variant, decode_width=decode_width
+                )
                 # Keep warmup seq_lens >= q_len_per_req so no query row gets an
                 # empty causal span; a stale seq_len of 1 overflows to non-finite KV.
-                self.input_buffers.seq_lens_buf[:bs].fill_(self.max_tokens_per_req)
-                self._init_capture_metadata(bs)
+                self.input_buffers.seq_lens_buf[:bs].fill_(decode_width)
+                self._init_capture_metadata(bs, ctx)
                 run_once()
             # Order the reset below after the last warmup's stateful kernels.
             self.device_module.synchronize()
@@ -516,13 +543,15 @@ class ForwardStepRunner:
         # Warmups can switch a backend back to eager metadata objects. Restore
         # the graph-backed metadata immediately before capture so replay-time
         # metadata refreshes update the same tensors recorded by the graph.
-        self._init_capture_metadata(bs)
+        self._init_capture_metadata(bs, ctx)
 
         # Fill sampler buffers OUTSIDE the capture so RNG ops aren't recorded.
-        self._prepare_sampling_capture(bs=bs, variant=variant)
+        self._prepare_sampling_capture(
+            bs=bs, variant=variant, decode_width=decode_width
+        )
         # Warmup forwards can mutate aliased metadata buffers, so refresh
         # them again immediately before graph capture records the final views.
-        self._init_capture_metadata(bs)
+        self._init_capture_metadata(bs, ctx)
 
         self.deepep_adapter.capture()
 
@@ -547,13 +576,13 @@ class ForwardStepRunner:
         # them, so the dummy run_once pushed stays queued — drain it, and
         # reset prev_batch/current_batch so the first real replay's build
         # doesn't advance the matcher from a stale warmup entry.
-        if self.capturable_grammar is not None:
+        if capturable_grammar is not None:
             while True:
                 try:
-                    self.capturable_grammar.queue.get_nowait()
+                    capturable_grammar.queue.get_nowait()
                 except queue.Empty:
                     break
-            self.capturable_grammar.reset_state()
+            capturable_grammar.reset_state()
 
         global_graph_memory_pool = graph.pool()
 
@@ -564,7 +593,7 @@ class ForwardStepRunner:
             snapshots = {"target": snapshot_graph_metadata(self.attn_backend)}
             if self.draft_attn_backend is not None:
                 snapshots["draft"] = snapshot_graph_metadata(self.draft_attn_backend)
-            self._metadata_snapshots[(variant, bs)] = snapshots
+            self._metadata_snapshots[(variant, decode_width, bs)] = snapshots
 
         return graph, out
 
@@ -578,6 +607,9 @@ class ForwardStepRunner:
         _is_cuda_graph_phase = True
         try:
             for bs in batch_sizes:
+                capturable_grammar, eager_grammar_buffers = self._grammar_for_width(
+                    self.max_tokens_per_req
+                )
                 ctx = ForwardContext(
                     attn_backend=self.attn_backend,
                     token_to_kv_pool=self.token_to_kv_pool,
@@ -585,12 +617,14 @@ class ForwardStepRunner:
                     num_extends=0,
                     input_num_tokens=bs * self.max_tokens_per_req,
                     forward_mode=ForwardMode.DECODE,
+                    decode_input_tokens=self.max_tokens_per_req,
                     # Match _capture_one: the lazy state this warms up (DeepEP
                     # buffers among it) must be the state capture will record.
                     all_decode_or_idle=True,
                     capture_hidden_mode=(
                         CaptureHiddenMode.FULL
                         if self.drafter is not None
+                        or self.prepare_target_capture is not None
                         else CaptureHiddenMode.NULL
                     ),
                 )
@@ -617,10 +651,10 @@ class ForwardStepRunner:
 
                 bind_grammar_mask_buf(
                     sampling_info,
-                    self.eager_grammar_buffers,
+                    eager_grammar_buffers,
                     bs,
-                    spec=self.drafter is not None,
-                    capturable=self.capturable_grammar,
+                    spec=self.max_tokens_per_req > 1,
+                    capturable=capturable_grammar,
                     grammar_backend=self.grammar_backend,
                 )
 
@@ -629,15 +663,33 @@ class ForwardStepRunner:
                 self._prepare_sampling_capture(
                     bs=bs,
                     variant=CUDA_GRAPH_VARIANT_DEFAULT,
+                    decode_width=self.max_tokens_per_req,
                 )
                 self.input_buffers.seq_lens_buf[:bs].fill_(self.max_tokens_per_req)
-                self._init_capture_metadata(bs)
+                self._init_capture_metadata(bs, ctx)
+                if capturable_grammar is not None:
+                    # The eager forward invokes the same grammar hostfunc as
+                    # graph capture: one queue entry is required per launch.
+                    capturable_grammar.add_batch(
+                        grammars=[None] * bs,
+                        bs=bs,
+                        has_candidates=False,
+                        tokens_per_req=self.max_tokens_per_req,
+                        advance_mask=None,
+                    )
                 self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
                 self.device_module.synchronize()
                 dist.barrier()
 
                 if self.sampling_backend is not None:
                     self.sampling_backend.reset_capture_state()
+                if capturable_grammar is not None:
+                    while True:
+                        try:
+                            capturable_grammar.queue.get_nowait()
+                        except queue.Empty:
+                            break
+                    capturable_grammar.reset_state()
         finally:
             _is_cuda_graph_phase = old_cuda_graph_phase
 
@@ -651,7 +703,7 @@ class ForwardStepRunner:
         """
         return {gid: table[:bs] for gid, table in self._placeholder_tables.items()}
 
-    def _init_capture_metadata(self, bs: int):
+    def _init_capture_metadata(self, bs: int, ctx: ForwardContext):
         tables = self.placeholder_block_tables(bs)
         self.attn_backend.init_forward_metadata_capture_cuda_graph(
             bs,
@@ -659,7 +711,9 @@ class ForwardStepRunner:
             self.input_buffers.seq_lens_buf[:bs],
             ForwardMode.DECODE,
             block_tables=tables,
-            num_tokens=bs * self.max_tokens_per_req,
+            num_tokens=bs
+            * (getattr(ctx, "decode_input_tokens", None) or self.max_tokens_per_req),
+            decode_input_tokens=ctx.decode_input_tokens,
         )
         if self.draft_attn_backend is not None:
             # One arena, one contract: the draft consumes its own groups out
@@ -671,13 +725,16 @@ class ForwardStepRunner:
                 self.input_buffers.seq_lens_buf[:bs],
                 ForwardMode.DECODE,
                 block_tables=tables,
-                num_tokens=bs * self.max_tokens_per_req,
+                num_tokens=bs * self.max_draft_tokens_per_req,
             )
             # Block drafters (DFLASH) re-run the unified refresh inside their
             # step loop with this round's tables; capture warm-ups run that
             # loop eagerly before any live decode has published tables, so
             # seed the placeholders here too.
             self.drafter.round_block_tables = tables
+
+        if getattr(self, "prepare_target_capture", None) is not None:
+            self.prepare_target_capture(ctx, tables, 0)
 
     def _prepare_decode_metadata(
         self,
@@ -702,7 +759,8 @@ class ForwardStepRunner:
             block_tables = self.placeholder_block_tables(padded_bs)
         # Pure decode: ctx.input_num_tokens == bs * max_tokens_per_req
         # (backends that key off their own buffers ignore it).
-        cache_kwargs["num_tokens"] = padded_bs * self.max_tokens_per_req
+        width = cache_kwargs.get("decode_input_tokens") or self.max_tokens_per_req
+        cache_kwargs["num_tokens"] = padded_bs * width
         self.attn_backend.refresh_decode_metadata(
             padded_bs,
             actual_bs,
@@ -729,7 +787,8 @@ class ForwardStepRunner:
                 forward_mode=ForwardMode.DECODE,
                 block_tables=block_tables,
                 for_graph_replay=use_graph,
-                num_tokens=padded_bs * self.max_tokens_per_req,
+                num_tokens=padded_bs
+                * getattr(self, "max_draft_tokens_per_req", self.max_tokens_per_req),
             )
             # Block drafters re-run the same refresh inside their step loop;
             # hand them this round's tables (dies with the drafter-side
@@ -802,25 +861,38 @@ class ForwardStepRunner:
         if self.dp_size <= 1 or ctx.global_num_tokens is None:
             return None
         max_num_tokens = max(ctx.global_num_tokens)
-        return (max_num_tokens + self.max_tokens_per_req - 1) // self.max_tokens_per_req
+        width = getattr(ctx, "decode_input_tokens", None) or self.max_tokens_per_req
+        return (max_num_tokens + width - 1) // width
 
     def _can_use_graph(self, bs: int, ctx: ForwardContext) -> bool:
         if self.disable:
             return False
         if not ctx.forward_mode.is_decode():
             return False
+        width = getattr(ctx, "decode_input_tokens", None) or self.max_tokens_per_req
         if self.dp_size > 1:
+            if (
+                getattr(ctx, "global_decode_input_tokens", None) is not None
+                and getattr(ctx, "decode_graph_width", None) is None
+            ):
+                return False
             if not ctx.all_decode_or_idle:
                 return False
             global_bs = self._global_graph_bs(ctx)
             if global_bs is None or global_bs == 0:
                 return False
             if self.disable_padding:
-                return self._has_cuda_graph_for_bs(global_bs)
-            return global_bs <= self.max_capture_bs
+                return self._has_cuda_graph_for_bs(global_bs, width)
+            return (
+                width in getattr(self, "decode_widths", (self.max_tokens_per_req,))
+                and global_bs <= self.max_capture_bs
+            )
         if self.disable_padding:
-            return self._has_cuda_graph_for_bs(bs)
-        return bs <= self.max_capture_bs
+            return self._has_cuda_graph_for_bs(bs, width)
+        return (
+            width in getattr(self, "decode_widths", (self.max_tokens_per_req,))
+            and bs <= self.max_capture_bs
+        )
 
     def can_run(self, bs: int, ctx: ForwardContext) -> bool:
         return self._can_use_graph(bs, ctx)
@@ -896,12 +968,14 @@ class ForwardStepRunner:
         input buffers on every call — empty for a pure decode or the idle
         replay, which never read them.
         """
+        width = getattr(ctx, "decode_input_tokens", None) or self.max_tokens_per_req
         use_graph = self._can_use_graph(bs, ctx)
         padded_bs = self._padded_bs(bs, ctx) if use_graph else bs
         active_req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
 
         if use_graph and padded_bs != bs:
             ctx.bs = padded_bs
+            ctx.input_num_tokens = padded_bs * width
             pad = padded_bs - bs
             seq_lens = torch.nn.functional.pad(
                 self.input_buffers.seq_lens_buf[:bs], (0, pad), value=1
@@ -947,6 +1021,7 @@ class ForwardStepRunner:
                 forward_mode=ctx.forward_mode,
                 use_graph=use_graph,
                 block_tables=block_tables,
+                decode_input_tokens=width,
             )
         else:
             # Extend/mixed (and the never-in-practice eager idle): dynamic
@@ -967,7 +1042,15 @@ class ForwardStepRunner:
                 all_decode_or_idle=ctx.all_decode_or_idle,
                 capture_hidden_mode=ctx.capture_hidden_mode,
                 num_tokens=ctx.input_num_tokens,
+                decode_input_tokens=width,
                 block_tables=block_tables,
+            )
+
+        if getattr(self, "prepare_target_capture", None) is not None:
+            self.prepare_target_capture(
+                ctx,
+                block_tables if bs > 0 else self.placeholder_block_tables(padded_bs),
+                bs,
             )
 
         if use_graph:
@@ -976,7 +1059,7 @@ class ForwardStepRunner:
             # the per-request generators with the capture-stub generator.
             self.deepep_adapter.replay()
 
-            graph_key = self._cuda_graph_key(padded_bs)
+            graph_key = self._cuda_graph_key(padded_bs, width)
             graph = self.graphs[graph_key]
             if self._graph_debug:
                 self._verify_graph_metadata(graph_key)
@@ -996,10 +1079,10 @@ class ForwardStepRunner:
             ) = self.output_buffers[graph_key]
 
             result = (
-                output_tokens[: bs * self.max_tokens_per_req],
+                output_tokens[: bs * width],
                 output_lengths[:bs],
                 (
-                    output_logprobs[: bs * self.max_tokens_per_req]
+                    output_logprobs[: bs * width]
                     if output_logprobs is not None
                     else None
                 ),
@@ -1009,13 +1092,12 @@ class ForwardStepRunner:
 
         if use_graph and padded_bs != bs:
             ctx.bs = bs
+            ctx.input_num_tokens = bs * width
 
         # Update mamba/GDN state after speculative verify (base default no-op).
-        if self.drafter is not None and ctx.forward_mode.is_decode():
+        if width > 1 and ctx.forward_mode.is_decode():
             self.attn_backend.update_mamba_state_after_mtp_verify(result[1])
-        if self.drafter is not None and (
-            ctx.forward_mode.is_decode() or ctx.forward_mode.is_mixed()
-        ):
+        if width > 1 and (ctx.forward_mode.is_decode() or ctx.forward_mode.is_mixed()):
             self.attn_backend.commit_speculative_state_after_verify(
                 result[1],
                 num_extends=ctx.num_extends,

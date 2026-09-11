@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <stdexcept>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -58,6 +59,8 @@ struct DecodeOperation : public ForwardOperationBase {
 using ForwardOperation = std::variant<PrefillOperation, DecodeOperation>;
 
 struct ForwardBatch {
+    // Frozen homogeneous verification width, zero for a prefill-only batch.
+    std::int32_t decode_input_tokens{0};
     std::vector<std::string> request_ids;
     std::vector<std::int32_t> request_pool_indices;
     std::vector<std::int32_t> input_lengths;
@@ -101,6 +104,10 @@ struct ForwardBatch {
                                          prefill->shifted_input_ids.end());
                 extend_prefix_lens.push_back(prefill->extend_prefix_len);
             } else if (auto* decode = std::get_if<DecodeOperation>(&op)) {
+                if (!decode_input_ids.empty() && decode_input_tokens != decode->input_length) {
+                    throw std::invalid_argument("ForwardBatch decode rows must have one verification width");
+                }
+                decode_input_tokens = decode->input_length;
                 decode_input_ids.push_back(decode->decode_input_id);
                 spec_candidate_ids.push_back(std::move(decode->spec_candidate_ids));
             }

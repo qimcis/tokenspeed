@@ -63,6 +63,25 @@ void SchedulerConfig::Validate() const {
     if (decode_input_tokens < 0) {
         throw std::invalid_argument("Scheduler: decode_input_tokens must be >= 0");
     }
+    if (draft_input_tokens < 0) {
+        throw std::invalid_argument("Scheduler: draft_input_tokens must be non-negative");
+    }
+    if (remote_draft_enabled) {
+        if (role != Role::kFused || decode_input_tokens != 6 || draft_input_tokens != 0) {
+            throw std::invalid_argument(
+                "Scheduler: remote drafting requires fused role, target width six and no local draft");
+        }
+        if (remote_draft_min_ready <= 0 || remote_draft_min_ready > max_batch_size || remote_draft_max_defer_ms < 0) {
+            throw std::invalid_argument(
+                "Scheduler: remote drafting requires a valid minimum batch and finite non-negative deferral");
+        }
+        const auto feature = std::find_if(cache_groups.begin(), cache_groups.end(), [this](const auto& group) {
+            return group.group_id == remote_draft_feature_group;
+        });
+        if (feature == cache_groups.end() || feature->retention != CacheGroupConfig::Retention::SlidingWindow) {
+            throw std::invalid_argument("Scheduler: remote drafting requires its sliding feature cache group");
+        }
+    }
     if (max_scheduled_tokens <= 0) {
         throw std::invalid_argument("Scheduler: max_scheduled_tokens must be > 0");
     }

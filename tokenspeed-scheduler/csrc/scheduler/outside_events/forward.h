@@ -51,9 +51,50 @@ struct UpdateReserveNumTokens {
 struct Abort {
     std::string request_id;
 };
+struct RemoteDraftTick {
+    std::int64_t now_ms{0};
+};
+
+struct RemoteDraftPending {
+    std::string request_id;
+    std::string session_id;
+    std::int32_t endpoint{-1};
+    std::int32_t anchor_id{-1};
+    std::int64_t now_ms{0};
+};
+
+struct RemoteDraftReady {
+    std::string request_id;
+    std::string session_id;
+    std::int32_t endpoint{-1};
+    std::int32_t anchor_id{-1};
+    // Proposed continuation only; the scheduler prepends the explicit anchor.
+    std::vector<std::int32_t> candidate_ids;
+};
+
+struct RemoteDraftUnavailable {
+    std::string request_id;
+    std::string session_id;
+    std::int32_t endpoint{-1};
+    std::int32_t anchor_id{-1};
+};
+
+struct RemoteDraftExport {
+    std::string request_id;
+    std::string session_id;
+    std::int32_t endpoint{-1};
+    std::int32_t anchor_id{-1};
+    std::int32_t start{0};
+};
+
+struct ReleaseRemoteDraftSnapshot {
+    std::uint64_t ticket_id{0};
+};
 }  // namespace forward
 
 using ForwardEvent =
-    std::variant<forward::ExtendResult, forward::Finish, forward::Abort, forward::UpdateReserveNumTokens>;
+    std::variant<forward::ExtendResult, forward::Finish, forward::Abort, forward::UpdateReserveNumTokens,
+                 forward::RemoteDraftTick, forward::RemoteDraftPending, forward::RemoteDraftReady,
+                 forward::RemoteDraftUnavailable, forward::RemoteDraftExport, forward::ReleaseRemoteDraftSnapshot>;
 
 }  // namespace tokenspeed

@@ -408,6 +408,11 @@ ts serve zai-org/GLM-5.3 \
   --speculative-num-steps 3
 ```
 
+For an independently batched DFlash2 worker, see
+[Remote DFlash2 for GLM-5.3](remote-dflash2.md). That recipe separates native
+draft width eight from target width six and true width-one fallback; GPU and
+economic qualification are pending.
+
 ## GLM 5.3 Flash
 
 GLM-5.3-Flash automatically configures its KDA/DSA backends and supports MTP from

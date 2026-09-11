@@ -105,6 +105,8 @@ class RequestState:
         self.cached_tokens: int = 0
         self.prefix_len: int = 0
         self.spec_verify_ct: int = 0
+        self.spec_verify_tokens: int = 0
+        self.spec_output_tokens: int = 0
         self.accept_draft_tokens: float | None = None
 
         # request stats (host-side); tracker attached only with --enable-log-request-stats
@@ -596,6 +598,8 @@ class OutputProcesser:
             return
         if self.spec_algorithm is None or self.spec_num_tokens is None:
             return
+        if forward_op.decode_input_tokens <= 1:
+            return
         if model_execution_results.output_lengths is None:
             return
         num_slots, accepted_draft_tokens = self._aggregate_spec_decode_step(
@@ -607,7 +611,7 @@ class OutputProcesser:
             self.metrics.record_spec_decode_step(
                 num_decode_slots=num_slots,
                 accepted_draft_tokens=accepted_draft_tokens,
-                draft_width=self.spec_num_tokens,
+                draft_width=forward_op.decode_input_tokens,
             )
 
     def add_cached_tokens(self, rids: list[str], extend_prefix_lens: list[int]) -> None:
@@ -648,6 +652,7 @@ class OutputProcesser:
             forward_op.extend_prefix_lens,
         )
         num_extends = forward_op.num_extends()
+        decode_width = forward_op.decode_input_tokens
 
         # per-request stats timing (host-side, only when --enable-log-request-stats)
         stats_now = time.time() if self.enable_log_request_stats else 0.0
@@ -691,8 +696,10 @@ class OutputProcesser:
                 else None
             )
             is_decode_slot = i >= num_extends
-            if self.spec_num_tokens is not None and is_decode_slot:
-                pt += self.spec_num_tokens
+            if is_decode_slot:
+                # The immutable plan describes this result's row stride. A
+                # remote fallback has one column even when capacity is six.
+                pt += decode_width
             else:
                 pt += output_length
 
@@ -775,8 +782,13 @@ class OutputProcesser:
                     )
 
             if is_decode_slot and self.spec_algorithm is not None:
-                request_state.spec_verify_ct += 1
                 self._check_physical_extent(rid, request_state, output_length)
+            is_spec_verify = (
+                is_decode_slot and self.spec_algorithm is not None and decode_width > 1
+            )
+            if is_spec_verify:
+                request_state.spec_verify_ct += 1
+                request_state.spec_verify_tokens += decode_width
 
             # With the capturable grammar pipeline the matcher is
             # advanced by the hostfunc; here we just read which token
@@ -815,14 +827,17 @@ class OutputProcesser:
                     request_state.check_finished(skip_grammar_termination=use_hostfunc)
                 new_ids.append(model_output_id)
                 if request_state.finished:
-                    request_state.accept_draft_tokens = (
-                        (len(request_state.output_ids) - 1)
-                        / request_state.spec_verify_ct
-                        if request_state.spec_verify_ct > 0
-                        else 0
-                    )
-                    self.log_accept_length(rid, request_state)
                     break
+
+            if is_spec_verify:
+                request_state.spec_output_tokens += len(new_ids)
+            if request_state.finished:
+                request_state.accept_draft_tokens = (
+                    request_state.spec_output_tokens / request_state.spec_verify_ct
+                    if request_state.spec_verify_ct > 0
+                    else 0
+                )
+                self.log_accept_length(rid, request_state)
 
             # first output token == TTFT anchor
             if request_state.output_ids:

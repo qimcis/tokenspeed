@@ -269,7 +269,7 @@ Req: chatcmpl-019ef6b7 Finish! RequestStats(status='finished', reason='stop', pr
 | `total_ms` | Received → finished/aborted. |
 | `preempt_ms` / `preempt_count` | Wall-clock this request's decode was delayed by prefilling other requests, and the number of such interruptions. Host-side best-effort. |
 | `decode_tps` | Decode throughput (generated tokens / decode window). |
-| `acc_len` / `acc_rate` | Spec-decode acceptance length and rate (`None` when speculative decoding is off). |
+| `acc_len` / `acc_rate` | Committed tokens per speculative verify round, and accepted draft tokens per verified query slot. The legacy rate denominator includes the anchor. Actual consumed widths are summed; width-one fallback contributes to neither measure. Both are `None` when no speculative round ran. |
 | `recv_ts` / `commit_ts` / `finish_ts` | Absolute epoch timestamps for received / scheduled / finished. |
 
 ### KV Cache Events

@@ -787,12 +787,12 @@ class TestCudaGraphSamplingVariants(unittest.TestCase):
         wrapper.sampling_backend = backend
         wrapper.max_tokens_per_req = 4
         wrapper.graphs = {
-            (CUDA_GRAPH_VARIANT_DEFAULT, 8): object(),
-            (CUDA_GRAPH_VARIANT_TRITON_VERIFY_NO_FILTER, 8): object(),
+            (CUDA_GRAPH_VARIANT_DEFAULT, 4, 8): object(),
+            (CUDA_GRAPH_VARIANT_TRITON_VERIFY_NO_FILTER, 4, 8): object(),
         }
 
         self.assertEqual(
-            wrapper._cuda_graph_capture_variants(),
+            wrapper._cuda_graph_capture_variants(4),
             (
                 CUDA_GRAPH_VARIANT_DEFAULT,
                 CUDA_GRAPH_VARIANT_TRITON_VERIFY_NO_FILTER,
@@ -800,14 +800,14 @@ class TestCudaGraphSamplingVariants(unittest.TestCase):
         )
         self.assertEqual(backend.capture_num_tokens_per_req, 4)
         self.assertEqual(
-            wrapper._cuda_graph_key(8),
-            (CUDA_GRAPH_VARIANT_TRITON_VERIFY_NO_FILTER, 8),
+            wrapper._cuda_graph_key(8, 4),
+            (CUDA_GRAPH_VARIANT_TRITON_VERIFY_NO_FILTER, 4, 8),
         )
         self.assertEqual(backend.replay_num_tokens_per_req, 4)
 
         backend.variant = "missing"
         with self.assertRaisesRegex(RuntimeError, "was not captured"):
-            wrapper._cuda_graph_key(8)
+            wrapper._cuda_graph_key(8, 4)
 
 
 class TestFlashInferFullFlipExtended(unittest.TestCase):

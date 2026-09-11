@@ -128,7 +128,9 @@ def create_model_runner(
     )
 
     draft_model_runner = None
-    if draft_model_config is not None:
+    if draft_model_config is not None and not getattr(
+        server_args, "remote_draft_endpoint", None
+    ):
         draft_model_runner = ModelRunner(
             model_config=draft_model_config,
             gpu_id=gpu_id,
@@ -151,6 +153,8 @@ def create_model_executor(
     draft_model_runner: ModelRunner | None = None,
     draft_attn_backend: AttentionBackend | None = None,
     draft_token_to_kv_pool: CachePool | None = None,
+    *,
+    remote_feature_capture_factory,
 ) -> ModelExecutor:
     """Create the model executor with its sampler configuration."""
     if server_args.enable_nvtx:
@@ -182,4 +186,5 @@ def create_model_executor(
         draft_model_runner=draft_model_runner,
         draft_attn_backend=draft_attn_backend,
         draft_token_to_kv_pool=draft_token_to_kv_pool,
+        remote_feature_capture_factory=remote_feature_capture_factory,
     )

@@ -229,13 +229,19 @@ class EngineMetrics:
         )
         self.spec_decode_num_draft_tokens = Counter(
             name="tokenspeed:spec_decode_num_draft_tokens",
-            documentation="Draft tokens proposed across verify steps.",
+            documentation=(
+                "Verification query slots in speculative rounds, including the "
+                "anchor (legacy metric name). Excludes width-one fallback."
+            ),
             labelnames=labelnames,
             **kw,
         )
         self.spec_decode_num_drafts = Counter(
             name="tokenspeed:spec_decode_num_drafts",
-            documentation="Number of speculative verify rounds (per request-slot).",
+            documentation=(
+                "Number of speculative verify rounds (per request-slot). "
+                "Excludes width-one fallback."
+            ),
             labelnames=labelnames,
             **kw,
         )
@@ -248,6 +254,58 @@ class EngineMetrics:
             labelnames=labelnames,
             **kw,
         )
+        self.remote_draft_gauges = {
+            field: Gauge(
+                name=f"tokenspeed:remote_draft_{field}",
+                documentation=description,
+                labelnames=labelnames,
+                multiprocess_mode="livemax",
+                **kw,
+            )
+            for field, description in (
+                (
+                    "connected",
+                    "One when the private drafter has a compatible active connection.",
+                ),
+                (
+                    "resident_sessions",
+                    "Worker-admitted sessions tracked by this attention cohort.",
+                ),
+                (
+                    "pending_requests",
+                    "Requests whose confirmed-prefix proposal is pending in the scheduler.",
+                ),
+                (
+                    "ready_requests",
+                    "Requests with a matching ready proposal in the scheduler.",
+                ),
+                (
+                    "outstanding_exports",
+                    "Projected-feature snapshots retaining scheduler source pins.",
+                ),
+            )
+        }
+
+    def record_remote_draft_snapshot(
+        self,
+        *,
+        connected: int,
+        resident_sessions: int,
+        pending_requests: int,
+        ready_requests: int,
+        outstanding_exports: int,
+    ) -> None:
+        """Publish bounded cohort gauges without request or session labels."""
+        if not self.enabled:
+            return
+        for field, value in (
+            ("connected", connected),
+            ("resident_sessions", resident_sessions),
+            ("pending_requests", pending_requests),
+            ("ready_requests", ready_requests),
+            ("outstanding_exports", outstanding_exports),
+        ):
+            self.remote_draft_gauges[field].labels(**self.labels).set(value)
 
     def set_scheduler_snapshot(
         self, *, running: int, waiting: int, kv_cache_usage_ratio: float
@@ -289,6 +347,12 @@ class EngineMetrics:
         accepted_draft_tokens: int,
         draft_width: int,
     ) -> None:
+        """Record a speculative round using its actual consumed verify width.
+
+        ``draft_width`` retains the legacy query-slot convention: it includes
+        the anchor. The caller excludes ordinary width-one fallback rounds.
+        ``accepted_draft_tokens`` excludes the bonus token sampled by verify.
+        """
         if not self.enabled or num_decode_slots <= 0:
             return
         self.spec_decode_num_drafts.labels(**self.labels).inc(num_decode_slots)

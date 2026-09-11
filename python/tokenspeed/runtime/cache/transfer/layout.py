@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+    cache_field_consumer_id,
     cache_field_layer_id,
 )
 
@@ -63,11 +64,32 @@ def select_layer_fields(
     selected = set()
     consumers = [[] for _ in range(num_layers)]
     for field in fields:
+        if cache_field_consumer_id(field.field_id) is not None:
+            continue
         layer_id = cache_field_layer_id(field.field_id)
         if first_layer <= layer_id < last_layer:
             selected.add(field.field_id)
             consumers[layer_id - first_layer].append(field.field_id)
     return frozenset(selected), tuple(tuple(consumer) for consumer in consumers)
+
+
+def select_non_layer_fields(
+    fields: tuple[object, ...],
+) -> tuple[frozenset[str], tuple[str, ...], tuple[tuple[str, ...], ...]]:
+    """Select named cache consumers in stable order, independent of layers.
+
+    Returns the selected fields, consumer names and corresponding field
+    tuples. Target cache views append these consumers after their layers;
+    layer indices and model architecture therefore remain unchanged.
+    """
+    consumers: dict[str, list[str]] = {}
+    for field in fields:
+        consumer_id = cache_field_consumer_id(field.field_id)
+        if consumer_id is not None:
+            consumers.setdefault(consumer_id, []).append(field.field_id)
+    names = tuple(sorted(consumers))
+    grouped = tuple(tuple(sorted(consumers[name])) for name in names)
+    return frozenset(field for fields in grouped for field in fields), names, grouped
 
 
 @dataclass(frozen=True, slots=True)

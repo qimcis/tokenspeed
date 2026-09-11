@@ -183,7 +183,8 @@ def test_base_wire_target_is_a_noop():
 
 
 def test_dflash_wire_target_requires_capture_support():
-    drafter = mock.MagicMock(spec=DFlash)
+    drafter = DFlash.__new__(DFlash)
+    drafter.model = SimpleNamespace(config=SimpleNamespace(target_layer_ids=[4, 5]))
     target_model = mock.MagicMock(
         spec=["get_input_embeddings", "lm_head", "logits_processor"]
     )
@@ -192,7 +193,8 @@ def test_dflash_wire_target_requires_capture_support():
 
 
 def test_dflash_wire_target_installs_capture_layers():
-    drafter = mock.MagicMock(spec=DFlash)
+    drafter = DFlash.__new__(DFlash)
+    drafter.model = SimpleNamespace(config=SimpleNamespace(target_layer_ids=[4, 5]))
     drafter.target_layer_ids = [4, 5]
     target_model = mock.MagicMock(
         spec=[
