@@ -28,6 +28,7 @@ import torch
 
 from tokenspeed.runtime.execution.multimodal_runtime import MultimodalRuntime
 from tokenspeed.runtime.execution.weight_loader import WeightLoader
+from tokenspeed.runtime.layers.attention.backends.support import CudaGraphSupport
 from tokenspeed.runtime.layers.moe.utils import initialize_moe_config
 from tokenspeed.runtime.multimodal.embedder import warmup_multimodal_encoders
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -151,47 +152,76 @@ class ModelRunner:
         return infer_multimodal_encoder_dtype(self.model)
 
     def deepep_prefill_graph_unsupported_reason(self) -> str | None:
-        """Return a rejection reason, or None for supported Qwen DeepEP plans.
-
-        Every MoE must belong to a complete Qwen graph break and use FP8 DeepGEMM.
-        """
+        """Require complete block boundaries and normal-prefill kernel support."""
         from tokenspeed.runtime.layers.moe.expert import MoELayer
-        from tokenspeed.runtime.models.qwen3_5_moe import Qwen3_5MoeSparseMoeBlock
 
         if self.model_config.dtype != torch.bfloat16:
             return "the loaded model must use BF16 activations"
 
         modules = tuple(self.model.modules())
-        blocks = tuple(
-            module for module in modules if type(module) is Qwen3_5MoeSparseMoeBlock
-        )
-        if not blocks:
-            return "the loaded model has no supported Qwen MoE graph-break blocks"
-        owned_experts = {id(block.experts) for block in blocks}
+        owned_experts = set()
         for module in modules:
+            declare = getattr(module, "bcg_moe_modules", None)
+            if declare is None:
+                continue
+            for expert in declare():
+                if expert not in modules:
+                    return "a MoE graph boundary declares an unregistered expert"
+                owned_experts.add(id(expert))
+
+        found = False
+        for name, module in self.model.named_modules():
             plan = getattr(module, "plan", None)
-            if (
-                isinstance(module, MoELayer)
-                or (isinstance(plan, Mapping) and plan.get("a2a_backend") == "deepep")
-            ) and id(module) not in owned_experts:
-                return "every MoE operation must use the complete Qwen graph break"
-        for block in blocks:
-            plan = block.experts.plan
-            if not block.use_deepep:
-                return "a Qwen MoE block did not select its DeepEP execution path"
             if not (
-                plan.get("apply_kernel_name") == "deep_gemm_deepep_fp8_moe_apply"
-                and plan.get("solution") == "deep_gemm"
-                and plan.get("weight_dtype") == "fp8"
-                and plan.get("a2a_backend") == "deepep"
-                and plan.get("deepep_mode") == "auto"
-                and plan.get("internal_activation_dtype") == "input"
+                isinstance(module, MoELayer)
+                or getattr(module, "moe_graph_consumer", False)
+                or (isinstance(plan, Mapping) and plan.get("a2a_backend") == "deepep")
             ):
-                return (
-                    "every Qwen MoE layer must resolve the BF16/block-FP8 "
-                    "DeepGEMM DeepEP kernel in auto mode"
-                )
+                continue
+            found = True
+            if id(module) not in owned_experts:
+                return f"{name} has no declared MoE graph boundary"
+            if not isinstance(plan, Mapping) or plan.get("a2a_backend") != "deepep":
+                return f"{name} did not select DeepEP"
+            if not (
+                plan.get("supports_prefill_graph", False)
+                and plan.get("deepep_mode") in {"auto", "normal"}
+                and "normal" in plan.get("deepep_modes", ())
+            ):
+                return f"{name} does not support DeepEP prefill graphs"
+        if not found:
+            return "the loaded model has no declared DeepEP experts"
         return None
+
+    def moe_cuda_graph_support(self) -> CudaGraphSupport:
+        """Resolve graph support from the selected target or draft expert plans."""
+        from tokenspeed.runtime.layers.moe.expert import MoELayer
+
+        if self.server_args.all2all_backend != "deepep":
+            return CudaGraphSupport()
+
+        decode_graph = True
+        for name, module in self.model.named_modules():
+            plan = getattr(module, "plan", None)
+            if not isinstance(plan, Mapping):
+                if isinstance(module, MoELayer) or getattr(
+                    module, "moe_graph_consumer", False
+                ):
+                    logger.info("Decode CUDA graphs disabled by %s", name)
+                    decode_graph = False
+                continue
+            if plan.get("a2a_backend") != "deepep":
+                continue
+            if plan.get("deepep_mode") == "normal" or "low_latency" not in plan.get(
+                "deepep_modes", ()
+            ):
+                logger.info("Decode CUDA graphs disabled by %s (no DeepEP LL)", name)
+                decode_graph = False
+
+        reason = self.deepep_prefill_graph_unsupported_reason()
+        if reason is not None:
+            logger.info("DeepEP prefill CUDA graphs unsupported: %s", reason)
+        return CudaGraphSupport(decode_graph=decode_graph, prefill_graph=reason is None)
 
     def prepare_multimodal_runtime(self) -> None:
         """Prepare loaded multimodal encoders for serving.

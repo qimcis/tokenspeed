@@ -67,6 +67,93 @@ __global__ void count_and_sort_expert_tokens_kernel(
 }
 
 template <typename scalar_t>
+__global__ void count_expert_tokens_stable_kernel(
+    const scalar_t* __restrict__ topk_ids,
+    int32_t* __restrict__ sorted_token_ids,
+    int32_t* __restrict__ counts,
+    int32_t num_experts,
+    int32_t block_size,
+    size_t numel,
+    bool pad_sorted_token_ids,
+    int32_t capacity) {
+  if (blockIdx.x == num_experts) {
+    if (pad_sorted_token_ids) {
+      for (int i = threadIdx.x; i < capacity; i += blockDim.x) sorted_token_ids[i] = numel;
+    }
+    return;
+  }
+  __shared__ int warp_counts[WARP_SIZE];
+  const int lane = threadIdx.x % WARP_SIZE;
+  const int warp = threadIdx.x / WARP_SIZE;
+  int count = 0;
+  for (size_t i = threadIdx.x; i < numel; i += blockDim.x) {
+    count += topk_ids[i] == static_cast<int>(blockIdx.x) - 1;
+  }
+  int prefix = warp_exclusive_scan(count);
+  if (lane == WARP_SIZE - 1) warp_counts[warp] = prefix + count;
+  __syncthreads();
+  if (warp == 0) {
+    int value = lane < blockDim.x / WARP_SIZE ? warp_counts[lane] : 0;
+    int total = warp_exclusive_scan(value) + value;
+    if (lane == WARP_SIZE - 1) counts[blockIdx.x] = CEILDIV(total, block_size) * block_size;
+  }
+}
+
+template <typename scalar_t>
+__global__ void scatter_expert_tokens_stable_kernel(
+    const scalar_t* __restrict__ topk_ids,
+    int32_t* __restrict__ sorted_token_ids,
+    int32_t* __restrict__ expert_ids,
+    int32_t* __restrict__ total_tokens_post_pad,
+    const int32_t* __restrict__ counts,
+    int32_t num_experts,
+    int32_t block_size,
+    size_t numel) {
+  __shared__ int warp_offsets[WARP_SIZE];
+  __shared__ int expert_offset;
+  const int lane = threadIdx.x % WARP_SIZE;
+  const int warp = threadIdx.x / WARP_SIZE;
+  const int expert = static_cast<int>(blockIdx.x) - 1;
+  if (warp == 0) {
+    int offset = 0;
+    int total = 0;
+    for (int e = lane; e < num_experts; e += WARP_SIZE) {
+      int count = counts[e];
+      offset += e < blockIdx.x ? count : 0;
+      total += count;
+    }
+    offset += warp_exclusive_scan(offset);
+    total += warp_exclusive_scan(total);
+    if (lane == WARP_SIZE - 1) {
+      expert_offset = offset;
+      if (blockIdx.x == 0) *total_tokens_post_pad = total;
+    }
+  }
+  int count = 0;
+  for (size_t i = threadIdx.x; i < numel; i += blockDim.x) count += topk_ids[i] == expert;
+  int prefix = warp_exclusive_scan(count);
+  if (lane == WARP_SIZE - 1) warp_offsets[warp] = prefix + count;
+  __syncthreads();
+  if (warp == 0) {
+    int value = lane < blockDim.x / WARP_SIZE ? warp_offsets[lane] : 0;
+    warp_offsets[lane] = warp_exclusive_scan(value);
+  }
+  __syncthreads();
+  for (int i = threadIdx.x; i < counts[blockIdx.x] / block_size; i += blockDim.x) {
+    expert_ids[expert_offset / block_size + i] = expert;
+  }
+  // Keep each warp's output range fixed across launches.
+  int offset = expert_offset + warp_offsets[warp];
+  for (size_t base = warp * WARP_SIZE; base < numel; base += blockDim.x) {
+    size_t i = base + lane;
+    bool match = i < numel && topk_ids[i] == expert;
+    unsigned mask = __ballot_sync(0xffffffffu, match);
+    if (match) sorted_token_ids[offset + __popc(mask & ((1u << lane) - 1))] = i;
+    offset += __popc(mask);
+  }
+}
+
+template <typename scalar_t>
 __global__ void moe_align_block_size_kernel(
     const scalar_t* __restrict__ topk_ids,
     int32_t* __restrict__ sorted_token_ids,
@@ -506,6 +593,17 @@ struct MoeAlignBlockSizeKernel {
           numel,
           pad_sorted_token_ids,
           (int32_t)max_num_tokens_padded);
+    } else if (num_experts <= 64) {
+      auto count_kernel = moe::count_expert_tokens_stable_kernel<scalar_t>;
+      LaunchKernel(dim3(num_experts + 1), dim3(1024), stream)(
+          count_kernel, topk_ids_ptr, sorted_token_ids_ptr, cumsum_buffer_ptr,
+          (int32_t)num_experts, (int32_t)block_size, numel,
+          pad_sorted_token_ids, (int32_t)max_num_tokens_padded);
+      auto scatter_kernel = moe::scatter_expert_tokens_stable_kernel<scalar_t>;
+      LaunchKernel(dim3(num_experts), dim3(1024), stream)(
+          scatter_kernel, topk_ids_ptr, sorted_token_ids_ptr, expert_ids_ptr,
+          num_tokens_post_pad_ptr, cumsum_buffer_ptr, (int32_t)num_experts,
+          (int32_t)block_size, numel);
     } else if (num_experts <= 1024) {
       const size_t scan_size = next_pow2(num_experts);
       const size_t shared_mem_size = (num_experts + (num_experts + 1) + scan_size + WARP_SIZE) * sizeof(int32_t);

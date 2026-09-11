@@ -487,9 +487,18 @@ def _dsa_prefill_logits_fp8_kernel(
 ):
     token = tl.program_id(0)
     block_id = tl.program_id(1)
-    offsets = block_id * BLOCK_N + tl.arange(0, BLOCK_N)
+    block_start = block_id * BLOCK_N
+    offsets = block_start + tl.arange(0, BLOCK_N)
     row_start = tl.load(row_starts + token).to(tl.int32)
     row_end = tl.load(row_ends + token).to(tl.int32)
+    block_end = tl.minimum(block_start + BLOCK_N, seq_len_sum)
+    if tl.maximum(row_start, block_start) >= tl.minimum(row_end, block_end):
+        tl.store(
+            logits + token * logits_stride + offsets,
+            -float("inf"),
+            mask=offsets < seq_len_sum,
+        )
+        return
     valid = (offsets >= row_start) & (offsets < row_end) & (offsets < seq_len_sum)
     slots = tl.load(
         kv_workspace_slots + offsets,

@@ -48,6 +48,7 @@ from tokenspeed.runtime.engine.io_struct import (
     FlushCacheReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
+    HealthCheckOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
     IsSchedulerPausedReqInput,
@@ -80,6 +81,17 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+def _is_health_check_generate_req(req) -> bool:
+    return (
+        isinstance(req, TokenizedGenerateReqInput)
+        and isinstance(req.rid, str)
+        and req.rid.startswith("HEALTH_CHECK_")
+        and req.input_ids == [0]
+        and req.sampling_params.max_new_tokens == 1
+        and req.validation_error is None
+    )
 
 
 def _profile_rank_tag(attn_mapping) -> str:
@@ -176,6 +188,7 @@ class RequestHandler:
 
         self.recv_func = recv_func
         self.send_func = send_func
+        self._health_check_reqs: dict[str, TokenizedGenerateReqInput] = {}
 
         self.control_request_dispatcher = TypeBasedDispatcher(
             [(ProfileReq, self.profile)]
@@ -217,6 +230,40 @@ class RequestHandler:
             self.req_broadcaster.start(self._drain_reqs())
 
         return recv_reqs
+
+    def defer_health_checks(self, recv_reqs: list, has_forward_work: bool) -> list:
+        # The native SMG health probe accepts a progress signal. Msgpack does not.
+        if self.server_args.zmq_msgpack:
+            return recv_reqs
+
+        pending = self._health_check_reqs
+        ordinary_reqs = []
+        for req in recv_reqs:
+            if _is_health_check_generate_req(req):
+                pending[req.rid] = req
+            else:
+                ordinary_reqs.append(req)
+
+        recv_reqs = []
+        for req in ordinary_reqs:
+            if isinstance(req, AbortReq) and pending.pop(req.rid, None) is not None:
+                continue
+            recv_reqs.append(req)
+            if isinstance(req, TokenizedGenerateReqInput):
+                has_forward_work = True
+
+        # An idle engine must still execute a probe, including after cancellations.
+        if pending and not has_forward_work:
+            rid = next(iter(pending))
+            recv_reqs.append(pending.pop(rid))
+        return recv_reqs
+
+    def complete_health_checks(self) -> None:
+        for req in self._health_check_reqs.values():
+            self.send_func.send_pyobj(
+                HealthCheckOutput(rid=req.rid, http_worker_ipc=req.http_worker_ipc)
+            )
+        self._health_check_reqs.clear()
 
     def process_requests(self, recv_reqs: list):
         """Dispatch control requests and return new generate request specs and states."""

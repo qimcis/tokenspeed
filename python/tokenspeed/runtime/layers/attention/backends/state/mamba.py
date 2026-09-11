@@ -2109,15 +2109,16 @@ class MambaAttnBackend(AttentionBackend):
             ``(core_attn_out, last_recurrent_state)``.
         """
         head_k_dim = query.shape[3]
-        beta = b.sigmoid()
-        g = fused_gdn_gating(A_log, a, dt_bias)
+        # The convolution leaves graph-padding rows unwritten.
+        beta = b[:num_real_tokens].sigmoid()
+        g = fused_gdn_gating(A_log, a[:num_real_tokens], dt_bias)
         g = g.unsqueeze(0)
         beta = beta.unsqueeze(0)
 
         gdn_result = gdn_chunk_prefill(
-            query,
-            key,
-            value,
+            query[:, :num_real_tokens],
+            key[:, :num_real_tokens],
+            value[:, :num_real_tokens],
             g,
             beta,
             scale=head_k_dim**-0.5,

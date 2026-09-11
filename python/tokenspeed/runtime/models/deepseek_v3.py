@@ -72,7 +72,7 @@ _FUSED_A_MAX_M = 16  # measured cliff: wins to M=16, flat ~1.35x loss from 18 to
 
 
 from tokenspeed.runtime.distributed import Mapping
-from tokenspeed.runtime.distributed.comm_manager import CommManager
+from tokenspeed.runtime.distributed.comm_manager import CommManager, MoEInputLayout
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     break_point,
     scrub_padding_tail,
@@ -97,8 +97,13 @@ from tokenspeed.runtime.layers.linear import (
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
 from tokenspeed.runtime.layers.moe.expert import MoELayer
+from tokenspeed.runtime.layers.moe.graph import run_moe_block
 from tokenspeed.runtime.layers.moe.topk import TopK
-from tokenspeed.runtime.layers.moe.utils import RoutingMethodType
+from tokenspeed.runtime.layers.moe.utils import (
+    RoutingMethodType,
+    get_all2all_backend,
+    use_deepep_low_latency,
+)
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
@@ -169,7 +174,10 @@ class DeepseekV3MLP(nn.Module):
     ) -> None:
         super().__init__()
         self.mapping = mapping
-        if is_shared_expert:
+        if is_shared_expert and get_all2all_backend().is_deepep():
+            # Shared experts run on this rank's source rows.
+            tp_rank, tp_size, tp_group = 0, 1, None
+        elif is_shared_expert:
             tp_rank = self.mapping.moe.tp_ep_rank
             tp_size = self.mapping.moe.tp_ep_size
             tp_group = self.mapping.moe.tp_ep_group
@@ -354,6 +362,58 @@ class DeepseekV3MoE(nn.Module):
             for name, x in self.experts.named_parameters()
             if name not in ["correction_bias"] and "shared_experts" not in name
         ]
+
+    @property
+    def use_deepep(self) -> bool:
+        return self.experts._spec.use_deepep
+
+    def forward_deepep(
+        self,
+        hidden_states: torch.Tensor,
+        ctx: ForwardContext,
+        comm_manager: CommManager,
+    ) -> torch.Tensor:
+        layout = MoEInputLayout(comm_manager, "physical", hidden_states.shape[0])
+        return run_moe_block(self._forward_deepep, hidden_states, None, ctx, layout)
+
+    def bcg_moe_modules(self) -> tuple[MoELayer, ...]:
+        return (self.experts,) if self.use_deepep else ()
+
+    def _forward_deepep(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        ctx: ForwardContext,
+        layout: MoEInputLayout,
+    ) -> torch.Tensor:
+        rows = layout.resolve(ctx)
+        hidden_states = hidden_states[: rows.live_rows]
+        router_logits = self.gate(hidden_states)
+        if hidden_states.size(0) > 0:
+            topk_output = self.topk(hidden_states, router_logits)
+        else:
+            topk_output = self.topk.empty_topk_output(
+                hidden_states.device,
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+            )
+        shared_output = None
+        overlap_fn = None
+        if self.n_shared_experts is not None:
+
+            def overlap_fn() -> None:
+                nonlocal shared_output
+                shared_output = self.shared_experts(hidden_states)
+
+        routed = self.experts(
+            hidden_states=hidden_states,
+            topk_output=topk_output,
+            num_global_tokens=rows.num_global_tokens,
+            max_num_tokens_per_gpu=rows.max_num_tokens_per_gpu,
+            low_latency=use_deepep_low_latency(ctx, self.mapping.attn.dp_size),
+            overlap_fn=overlap_fn,
+        )
+        return routed + shared_output if shared_output is not None else routed
 
     def forward(
         self,
@@ -1520,6 +1580,8 @@ class DeepseekV3DecoderLayer(nn.Module):
         num_global_tokens,
         max_num_tokens_per_gpu,
     ):
+        if self.is_moe_layer and self.mlp.use_deepep:
+            return self.mlp.forward_deepep(hidden_states, ctx, self.comm_manager)
         hidden_states = self.comm_manager.pre_mlp_comm(hidden_states, ctx)
         if self.is_moe_layer:
             hidden_states = self.mlp(

@@ -18,6 +18,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Literal
+
 import torch
 
 from tokenspeed.runtime.distributed.comm_ops import (
@@ -27,6 +32,30 @@ from tokenspeed.runtime.distributed.comm_ops import (
 )
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
+
+
+@dataclass(frozen=True)
+class MoERowLayout:
+    """Live source and return rows for one MoE invocation."""
+
+    source_offset: int
+    live_rows: int
+    output_rows: int
+    gather_counts: tuple[int, ...]
+    num_global_tokens: int
+    max_num_tokens_per_gpu: int
+
+
+@dataclass(frozen=True)
+class MoEInputLayout:
+    """Capture-stable placement; live counts come from the current context."""
+
+    comm_manager: CommManager
+    placement: Literal["physical", "replicated"]
+    physical_rows: int
+
+    def resolve(self, ctx: ForwardContext) -> MoERowLayout:
+        return self.comm_manager.moe_row_layout(ctx, self.placement, self.physical_rows)
 
 
 class CommManager:
@@ -123,39 +152,98 @@ class CommManager:
         result[self.mapping.moe.tp_ep_rank] = num_tokens
         return result
 
-    def moe_num_valid_rows(self, ctx: ForwardContext, valid_rows: int | None) -> int:
-        """Return live MoE rows in this rank's post-attention shard.
+    def moe_row_layout(
+        self,
+        ctx: ForwardContext,
+        placement: Literal["physical", "replicated"],
+        physical_rows: int,
+    ) -> MoERowLayout:
+        """Resolve live MoE rows without changing their physical input placement.
 
-        ``valid_rows`` counts real tokens before TP; ``None`` uses all rows.
-        ``ctx`` supplies the padded layout: R=5, B=8, TP2 yields [4, 1].
+        ``physical`` preserves post-attention shards; ``replicated`` balances
+        live source rows across attention TP and returns the gathered rows.
+        ``physical_rows`` is the input capacity, including graph padding.
         """
-        if not self.mapping.has_attn_tp or self.use_all_reduce(is_moe=True):
-            num_tokens = ctx.input_num_tokens
-            offset = 0
-            capacity = num_tokens
-        else:
-            if (
-                self.mapping.attn.has_dp
-                and ctx.collective_global_num_tokens is None
-                and ctx.global_num_tokens is None
-            ):
-                raise ValueError(
-                    "MoE physical rows with attention DP require global token counts"
-                )
-            scattered = self.attn_tp_group_scattered_num_tokens(ctx)
-            num_tokens = sum(scattered)
-            rank = self.mapping.attn.tp_rank
-            offset = sum(scattered[:rank])
-            capacity = scattered[rank]
-
-        if valid_rows is None:
-            return capacity
-        if not 0 <= valid_rows <= num_tokens:
+        if placement not in ("physical", "replicated"):
+            raise ValueError(f"Unknown MoE input placement: {placement}")
+        attn = self.mapping.attn
+        physical_global = (
+            ctx.collective_global_num_tokens
+            if ctx.collective_global_num_tokens is not None
+            else ctx.global_num_tokens
+        )
+        physical_local = (
+            ctx.collective_num_tokens
+            if ctx.collective_num_tokens is not None
+            else ctx.input_num_tokens
+        )
+        live = ctx.moe_token_counts
+        live_global = live.global_num_tokens if live is not None else physical_global
+        live_local = live.num_tokens if live is not None else physical_local
+        if attn.has_dp and physical_global is None and live is not None:
             raise ValueError(
-                f"MoE valid rows {valid_rows} exceed physical token range "
-                f"[0, {num_tokens}]"
+                "Padded MoE with attention DP requires global token counts"
             )
-        return min(max(valid_rows - offset, 0), capacity)
+
+        all_sources = []
+        local_counts = None
+        local_capacity = 0
+        local_total = 0
+        scattered_input = (
+            placement == "physical"
+            and attn.has_tp
+            and not self.use_all_reduce(is_moe=True)
+        )
+        for dp_rank in range(attn.dp_size):
+            rank = dp_rank * attn.tp_size * attn.cp_size
+            capacity = (
+                physical_global[rank]
+                if physical_global is not None
+                else physical_local if dp_rank == attn.dp_rank else 0
+            )
+            count = (
+                live_global[rank]
+                if live_global is not None
+                else live_local if dp_rank == attn.dp_rank else 0
+            )
+            if not 0 <= count <= capacity:
+                raise ValueError(f"MoE live rows {count} exceed capacity {capacity}")
+            capacities = self._scatter_count(capacity, attn.tp_size)
+            if placement == "replicated":
+                sources = self._scatter_count(count, attn.tp_size)
+            elif scattered_input:
+                offset = 0
+                sources = []
+                for shard_capacity in capacities:
+                    sources.append(min(max(count - offset, 0), shard_capacity))
+                    offset += shard_capacity
+            else:
+                sources = [count] * attn.tp_size
+            all_sources.extend(sources)
+            if dp_rank == attn.dp_rank:
+                local_counts = sources
+                local_capacity = (
+                    capacities[attn.tp_rank] if scattered_input else capacity
+                )
+                local_total = count
+
+        if physical_rows != local_capacity:
+            raise ValueError(
+                f"MoE input has {physical_rows} rows, expected {local_capacity}"
+            )
+        assert local_counts is not None
+        ep_sources = [
+            all_sources[attn.scatter_index(rank)] for rank in self.mapping.moe.ep_group
+        ]
+        replicated = placement == "replicated"
+        return MoERowLayout(
+            source_offset=sum(local_counts[: attn.tp_rank]) if replicated else 0,
+            live_rows=local_counts[attn.tp_rank],
+            output_rows=local_total if replicated else local_counts[attn.tp_rank],
+            gather_counts=tuple(local_counts),
+            num_global_tokens=sum(ep_sources),
+            max_num_tokens_per_gpu=max(ep_sources),
+        )
 
     # ---- Communication patterns ----
 
@@ -326,6 +414,8 @@ class CommManager:
             self.use_all_reduce(self.is_moe)
             and self.mapping.has_attn_tp
             and global_server_args_dict.get("enable_allreduce_fusion", False)
+            # DeepEP returns complete outputs, with no reduction to defer.
+            and global_server_args_dict["all2all_backend"] != "deepep"
         )
 
     def should_fuse(self, num_tokens: int) -> bool:

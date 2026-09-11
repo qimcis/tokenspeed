@@ -518,9 +518,7 @@ def _validate_selected_deepep_mode(
     """Reject a selected DeepEP kernel that lacks a requested collective leg."""
     if a2a_backend != "deepep":
         return
-    supported_modes = kernel_traits.get("deepep_modes")
-    if supported_modes is None:
-        return
+    supported_modes = kernel_traits.get("deepep_modes", frozenset())
 
     requested_mode = deepep_mode or "auto"
     required_modes = (
@@ -644,11 +642,12 @@ def moe_plan(
 
     The selected apply kernel owns plan metadata. A plan with support_routing
     false requires precomputed top-k ids and weights when calling moe_apply.
-    Weight preprocessing is selected from the ordered candidates advertised by
-    the selected apply kernel, then pinned by callable in the returned plan so load
-    time does not rerun selection or conflict resolution.
+    Apply and weight preprocessing callables are pinned in the plan so execution
+    and weight loading use the same selected kernel.
     """
     weight_dtype = _normalize_weight_dtype(weight_dtype)
+    if internal_activation_dtype is None:
+        internal_activation_dtype = "input"
     _validate_a2a_backend(a2a_backend)
     _validate_routing_mode(routing_mode)
     _validate_deepep_mode(a2a_backend, deepep_mode)
@@ -669,6 +668,13 @@ def moe_plan(
         internal_activation_dtype=internal_activation_dtype,
         with_bias=with_bias,
     )
+
+    if a2a_backend == "deepep":
+        traits["deepep_modes"] = (
+            frozenset({"normal", "low_latency"})
+            if deepep_mode in {None, "auto"}
+            else frozenset({deepep_mode})
+        )
 
     kernel = select_kernel(
         "moe",
@@ -696,12 +702,17 @@ def moe_plan(
     )
     return {
         "weight_dtype": weight_dtype,
+        "input_dtype": input_dtype,
         "activation": activation,
+        "apply_kernel": kernel,
         "apply_kernel_name": apply_spec.name,
         "weight_preprocessor": apply_spec.weight_preprocessor,
         "a2a_backend": a2a_backend,
         "deepep_group": deepep_group,
         "deepep_mode": deepep_mode or "auto",
+        "deepep_modes": apply_spec.traits.get("deepep_modes", frozenset()),
+        "supports_prefill_graph": True
+        in apply_spec.traits.get("supports_prefill_graph", frozenset()),
         "deepep_low_latency_max_num_tokens_per_gpu": (
             deepep_low_latency_max_num_tokens_per_gpu
         ),
@@ -786,12 +797,9 @@ def moe_apply(
 
     Solutions may use precomputed top-k tensors or route from logits directly.
     """
-    kernel = select_kernel(
-        "moe",
-        "apply",
-        format_signature(x=dense_tensor_format(x.dtype)),
-        override=plan["apply_kernel_name"],
-    )
+    if x.dtype != plan["input_dtype"]:
+        raise ValueError("MoE input dtype differs from the prepared plan")
+    kernel = plan["apply_kernel"]
     # Only the all-to-all EP kernels own dispatch/combine legs, so the mode
     # decision stays off the signature every other apply kernel implements.
     a2a_kwargs = (

@@ -61,7 +61,7 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
     BreakableCapture,
     active_forward,
 )
-from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.context import ForwardContext, MoETokenCounts
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
@@ -755,7 +755,20 @@ class PrefillGraph:
         so models split prefill vs decode and dispatch the per-mode backend
         correctly with no side channel.
         """
-        saved = (ctx.input_num_tokens, ctx.global_num_tokens, ctx.global_bs)
+        saved = (
+            ctx.input_num_tokens,
+            ctx.global_num_tokens,
+            ctx.global_bs,
+            ctx.moe_token_counts,
+        )
+        ctx.moe_token_counts = MoETokenCounts(
+            num_tokens=ctx.input_num_tokens,
+            global_num_tokens=(
+                tuple(ctx.global_num_tokens)
+                if ctx.global_num_tokens is not None
+                else None
+            ),
+        )
         ctx.input_num_tokens = bucket
         if self.dp_size > 1 and ctx.global_num_tokens is not None:
             ctx.global_num_tokens = [bucket] * self.config.world_size
@@ -764,7 +777,12 @@ class PrefillGraph:
             with active_forward(ctx):
                 yield
         finally:
-            ctx.input_num_tokens, ctx.global_num_tokens, ctx.global_bs = saved
+            (
+                ctx.input_num_tokens,
+                ctx.global_num_tokens,
+                ctx.global_bs,
+                ctx.moe_token_counts,
+            ) = saved
 
     def _log_engaged_once(
         self, bucket: int, ctx: ForwardContext, is_multimodal: bool

@@ -162,8 +162,8 @@ def _validate_deepep_prefill_graph_support(
         reason = "only single-node expert parallelism is supported"
     elif server_args.disaggregation_mode != "null":
         reason = "prefill/decode/encoder disaggregation is not supported"
-    elif server_args.deepep_mode != "auto":
-        reason = "--deepep-mode auto is required for normal prefill and LL decode"
+    elif server_args.deepep_mode == "low_latency":
+        reason = "DeepEP prefill requires normal mode or auto"
     elif model_runner.is_multimodal_active:
         reason = "multimodal execution is active; use --language-model-only"
     elif not model_runner.is_generation:
@@ -481,6 +481,9 @@ class ModelExecutor:
                 config, model_runner, graph_support.prefill_graph
             )
         )
+        graph_support = graph_support & model_runner.moe_cuda_graph_support()
+        if draft_model_runner is not None:
+            graph_support = graph_support & draft_model_runner.moe_cuda_graph_support()
 
         self.dp_sampling_runtime_config = setup_dp_sampling(
             model=self.model_runner.model,

@@ -71,7 +71,8 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from tokenspeed.runtime.distributed import Mapping
-from tokenspeed.runtime.distributed.comm_manager import CommManager
+from tokenspeed.runtime.distributed.comm_manager import CommManager, MoEInputLayout
+from tokenspeed.runtime.distributed.comm_ops import token_all_gather
 from tokenspeed.runtime.distributed.pp_stage import PPStageState, pp_layer_window
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -131,12 +132,18 @@ from tokenspeed.runtime.layers.moe import (
     build_moe_checkpoint_loader,
 )
 from tokenspeed.runtime.layers.moe.expert import MoELayer
+from tokenspeed.runtime.layers.moe.graph import run_moe_block
 from tokenspeed.runtime.layers.moe.topk import (
     BypassedTopKOutput,
     StandardTopKOutput,
     TopK,
 )
-from tokenspeed.runtime.layers.moe.utils import RoutingMethodType, get_moe_backend
+from tokenspeed.runtime.layers.moe.utils import (
+    RoutingMethodType,
+    get_all2all_backend,
+    get_moe_backend,
+    use_deepep_low_latency,
+)
 from tokenspeed.runtime.layers.quantization import Fp8Config, Mxfp4Config
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
@@ -1544,6 +1551,8 @@ class DeepseekV4MLP(nn.Module):
         tp_rank = tp.tp_ep_rank if is_shared_expert else tp.tp_rank
         tp_size = tp.tp_ep_size if is_shared_expert else tp.tp_size
         tp_group = tp.tp_ep_group if is_shared_expert else tp.tp_group
+        if is_shared_expert and get_all2all_backend().is_deepep():
+            tp_rank, tp_size, tp_group = 0, 1, None
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -1894,7 +1903,11 @@ class DeepseekV4MoE(nn.Module):
             )
         self.stream_fork = StreamFork(aux_stream)
 
-        self.use_mega_moe = get_moe_backend().is_mega_moe()
+        moe_backend = get_moe_backend()
+        self.use_mega_moe = moe_backend.is_mega_moe()
+        self.use_deepep = get_all2all_backend().is_deepep() and not self.use_mega_moe
+        if self.use_deepep and mapping.moe.tp_size != 1:
+            raise ValueError("DeepSeek V4 DeepEP requires MoE TP size 1.")
         if mapping.moe.ep_size > 1:
             if global_server_args_dict.get("enable_eplb", False):
                 raise ValueError(
@@ -1928,7 +1941,10 @@ class DeepseekV4MoE(nn.Module):
                     "DeepSeek V4 normal EP does not support redundant experts "
                     "with precomputed routing."
                 )
-            if mapping.attn.tp_size not in (1, mapping.moe.tp_ep_size):
+            if not self.use_deepep and mapping.attn.tp_size not in (
+                1,
+                mapping.moe.tp_ep_size,
+            ):
                 raise ValueError(
                     "DeepSeek V4 normal EP requires attention TP size 1 or "
                     "attention TP size equal to the MoE TPxEP size."
@@ -1954,9 +1970,7 @@ class DeepseekV4MoE(nn.Module):
                 add_prefix("shared_experts", prefix),
                 swiglu_limit=getattr(config, "swiglu_limit", None),
                 reduce_results=False,
-                # Normal EP sums routed and shared partials over the same TPxEP
-                # group. MegaMoE retains its existing dense placement and
-                # CommManager-owned shared-expert communication.
+                # Normal EP shards over TPxEP; MegaMoE uses dense placement.
                 is_shared_expert=not self.use_mega_moe,
             )
         else:
@@ -1994,13 +2008,9 @@ class DeepseekV4MoE(nn.Module):
                 activation="swiglu",
                 swiglu_limit=getattr(config, "swiglu_limit", None),
                 with_bias=False,
-                # FlashInfer's standard MXFP4 kernel performs routing in-kernel.
-                # Keep precomputed top-k for backends that require it; for
-                # FlashInfer, MoELayer repacks the already-selected routes into
-                # router logits before invoking the kernel.
                 routing_mode=(
                     None
-                    if get_moe_backend().is_flashinfer_trtllm()
+                    if get_moe_backend().is_flashinfer_trtllm() and not self.use_deepep
                     else "precomputed_topk"
                 ),
                 routing_config={
@@ -2147,6 +2157,65 @@ class DeepseekV4MoE(nn.Module):
                 shared = self._forward_shared_experts(hidden_states)
         return routed + shared if shared is not None else routed
 
+    def bcg_moe_modules(self) -> tuple[MoELayer, ...]:
+        return (self.experts,) if self.use_deepep else ()
+
+    def _forward_deepep(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        ctx: ForwardContext,
+        layout: MoEInputLayout,
+    ) -> torch.Tensor:
+        # mHC retains full attention rows; DeepEP routes disjoint TP shards.
+        rows = layout.resolve(ctx)
+        offset = rows.source_offset
+        num_local_tokens = rows.live_rows
+        hidden_states = hidden_states[offset : offset + num_local_tokens]
+        if input_ids is not None:
+            input_ids = input_ids[offset : offset + num_local_tokens]
+        if num_local_tokens:
+            topk_weights, topk_ids, router_scores = self._select_experts(
+                hidden_states, input_ids
+            )
+            topk_output = self._make_topk_output(
+                hidden_states, topk_weights, topk_ids, router_scores
+            )
+        else:
+            # Empty source ranks still participate in dispatch and combine.
+            topk_output = self.topk.empty_topk_output(
+                hidden_states.device,
+                hidden_states=hidden_states,
+                router_logits=None,
+            )
+        shared = None
+        overlap_fn = None
+        if self.shared_experts is not None:
+
+            def overlap_fn() -> None:
+                nonlocal shared
+                shared = self._forward_shared_experts(hidden_states)
+
+        routed = self.experts(
+            hidden_states=hidden_states,
+            topk_output=topk_output,
+            num_global_tokens=rows.num_global_tokens,
+            max_num_tokens_per_gpu=rows.max_num_tokens_per_gpu,
+            low_latency=use_deepep_low_latency(ctx, self.mapping.attn.dp_size),
+            overlap_fn=overlap_fn,
+        )
+        if self.routed_scaling_factor != 1.0:
+            routed *= self.routed_scaling_factor
+        if shared is not None:
+            routed = routed + shared
+        if self.mapping.attn.has_tp:
+            routed = token_all_gather(
+                routed,
+                group=self.mapping.attn.tp_group,
+                scattered_num_tokens=rows.gather_counts,
+            )
+        return routed
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -2162,6 +2231,19 @@ class DeepseekV4MoE(nn.Module):
                 input_ids,
                 ctx,
                 comm_manager,
+            )
+        if self.use_deepep:
+            if ctx is None or comm_manager is None:
+                raise ValueError(
+                    "DeepEP requires a forward context and communication layout"
+                )
+            layout = MoEInputLayout(comm_manager, "replicated", hidden_states.shape[0])
+            return run_moe_block(
+                self._forward_deepep,
+                hidden_states,
+                input_ids,
+                ctx,
+                layout,
             )
         return self.forward_normal(
             hidden_states, input_ids, num_global_tokens, max_num_tokens_per_gpu
@@ -3472,7 +3554,8 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         ffn_input_ids = input_ids
         use_mega_moe = getattr(self.ffn, "use_mega_moe", False)
-        if use_mega_moe:
+        use_deepep = self.ffn.use_deepep
+        if use_mega_moe or use_deepep:
             token_counts = self.comm_manager.moe_tp_ep_group_scattered_num_tokens(ctx)
             num_global_tokens = sum(token_counts)
             max_num_tokens_per_gpu = max(token_counts) if token_counts else 0
@@ -3493,10 +3576,10 @@ class DeepseekV4DecoderLayer(nn.Module):
                 ffn_input_ids,
                 num_global_tokens,
                 max_num_tokens_per_gpu,
-                ctx=ctx if use_mega_moe else None,
-                comm_manager=self.comm_manager if use_mega_moe else None,
+                ctx=ctx,
+                comm_manager=self.comm_manager,
             )
-        if not use_mega_moe:
+        if not (use_mega_moe or use_deepep):
             with nvtx_range("post_mlp_comm"):
                 hidden_states, _ = self.comm_manager.post_mlp_comm(
                     hidden_states, None, ctx

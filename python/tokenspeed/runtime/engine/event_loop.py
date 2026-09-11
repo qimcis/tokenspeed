@@ -629,6 +629,14 @@ class EventLoop:
 
     def _process_new_requests(self):
         recv_reqs = self.request_handler.recv_reqs()
+        recv_reqs = self.request_handler.defer_health_checks(
+            recv_reqs,
+            has_forward_work=bool(
+                self.output_processor.rid_to_state
+                or self.scheduler.waiting_size()
+                or len(self.request_handler.grammar_manager)
+            ),
+        )
         # Pause-state snapshot for withhold_admissions below: it must be
         # taken before process_requests, which may flip the state mid-batch.
         pause_blocked_before = self._pause.admit_blocked
@@ -777,6 +785,7 @@ class EventLoop:
             results,
             is_prefill_instance=is_prefill_instance,
         )
+        self.request_handler.complete_health_checks()
 
         # Fold committed tokens into the decode throughput window (host-side
         # reads of the already-synced result; no GPU sync).

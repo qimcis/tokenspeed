@@ -58,7 +58,11 @@ from tokenspeed_kernel.ops.moe.marlin.mxfp4 import (
     marlin_mxfp4_moe_weights,
     marlin_mxfp4_precomputed_moe_apply,
 )
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+)
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
@@ -216,11 +220,7 @@ def _apply_low_latency(
         enable_pdl=enable_pdl,
     ).view(num_local_experts, recv_m, hidden)
 
-    # The low-latency combine leg applies the routing weights itself. This
-    # deep_ep tree's LL combine carries an identity-expert extension (-1 ids
-    # add x_ori * weight) and device-asserts x_ori whenever any weight is
-    # nonzero; all our ids are valid so x is never actually read, but the
-    # pointer must be supplied.
+    # Some DeepEP builds require the original tokens for their identity expert.
     dispatcher.combine_a(
         expert_out, topk_ids, topk_weights, low_latency=True, moe_origin_input=x
     )
@@ -246,6 +246,12 @@ def _apply_low_latency(
         "supports_ep": frozenset({True}),
         "supports_all_to_all_ep": frozenset({True}),
         "deepep_modes": frozenset({"normal", "low_latency"}),
+        "supports_prefill_graph": frozenset(
+            {
+                current_platform().arch_version
+                in {ArchVersion(10, 0), ArchVersion(10, 3)}
+            }
+        ),
         "ispp_alignment": frozenset({MXFP4_BLOCK}),
         "internal_activation_dtype": frozenset({"input"}),
         "supports_bias": frozenset({False}),

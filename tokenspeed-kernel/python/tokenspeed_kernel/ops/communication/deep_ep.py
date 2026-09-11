@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 from enum import Enum, IntEnum, auto
@@ -571,6 +572,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self.return_recv_hook = return_recv_hook
         self.use_fp8 = use_fp8
         self.ue8m0_scales = ue8m0_scales
+        self.combine_supports_x_ori = (
+            "x_ori" in inspect.signature(Buffer.low_latency_combine).parameters
+        )
 
     def dispatch_a(
         self,
@@ -711,12 +715,8 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     ):
         buffer = self._get_buffer()
         combine_kwargs = {}
-        if moe_origin_input is not None:
-            # Trees whose low-latency combine carries the identity-expert leg
-            # (routing weight on a -1 id folds moe_origin_input back in) take
-            # the original tokens as ``x_ori`` — and their device kernel
-            # asserts the pointer whenever any routing weight is nonzero, so
-            # it must be forwarded rather than dropped.
+        if moe_origin_input is not None and self.combine_supports_x_ori:
+            # The identity-expert extension requires the original tokens.
             combine_kwargs["x_ori"] = moe_origin_input
         combined_hidden_states, event, hook = buffer.low_latency_combine(
             hidden_states,

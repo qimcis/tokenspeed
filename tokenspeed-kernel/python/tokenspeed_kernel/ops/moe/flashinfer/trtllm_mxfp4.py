@@ -22,8 +22,10 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Callable
 
 import torch
+from tokenspeed_kernel.ops.moe._deepep import apply_bf16_deepep, get_bf16_dispatcher
 from tokenspeed_kernel.ops.tuning import get_autotune_max_num_tokens
 from tokenspeed_kernel.platform import (
     ArchVersion,
@@ -96,7 +98,11 @@ def situ_moe_unavailable_reason() -> str | None:
     """
     if not platform.is_nvidia:
         return "flashinfer TRTLLM-Gen SiTU MoE requires an NVIDIA platform"
-    if _SITU_ACTIVATION_TYPE is None or _fi_fp4_routed_moe is None:
+    if (
+        _SITU_ACTIVATION_TYPE is None
+        or _fi_fp4_routed_moe is None
+        or _situ_import_error
+    ):
         return (
             "Kimi-K3 SiTU requires flashinfer with public and precomputed "
             f"TRTLLM-Gen SiTU routing: {_situ_import_error}"
@@ -105,36 +111,23 @@ def situ_moe_unavailable_reason() -> str | None:
 
 
 if platform.is_nvidia:
-    from flashinfer import (
+    from tokenspeed_kernel.thirdparty.flashinfer.mxfp4_moe import (
+        ActivationType as _FiActivationType,
+    )
+    from tokenspeed_kernel.thirdparty.flashinfer.mxfp4_moe import (
+        get_w2_permute_indices_with_cache,
+        maybe_get_cached_w3_w1_permute_indices,
         mxfp8_quantize,
         nvfp4_block_scale_interleave,
+        routed_moe_unavailable_reason,
         trtllm_fp4_block_scale_moe,
     )
-    from flashinfer.fused_moe.core import (
-        _maybe_get_cached_w3_w1_permute_indices as maybe_get_cached_w3_w1_permute_indices,
-    )
-    from flashinfer.fused_moe.core import (
-        get_w2_permute_indices_with_cache,
+    from tokenspeed_kernel.thirdparty.flashinfer.mxfp4_moe import (
+        trtllm_fp4_block_scale_routed_moe as _fi_fp4_routed_moe,
     )
 
-    # SiTU is native in flashinfer's TRTLLM-Gen MoE since PR #4180 (> 0.6.15);
-    # older builds lack the ActivationType.Situ member.
-    try:
-        from flashinfer.fused_moe import (
-            trtllm_fp4_block_scale_routed_moe as _fi_fp4_routed_moe,
-        )
-        from flashinfer.tllm_enums import ActivationType as _FiActivationType
-
-        _SITU_ACTIVATION_TYPE = getattr(_FiActivationType, "Situ", None)
-        _situ_import_error: ImportError | None = (
-            None
-            if _SITU_ACTIVATION_TYPE is not None
-            else ImportError("flashinfer build has no ActivationType.Situ")
-        )
-    except ImportError as exc:
-        _fi_fp4_routed_moe = None
-        _SITU_ACTIVATION_TYPE = None
-        _situ_import_error = exc
+    _SITU_ACTIVATION_TYPE = getattr(_FiActivationType, "Situ", None)
+    _situ_import_error = routed_moe_unavailable_reason()
 
     def _get_device_permute_indices(
         x: torch.Tensor,
@@ -251,9 +244,9 @@ if platform.is_nvidia:
             )
             limit = None
         elif (swiglu_arg := getattr(w, "swiglu_arg", None)) is None:
-            alpha = 1.702
-            limit = 7.0
-            beta = 1.0
+            alpha = 1.0
+            limit = None
+            beta = 0.0
         else:
             alpha = swiglu_arg.alpha
             limit = swiglu_arg.limit
@@ -449,22 +442,22 @@ if platform.is_nvidia:
             enable_pdl=enable_pdl,
         )[0]
 
-    def _call_mxfp4_situ_routed_moe(
+    def _call_mxfp4_routed_moe(
         w: torch.nn.Module,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         x: torch.Tensor,
         output: torch.Tensor | None,
         enable_pdl: bool,
-        hidden_states_scale: torch.Tensor | None = None,
-        do_finalize: bool = True,
+        hidden_states_scale: torch.Tensor | None,
+        do_finalize: bool,
+        activation_type: int,
     ):
         num_experts, local_experts, local_expert_offset = _local_expert_range(w)
-        # FlashInfer's precomputed route is an unpacked (ids, weights) tuple.
-        # IDs remain global; the kernel filters them to this rank's expert range.
+        # IDs are global; FlashInfer excludes nonlocal and negative routes.
         topk = (
             topk_ids.to(torch.int32).contiguous(),
-            topk_weights.to(torch.bfloat16).contiguous(),
+            topk_weights.to(torch.float32).contiguous(),
         )
         result = _fi_fp4_routed_moe(
             topk_ids=topk,
@@ -473,18 +466,18 @@ if platform.is_nvidia:
             hidden_states_scale=hidden_states_scale,
             gemm1_weights=w.w13_weight,
             gemm1_weights_scale=w.w13_weight_scale.view(torch.float8_e4m3fn),
-            gemm1_bias=None,
+            gemm1_bias=getattr(w, "w13_weight_bias", None),
             gemm1_alpha=w.gemm1_alpha,
             gemm1_beta=w.gemm1_beta,
             gemm1_clamp_limit=getattr(w, "gemm1_clamp_limit", None),
             gemm2_weights=w.w2_weight,
             gemm2_weights_scale=w.w2_weight_scale.view(torch.float8_e4m3fn),
-            gemm2_bias=None,
+            gemm2_bias=getattr(w, "w2_weight_bias", None),
             output1_scale_scalar=None,
             output1_scale_gate_scalar=None,
             output2_scale_scalar=None,
             num_experts=num_experts,
-            top_k=getattr(w, "top_k"),
+            top_k=topk_ids.shape[1],
             n_group=None,
             topk_group=None,
             intermediate_size=getattr(w, "intermediate_size_per_partition"),
@@ -494,7 +487,7 @@ if platform.is_nvidia:
             routing_method_type=1,
             do_finalize=do_finalize,
             enable_pdl=enable_pdl,
-            activation_type=_SITU_ACTIVATION_TYPE,
+            activation_type=activation_type,
             tune_max_num_tokens=get_autotune_max_num_tokens(),
             output=output if do_finalize else None,
         )
@@ -711,7 +704,7 @@ if platform.is_nvidia:
                 )
 
         if use_precomputed_topk:
-            result = _call_mxfp4_situ_routed_moe(
+            result = _call_mxfp4_routed_moe(
                 w,
                 topk_weights,
                 topk_ids,
@@ -720,6 +713,7 @@ if platform.is_nvidia:
                 enable_pdl,
                 hidden_states_scale=hidden_states_scale,
                 do_finalize=do_finalize,
+                activation_type=_SITU_ACTIVATION_TYPE,
             )
             if not do_finalize:
                 return result
@@ -770,3 +764,169 @@ if platform.is_nvidia:
         if hidden_original != hidden_padded:
             return output[:, :hidden_original].contiguous()
         return output
+
+    def flashinfer_trtllm_mxfp4_routed_moe_apply(
+        plan: dict,
+        x: torch.Tensor,
+        w: torch.nn.Module,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        enable_pdl: bool,
+    ) -> torch.Tensor:
+        """Compute weighted local expert contributions for flat received rows.
+
+        Args:
+            plan: Prepared MoE plan, including the activation precision policy.
+            x: BF16 received rows, with inactive rows zeroed by the dispatcher.
+            w: Local packed MXFP4 weights and activation parameters.
+            topk_weights: FP32 route weights, applied exactly once here.
+            topk_ids: Global expert IDs; negative and nonlocal slots are ignored.
+            enable_pdl: Whether to enable dependent kernel launches.
+
+        Returns:
+            One BF16 local contribution per received row.
+        """
+        if x.dtype != torch.bfloat16:
+            raise TypeError("FlashInfer routed MXFP4 requires BF16 received rows")
+        if topk_ids.shape != topk_weights.shape or topk_ids.shape[0] != x.shape[0]:
+            raise ValueError("Received rows and route shapes do not match")
+        hidden_padded = w.hidden_size_padded
+        hidden_original = w.hidden_size_original
+        if x.shape[0] == 0:
+            return x.new_empty((0, hidden_original))
+        if x.shape[-1] > hidden_padded:
+            raise ValueError("Received hidden dimension exceeds the prepared weights")
+        if x.shape[-1] != hidden_padded:
+            x = torch.nn.functional.pad(x, (0, hidden_padded - x.shape[-1]))
+        situ = getattr(w, "activation", "silu") == "situ"
+        precision = plan["internal_activation_dtype"]
+        if precision == "input":
+            if situ:
+                raise ValueError("FlashInfer MXFP4 SiTU requires FP8 activations")
+            x_scale = None
+        elif precision == "fp8":
+            x, x_scale = mxfp8_quantize(
+                x,
+                False,
+                enable_pdl=enable_pdl,
+                alignment=hidden_padded,
+                backend="cute-dsl",
+            )
+            x_scale = x_scale.view(torch.float8_e4m3fn).reshape(x.shape[0], -1)
+        else:
+            raise ValueError(
+                f"Unsupported FlashInfer MXFP4 activation dtype: {precision}"
+            )
+        output = torch.empty(
+            (x.shape[0], hidden_padded), dtype=torch.bfloat16, device=x.device
+        )
+        _call_mxfp4_routed_moe(
+            w,
+            topk_weights,
+            topk_ids,
+            x,
+            output,
+            enable_pdl,
+            hidden_states_scale=x_scale,
+            do_finalize=True,
+            activation_type=_SITU_ACTIVATION_TYPE if situ else _FiActivationType.Swiglu,
+        )
+        _, local_experts, expert_start = _local_expert_range(w)
+        valid_rows = (
+            (topk_ids >= expert_start) & (topk_ids < expert_start + local_experts)
+        ).any(dim=-1)
+        output = torch.where(valid_rows[:, None], output, 0)
+        if hidden_original != hidden_padded:
+            return output[:, :hidden_original].contiguous()
+        return output
+
+    def _register_mxfp4_deepep_kernel(function):
+        if (reason := routed_moe_unavailable_reason()) is not None:
+            logger.info("DeepEP MXFP4 kernel not registered: %s", reason)
+            return function
+        for situ in (False, True):
+            if situ and _SITU_ACTIVATION_TYPE is None:
+                continue
+            register_kernel(
+                "moe",
+                "apply",
+                name=(
+                    "flashinfer_trtllm_mxfp4_situ_deepep_moe_apply"
+                    if situ
+                    else "flashinfer_trtllm_mxfp4_deepep_moe_apply"
+                ),
+                solution="flashinfer_trtllm",
+                weight_preprocessor=(
+                    flashinfer_trtllm_mxfp4_situ_moe_weights
+                    if situ
+                    else flashinfer_trtllm_mxfp4_moe_weights
+                ),
+                capability=CapabilityRequirement(
+                    vendors=frozenset({"nvidia"}),
+                    min_arch_version=ArchVersion(10, 0),
+                    max_arch_version=ArchVersion(10, 3),
+                ),
+                signatures=format_signatures("x", "dense", {torch.bfloat16}),
+                traits={
+                    "weight_dtype": frozenset({"mxfp4"}),
+                    "activation": frozenset({"situ"} if situ else {"silu", "swiglu"}),
+                    "routing_mode": frozenset({"precomputed_topk"}),
+                    "supports_deferred_finalize": frozenset({False}),
+                    "supports_ep": frozenset({True}),
+                    "supports_all_to_all_ep": frozenset({True}),
+                    "deepep_modes": frozenset({"normal", "low_latency"}),
+                    "supports_prefill_graph": frozenset({True}),
+                    "ispp_alignment": frozenset({1}),
+                    "internal_activation_dtype": frozenset(
+                        {"fp8"} if situ else {"input"}
+                    ),
+                    "supports_bias": frozenset({False} if situ else {True}),
+                },
+                priority=Priority.PORTABLE - 1,
+            )(function)
+        return function
+
+    @_register_mxfp4_deepep_kernel
+    def flashinfer_trtllm_mxfp4_deepep_moe_apply(
+        plan: dict,
+        x: torch.Tensor,
+        w: torch.nn.Module,
+        router_logits: torch.Tensor | None,
+        topk_weights: torch.Tensor | None,
+        topk_ids: torch.Tensor | None,
+        num_tokens_global: int | None,
+        max_num_tokens_per_gpu: int | None,
+        do_finalize: bool,
+        enable_pdl: bool,
+        low_latency: bool | None,
+        overlap_fn: Callable[[], None] | None,
+    ) -> torch.Tensor:
+        """Dispatch BF16 rows, compute native MXFP4 experts, and combine.
+
+        Arguments follow ``moe_apply``. Routing must be precomputed and every
+        EP rank must pass the same ``low_latency`` choice. Normal compute folds
+        route weights into its output; low-latency combine applies them instead.
+        Returns the finalized BF16 rows owned by this rank.
+        """
+        del router_logits, num_tokens_global, max_num_tokens_per_gpu
+        if not do_finalize:
+            raise ValueError("DeepEP MXFP4 cannot defer finalization")
+        if topk_weights is None or topk_ids is None:
+            raise ValueError("DeepEP MXFP4 requires precomputed routes")
+        dispatcher = get_bf16_dispatcher(plan, w, x)
+
+        def experts(recv_x, recv_weights, recv_ids):
+            return flashinfer_trtllm_mxfp4_routed_moe_apply(
+                plan, recv_x, w, recv_weights, recv_ids, enable_pdl
+            )
+
+        return apply_bf16_deepep(
+            dispatcher,
+            x,
+            topk_weights,
+            topk_ids,
+            low_latency,
+            w.ep_rank * w.num_local_experts,
+            experts,
+            overlap_fn,
+        )

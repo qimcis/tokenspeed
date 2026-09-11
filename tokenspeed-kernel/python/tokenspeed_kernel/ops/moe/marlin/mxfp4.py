@@ -214,7 +214,7 @@ def marlin_mxfp4_precomputed_moe_apply(
 
     topk_ids = topk_ids.to(torch.int32)
     topk_weights = topk_weights.to(torch.float32)
-    is_ep = ep_size > 1
+    is_ep = ep_size > 1 or plan.get("a2a_backend") == "deepep"
     if is_ep:
         # Global -> local id remap: [expert_start, +num_local) -> [0, num_local),
         # everything else -> -1 (the align kernel parks these in the extra lane
@@ -264,9 +264,9 @@ def marlin_mxfp4_precomputed_moe_apply(
         size_k=hidden,
     ).view(-1, gemm1_n)
 
-    beta = float(getattr(w, "activation_situ_beta", 1.0))
-    linear_beta = getattr(w, "activation_situ_linear_beta", None)
     if activation == "situ":
+        beta = float(getattr(w, "activation_situ_beta", 1.0))
+        linear_beta = getattr(w, "activation_situ_linear_beta", None)
         intermediate2 = situ_and_mul(
             intermediate1,
             beta=beta,
@@ -275,7 +275,13 @@ def marlin_mxfp4_precomputed_moe_apply(
     else:
         from tokenspeed_kernel.ops.activation.triton import silu_and_mul
 
-        intermediate2 = silu_and_mul(intermediate1)
+        limit = getattr(getattr(w, "swiglu_arg", None), "limit", None)
+        intermediate2 = silu_and_mul(
+            intermediate1,
+            out=None,
+            enable_pdl=False,
+            limit=limit if limit is not None and limit > 0 else None,
+        )
 
     # GEMM2: fold the route weights in (mul_topk_weights) so finalize is a
     # plain sum over top_k. EP-masked routes wrote nothing, so zero-init c.

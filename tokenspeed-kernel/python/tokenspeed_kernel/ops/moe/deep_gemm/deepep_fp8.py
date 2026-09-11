@@ -117,6 +117,13 @@ if platform.is_nvidia and m_grouped_fp8_gemm_nt_masked is not None:
         )
         return topk_weights, topk_ids
 
+    def _clamp_swiglu_input_(gateup: torch.Tensor, w: torch.nn.Module) -> None:
+        limit = getattr(getattr(w, "swiglu_arg", None), "limit", None)
+        if limit is not None and limit > 0:
+            gate, up = gateup.chunk(2, dim=-1)
+            gate.clamp_(max=limit)
+            up.clamp_(min=-limit, max=limit)
+
     def deep_gemm_deepep_fp8_moe_weights(plan: dict, w: torch.nn.Module):
         # DeepGEMM's ``nt`` grouped GEMM consumes B as [E, N, K] with block
         # scales [E, ceil(N/128), ceil(K/128)] and computes ``a @ b.T``. That is
@@ -300,6 +307,7 @@ if platform.is_nvidia and m_grouped_fp8_gemm_nt_masked is not None:
 
         # Fused SiLU(gate)*up followed by a 1x128 block FP8 quantize. The EP
         # variant honors ``masked_m`` so padded rows are skipped.
+        _clamp_swiglu_input_(gateup, w)
         ispp = w.w2_weight.shape[-1]
         if requires_ue8m0:
             # Produce DeepGEMM's packed MN-major scales in the activation
@@ -357,7 +365,9 @@ if platform.is_nvidia and m_grouped_fp8_gemm_nt_masked is not None:
         )
 
         # Combine travels in bf16 and applies the routing weights.
-        dispatcher.combine_a(out, topk_ids, topk_weights, low_latency=True)
+        dispatcher.combine_a(
+            out, topk_ids, topk_weights, low_latency=True, moe_origin_input=x
+        )
         return dispatcher.combine_b()
 
     def _apply_normal(
@@ -428,6 +438,7 @@ if platform.is_nvidia and m_grouped_fp8_gemm_nt_masked is not None:
             # Fused SiLU(gate)*up + FP8 block quantize. Padding rows of an expert
             # block are quantized like any other row; they are simply never
             # gathered back.
+            _clamp_swiglu_input_(gateup, w)
             ispp = w.w2_weight.shape[-1]
             if requires_ue8m0:
                 # Power-of-two scales, packed in the column-major TMA layout the
@@ -512,6 +523,9 @@ if platform.is_nvidia and m_grouped_fp8_gemm_nt_masked is not None:
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({True}),
             "deepep_modes": frozenset({"normal", "low_latency"}),
+            "supports_prefill_graph": frozenset(
+                {platform.arch_version in {ArchVersion(10, 0), ArchVersion(10, 3)}}
+            ),
             # DeepGEMM tiles both GEMMs on 128-element K/N blocks, so the
             # per-partition intermediate size must be a multiple of the block.
             "ispp_alignment": frozenset({_FP8_BLOCK}),

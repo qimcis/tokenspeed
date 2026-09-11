@@ -1176,6 +1176,8 @@ class GlmMoeDsaDecoderLayer(DeepseekV3DecoderLayer):
         num_global_tokens,
         max_num_tokens_per_gpu,
     ):
+        if self.is_moe_layer and self.mlp.use_deepep:
+            return self.mlp.forward_deepep(hidden_states, ctx, self.comm_manager)
         hidden_states = self.comm_manager.pre_mlp_comm(hidden_states, ctx)
         if self.is_moe_layer:
             hidden_states = self.mlp(

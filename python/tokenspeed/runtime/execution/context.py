@@ -73,6 +73,14 @@ class DraftNarrowing(Protocol):
         the following steps."""
 
 
+@dataclass(frozen=True)
+class MoETokenCounts:
+    """Live counts before graph padding changes the collective geometry."""
+
+    num_tokens: int
+    global_num_tokens: tuple[int, ...] | None
+
+
 @dataclass
 class ForwardContext:
     """Do not contain Tensor.
@@ -110,6 +118,7 @@ class ForwardContext:
     # back to ``input_num_tokens`` / ``global_num_tokens``.
     collective_num_tokens: int | None = None
     collective_global_num_tokens: list[int] | None = None
+    moe_token_counts: MoETokenCounts | None = None
 
     # --- logits processor ---
     gather_ids: torch.Tensor | None = None

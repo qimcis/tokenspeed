@@ -36,13 +36,8 @@ from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
 from tokenspeed.runtime.configs.qwen3_5_text_base_config import Qwen3_5BaseTextConfig
-from tokenspeed.runtime.distributed.comm_manager import CommManager
+from tokenspeed.runtime.distributed.comm_manager import CommManager, MoEInputLayout
 from tokenspeed.runtime.distributed.mapping import Mapping
-from tokenspeed.runtime.execution.breakable_cuda_graph import (
-    break_here,
-    current_valid_rows,
-    is_breakable_capture_active,
-)
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_step import (
     get_is_capture_mode,
@@ -56,11 +51,10 @@ from tokenspeed.runtime.layers.linear import (
     RowParallelLinear,
 )
 from tokenspeed.runtime.layers.moe.expert import MoELayer
+from tokenspeed.runtime.layers.moe.graph import run_moe_block
 from tokenspeed.runtime.layers.moe.topk import TopK
 from tokenspeed.runtime.layers.moe.utils import (
     RoutingMethodType,
-    get_all2all_backend,
-    get_moe_backend,
     use_deepep_low_latency,
 )
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
@@ -262,15 +256,6 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         self.layer_index = layer_index
         self.tp_size = mapping.world_size
         self.stream_fork = StreamFork(alt_stream)
-        # DeepEP needs a MoE backend whose apply kernel drives the
-        # dispatch/combine legs itself: nvfp4 via flashinfer cutedsl, or
-        # block-scale fp8 via DeepGEMM masked grouped GEMMs.
-        # Draft models (non-quantized) must fall back to the TP path even
-        # when the target model has deep_ep configured globally.
-        moe_backend = get_moe_backend()
-        self.use_deepep = get_all2all_backend().is_deepep() and (
-            moe_backend.is_flashinfer_cutedsl() or moe_backend.is_deep_gemm()
-        )
         self.comm_manager = CommManager(
             mapping=mapping,
             layer_id=layer_index,
@@ -338,6 +323,10 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
             self.shared_expert = None
             self.shared_expert_gate = None
 
+    @property
+    def use_deepep(self) -> bool:
+        return self.experts._spec.use_deepep
+
     def get_moe_routed_weights(self):
         """Return routed expert weights excluding auxiliary shared parameters."""
         return [
@@ -354,20 +343,10 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         ctx: ForwardContext,
     ) -> torch.Tensor:
         if self.use_deepep:
-            if is_breakable_capture_active():
-                # Allocate in the graph pool; downstream consumers may retain it.
-                dst = torch.empty_like(hidden_states)
-                return break_here(
-                    self._forward_deepep_bcg_into,
-                    dst,
-                    hidden_states,
-                    ctx,
-                    dst,
-                    capture_stub=self._stub_deepep_bcg_into,
-                )
-            return self._forward_deepep(
-                hidden_states, num_global_tokens, max_num_tokens_per_gpu, ctx
+            layout = MoEInputLayout(
+                self.comm_manager, "physical", hidden_states.shape[0]
             )
+            return run_moe_block(self._forward_deepep, hidden_states, None, ctx, layout)
         return self._forward_tp(
             hidden_states, num_global_tokens, max_num_tokens_per_gpu, ctx
         )
@@ -436,63 +415,20 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
-    @staticmethod
-    def _stub_deepep_bcg_into(
-        hidden_states: torch.Tensor,
-        ctx: ForwardContext,
-        dst: torch.Tensor,
-    ) -> torch.Tensor:
-        """Initialize the output without DeepEP communication during capture."""
-        return dst.zero_()
-
-    def _forward_deepep_bcg_into(
-        self,
-        hidden_states: torch.Tensor,
-        ctx: ForwardContext,
-        dst: torch.Tensor,
-    ) -> torch.Tensor:
-        """Run the complete MoE on live local rows and write the padded output."""
-        live_rows = self.comm_manager.moe_num_valid_rows(ctx, current_valid_rows())
-        num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
-            ctx
-        )
-        # Clear the local tail; valid_rows is in pre-TP coordinates.
-        dst.zero_()
-        # Empty source ranks still dispatch/combine for remote expert work.
-        result = self._forward_deepep(
-            hidden_states[:live_rows],
-            num_global_tokens,
-            max_num_tokens_per_gpu,
-            ctx,
-        )
-        dst[:live_rows].copy_(result)
-        return dst
+    def bcg_moe_modules(self) -> tuple[MoELayer, ...]:
+        return (self.experts,) if self.use_deepep else ()
 
     def _forward_deepep(
         self,
         hidden_states: torch.Tensor,
-        num_global_tokens: int,
-        max_num_tokens_per_gpu: int,
+        input_ids: torch.Tensor | None,
         ctx: ForwardContext,
+        layout: MoEInputLayout,
     ) -> torch.Tensor:
-        """DeepEP path: routing on local tokens, dispatch/combine handled by executor."""
-        num_tokens, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_dim)
-
-        # Gate on local tokens (no all-gather needed)
+        rows = layout.resolve(ctx)
+        hidden_states = hidden_states[: rows.live_rows]
+        hidden_states = hidden_states.view(-1, hidden_states.shape[1])
         router_logits, _ = self.gate(hidden_states)
-
-        # Shared weights are replicated: no TP reduction. The callback overlaps
-        # low-latency dispatch; normal dispatch runs it before communication.
-        shared_output = None
-        overlap_fn = None
-        if self.shared_expert is not None:
-
-            def overlap_fn() -> None:
-                nonlocal shared_output
-                shared_output = self.shared_expert(hidden_states)
-
-        # TopK on local tokens
         if hidden_states.shape[0] > 0:
             topk_output = self.topk(hidden_states, router_logits)
         else:
@@ -501,28 +437,30 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
                 hidden_states=hidden_states,
                 router_logits=router_logits,
             )
+        shared_output = None
+        overlap_fn = None
+        if self.shared_expert is not None:
 
-        # DeepEP executor handles dispatch -> MoE GEMM -> combine internally.
-        # Decode-shaped forwards take the low-latency legs; extend-shaped ones
-        # exceed their fixed capacity and must take the normal legs.
-        final_hidden_states = self.experts(
+            def overlap_fn() -> None:
+                nonlocal shared_output
+                shared_output = self.shared_expert(hidden_states)
+
+        routed = self.experts(
             hidden_states=hidden_states,
             topk_output=topk_output,
-            num_global_tokens=num_global_tokens,
-            max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+            num_global_tokens=rows.num_global_tokens,
+            max_num_tokens_per_gpu=rows.max_num_tokens_per_gpu,
             low_latency=use_deepep_low_latency(ctx, self.mapping.attn.dp_size),
             overlap_fn=overlap_fn,
         )
-
         if shared_output is not None:
             if self.shared_expert_gate is not None and hidden_states.shape[0] > 0:
                 fused_gate_sigmoid_mul_add(
                     hidden_states,
                     self.shared_expert_gate.weight.squeeze(0),
                     shared_output,
-                    final_hidden_states,
+                    routed,
                 )
             else:
-                final_hidden_states = final_hidden_states + shared_output
-
-        return final_hidden_states.view(num_tokens, hidden_dim)
+                routed = routed + shared_output
+        return routed.view_as(hidden_states)
