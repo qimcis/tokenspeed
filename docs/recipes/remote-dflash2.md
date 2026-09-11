@@ -146,15 +146,18 @@ tokenspeed serve zai-org/GLM-5.3 \
   --remote-draft-endpoint "${REMOTE_DRAFT_ENDPOINT:?Set the private worker endpoint}" \
   --remote-draft-min-ready "${REMOTE_DRAFT_MIN_READY:?Set the calibrated minimum ready count}" \
   --remote-draft-max-defer-ms "${REMOTE_DRAFT_MAX_DEFER_MS:?Set the workload deferral bound}" \
-  --max-model-len 16384 \
+  --max-model-len 1048576 \
   --chunked-prefill-size 4096 \
   --max-num-seqs 128 \
   --host 0.0.0.0 \
   --port 8000
 ```
 
-Context length, prefill chunk size and admission count above are qualification
-starting points, not measured capacity recommendations. Keep the existing
+The context limit is 1,048,576 total prompt and generated tokens, matching the
+checkpoint's advertised 1M context and `max_position_embeddings`. Prefill chunk
+size and admission count above are qualification starting points, not measured
+capacity recommendations. Actual admission remains subject to the cache budget.
+Keep the existing
 frontend's health/readiness, request, cancellation and streaming interfaces.
 Do not send application requests directly to the draft worker.
 
