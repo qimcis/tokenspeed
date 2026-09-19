@@ -140,6 +140,17 @@ wasted FLOPs);
 `actual_bs == 0` is the idle replay. Eager idle bypasses the wrapper entirely
 (`execute_idle_forward` calls `model_runner.forward(IDLE)` directly).
 
+V4.1 query-head padding is a separate kernel ABI concern. The receiving
+attention backend explicitly opts into fused RoPE plus 64/128-head padding
+only when its selected kernel benefits from it. Target selection and this
+preparation preference share the same kernel selector, including capability
+and override checks. Portable target attention and DSpark window attention
+keep the real local heads (8 at TP8), with matching sink logits. Native
+Blackwell FlashMLA retains fused query padding and its warmed immutable sink
+buffer. Native prefill and mixed batches keep real query heads and reuse that
+padded sink buffer, avoiding another sink-padding allocation for each query
+tile. Eager and captured forwards use this same preparation path.
+
 ### Pointer-stable per-bs views from one builder
 
 Per-bs metadata objects (each leaf's `_decode_views_by_bs[bs]`, the router's

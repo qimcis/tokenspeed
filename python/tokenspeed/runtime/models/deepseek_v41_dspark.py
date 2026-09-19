@@ -111,6 +111,10 @@ class _WindowAttention:
     def query_metadata(self, mode):
         return self.meta
 
+    def prefers_padded_query(self, q: torch.Tensor) -> bool:
+        # Dense window attention has no native head-count ABI.
+        return False
+
     def forward_v41(
         self,
         q,

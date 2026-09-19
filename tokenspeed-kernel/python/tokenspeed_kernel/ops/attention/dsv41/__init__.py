@@ -54,6 +54,7 @@ __all__ = [
     "cache_gather",
     "index_q_quantize",
     "selected_attention",
+    "prefers_padded_query",
     "new_attention_schedule",
     "index_score",
     "index_topk",
@@ -233,6 +234,40 @@ def new_attention_schedule() -> object | None:
     return new_flashmla_schedule()
 
 
+def _selected_attention_kernel(q: torch.Tensor, has_native_inputs: bool):
+    from tokenspeed_kernel.ops.attention.dsv41.flash_mla import (
+        is_flash_mla_v41_available,
+    )
+
+    return select_kernel(
+        "attention",
+        "dsv41_selected_attention",
+        format_signature(x=dense_tensor_format(q.dtype)),
+        features=None,
+        platform=None,
+        objective=SelectionObjective.DEFAULT,
+        traits={
+            "flashmla_eligible": has_native_inputs and is_flash_mla_v41_available()
+        },
+        solution=None,
+        override=None,
+    )
+
+
+def prefers_padded_query(q: torch.Tensor) -> bool:
+    """Whether selected decode attention benefits from fused query padding.
+
+    ``q`` is the real-head BF16 query. The caller must provide the native
+    schedule when available, as with ``new_attention_schedule``. Returns True
+    only for the selected FlashMLA implementation, whose ABI uses 64/128 heads.
+    Merely having the optional library installed does not enable it on Hopper.
+    Other implementations receive real heads and matching sink logits.
+    """
+    return (
+        _selected_attention_kernel(q, True).name == "flashmla_dsv41_selected_attention"
+    )
+
+
 def selected_attention(
     q: torch.Tensor,
     swa_cache: torch.Tensor,
@@ -282,23 +317,8 @@ def selected_attention(
     decode, and tiles compact BF16 prefill workspaces. The portable implementation
     uses the same selections and bounded gather with FP32 online softmax.
     """
-    from tokenspeed_kernel.ops.attention.dsv41.flash_mla import (
-        is_flash_mla_v41_available,
-    )
-
-    native = (
-        schedule is not None or prefill_kv is not None
-    ) and is_flash_mla_v41_available()
-    kernel = select_kernel(
-        "attention",
-        "dsv41_selected_attention",
-        format_signature(x=dense_tensor_format(q.dtype)),
-        features=None,
-        platform=None,
-        objective=SelectionObjective.DEFAULT,
-        traits={"flashmla_eligible": native},
-        solution=None,
-        override=None,
+    kernel = _selected_attention_kernel(
+        q, schedule is not None or prefill_kv is not None
     )
     return kernel(
         q,

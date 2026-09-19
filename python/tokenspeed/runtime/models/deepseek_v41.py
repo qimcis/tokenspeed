@@ -727,10 +727,12 @@ class DeepseekV41Attention(nn.Module):
         if self._padded_attn_sink is not None:
             self._padded_attn_sink[: self.n_local_heads].copy_(param)
 
-    def _kernel_attn_sink(self):
-        padded = 64 if self.n_local_heads <= 64 else 128
-        if not self.attn_sink.is_cuda or padded == self.n_local_heads:
+    def _kernel_attn_sink(self, num_heads: int):
+        if num_heads == self.n_local_heads:
             return self.attn_sink
+        padded = 64 if self.n_local_heads <= 64 else 128
+        if num_heads != padded:
+            raise ValueError("Prepared query and attention sink head counts disagree")
         if self._padded_attn_sink is None:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("Warm up attention sink before graph capture")
@@ -831,7 +833,15 @@ class DeepseekV41Attention(nn.Module):
                         index_q = index_weights = None
             q, _ = self.wq_b(qr, block_scale=None, output_dtype=None)
             q = q.unflatten(-1, (self.n_local_heads, self.head_dim))
-            if q.is_cuda and mode.is_decode() and self.head_dim == 512:
+            native_padding = (
+                q.is_cuda and self.head_dim == 512 and backend.prefers_padded_query(q)
+            )
+            sink_heads = (
+                (64 if self.n_local_heads <= 64 else 128)
+                if native_padding
+                else self.n_local_heads
+            )
+            if native_padding and mode.is_decode():
                 q = rope_pad_query(q, positions, self.rotary_emb.cos_sin_cache, None)
             else:
                 q = self.rotary_emb.apply_owned(q, positions, False)
@@ -863,7 +873,7 @@ class DeepseekV41Attention(nn.Module):
             forward_mode=mode,
             index_q=index_q,
             index_weights=index_weights,
-            attn_sink=self._kernel_attn_sink(),
+            attn_sink=self._kernel_attn_sink(sink_heads),
             softmax_scale=self.head_dim**-0.5,
             index_process_group=index_group,
             swa_rope_cache=swa_rope_cache,

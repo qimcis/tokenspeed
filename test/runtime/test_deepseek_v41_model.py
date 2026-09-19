@@ -241,6 +241,9 @@ class _Backend:
     def query_metadata(self, mode):
         return self.meta
 
+    def prefers_padded_query(self, q):
+        return False
+
     def decoder_view(self):
         return self.view
 

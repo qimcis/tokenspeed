@@ -1392,6 +1392,11 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             )
         return plan.history_slots[ratio]
 
+    def prefers_padded_query(self, q: torch.Tensor) -> bool:
+        from tokenspeed_kernel.ops.attention import dsv41
+
+        return dsv41.prefers_padded_query(q)
+
     def _decode_schedule(self):
         from tokenspeed_kernel.ops.attention import dsv41
 
