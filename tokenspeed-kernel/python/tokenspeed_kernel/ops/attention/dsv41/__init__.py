@@ -314,8 +314,10 @@ def selected_attention(
         entries are not deduplicated. Inverse RoPE remains the caller's job.
 
     The optional Blackwell implementation reads packed pages directly for
-    decode, and tiles compact BF16 prefill workspaces. The portable implementation
-    uses the same selections and bounded gather with FP32 online softmax.
+    decode, and tiles compact BF16 prefill workspaces. Hopper uses native BF16
+    sparse attention for TP8 prefill and larger combined batches, direct tiled
+    reads for SWA-only TP8 decode, and portable attention for smaller combined
+    batches. The portable path uses bounded gather with FP32 online softmax.
     """
     kernel = _selected_attention_kernel(
         q, schedule is not None or prefill_kv is not None
@@ -833,5 +835,6 @@ import tokenspeed_kernel.ops.attention.dsv41.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41.deep_select  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41.deep_gemm  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41.flash_mla  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.dsv41.hopper  # noqa: E402,F401
 
 # isort: on

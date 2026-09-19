@@ -75,7 +75,11 @@ def test_padding_preference_matches_actual_selected_attention(
         (
             "flashmla_dsv41_selected_attention"
             if native_expected
-            else "triton_dsv41_selected_attention"
+            else (
+                "hopper_dsv41_selected_attention"
+                if platform.arch_version.major == 9
+                else "triton_dsv41_selected_attention"
+            )
         )
     ]
 
@@ -176,22 +180,26 @@ def test_unpadded_portable_attention_matches_padded_heads_and_graph(
             if padded
             else dsv41.rope_inplace(q.clone(), positions, table, None)
         )
-        return dsv41.selected_attention(
-            rotated,
-            swa,
-            swa_slots,
-            swa_lens,
-            global_cache,
-            global_slots,
-            global_lens,
-            padded_sink if padded else sink,
-            512**-0.5,
-            None,
-            256,
-            None,
-            None,
-            None,
-        )[:, :8]
+        # This isolates head padding from Hopper's different attention arithmetic.
+        with kernel_override(
+            "attention", "dsv41_selected_attention", "triton_dsv41_selected_attention"
+        ):
+            return dsv41.selected_attention(
+                rotated,
+                swa,
+                swa_slots,
+                swa_lens,
+                global_cache,
+                global_slots,
+                global_lens,
+                padded_sink if padded else sink,
+                512**-0.5,
+                None,
+                256,
+                None,
+                None,
+                None,
+            )[:, :8]
 
     torch.testing.assert_close(forward(False), forward(True), rtol=0, atol=0)
     stream = torch.cuda.Stream()
