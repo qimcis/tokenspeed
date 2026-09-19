@@ -358,7 +358,14 @@ class DefaultModelLoader(BaseModelLoader):
                 hf_weights_files,
             )
         elif self.load_config.load_format == LoadFormat.INSTANTTENSOR:
-            weights_iterator = instanttensor_weights_iterator(hf_weights_files)
+            weights_iterator = instanttensor_weights_iterator(
+                hf_weights_files,
+                accept=(
+                    (lambda name: weight_name_filter(source.prefix + name))
+                    if weight_name_filter is not None
+                    else None
+                ),
+            )
         elif use_safetensors and weight_name_filter is not None:
             weights_iterator = safetensors_filtered_weights_iterator(
                 hf_weights_files,

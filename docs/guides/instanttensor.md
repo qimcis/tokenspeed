@@ -67,7 +67,7 @@ serve identical output, as the loaders are bit-for-bit equivalent.
 
 ## Memory considerations
 
-InstantTensor reads each checkpoint tensor **directly onto the GPU**, whereas
+InstantTensor reads each tensor in its input shards **directly onto the GPU**, whereas
 the default safetensors loader stages the full tensor in host (CPU) memory and
 copies only the current rank's shard to the GPU. InstantTensor's own overhead is
 small: it uses a GPU staging buffer (dynamically sized, configurable) that is
@@ -88,11 +88,27 @@ correspondingly limited by GPU memory.
 
 Tuning:
 
-- `INSTANTTENSOR_BUFFER_SIZE` / `INSTANTTENSOR_MAX_FREE_MEM_USAGE` bound
-  InstantTensor's GPU I/O staging buffer, trading a little throughput for lower
-  peak memory.
+- `INSTANTTENSOR_BUFFER_SIZE` / `INSTANTTENSOR_MAX_FREE_MEM_USAGE` tune
+  InstantTensor's GPU I/O staging memory. They do not cap a tensor's allocation:
+  InstantTensor enlarges its buffer to hold at least the largest input tensor.
 - `--gpu-memory-utilization` only sizes the KV cache *after* weights are loaded;
   it does not change peak memory during loading.
+
+### Models with filtered weights and Engram tables
+
+When a model supplies a checkpoint-name filter, TokenSpeed inspects bounded
+safetensors headers before opening a GPU loader. Shards containing only accepted
+names use InstantTensor. Mixed shards use CPU safetensors `get_tensor` for accepted
+names only, with whole-file prefetch disabled; shards with no accepted names are
+skipped. The predicate must select the same files on every rank in the loading
+process group. Logs report how many shards use each route.
+
+For DeepSeek V4.1, this is a hybrid loading path: ordinary shards use
+InstantTensor, while the small projection tensors sharing Engram shards use
+filtered CPU loading. Engram embed weights and scales remain on the model's
+existing CPU `get_slice` path, which copies only each TP rank's rows in bounded
+chunks. Full Engram tables are never passed to InstantTensor. The checkpoint
+requires no rewrite, and the CLI remains `--load-format instanttensor`.
 
 ## Notes
 
@@ -103,7 +119,7 @@ Tuning:
 - Checkpoints declaring a sub-byte safetensors dtype (`F4`, `F6_E2M3`,
   `F6_E3M2`) are rejected up front, because InstantTensor reads them at twice
   their true length without raising. This does not affect NVFP4 or MXFP4
-  checkpoints, which store their packed 4-bit values as byte-aligned `U8`.
+  checkpoints that store their packed 4-bit values as byte-aligned `U8` or `I8`.
 
 For benchmarks and implementation details, see the
 [InstantTensor repository](https://github.com/scitix/InstantTensor).
