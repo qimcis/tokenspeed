@@ -28,6 +28,8 @@ from typing import List, Optional
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.gemm._hopper_block32_policy import get_hopper_block32_config
+from tokenspeed_kernel.ops.gemm.hopper_block32 import gemm_fp8_block32
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, Platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import (
@@ -510,6 +512,25 @@ def w8a8_block_fp8_matmul_triton(
     )
 
     block_n, block_k = block_size
+
+    if (
+        (block_n, block_k) == (1, 32)
+        and A.dtype == torch.float8_e4m3fn
+        and B.dtype == torch.float8_e4m3fn
+        and As.dtype == torch.uint8
+        and Bs.dtype == torch.uint8
+        and C.dtype == torch.bfloat16
+    ):
+        hopper_config = get_hopper_block32_config(Platform.get(), M, N, K)
+        if hopper_config is not None:
+            workspace = (
+                torch.empty(
+                    (hopper_config.split_k, M, N), device=A.device, dtype=torch.float32
+                )
+                if hopper_config.split_k > 1
+                else None
+            )
+            return gemm_fp8_block32(A, B, As, Bs, C, hopper_config, workspace)
 
     config = get_w8a8_block_fp8_config(M, N, K, block_n, block_k)
     if config is None:
