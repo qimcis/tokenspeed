@@ -281,6 +281,10 @@ class Envs:
     # Quantization
     TOKENSPEED_NVFP4_GEMM_SWIGLU_NVFP4_QUANT = EnvBool(True)
 
+    # Experimental V4.1 local HC epilogue. Standalone H20 measurements regress;
+    # keep disabled while collective-fusion candidates are evaluated.
+    TOKENSPEED_EXPERIMENTAL_V41_HOPPER_EPILOGUE = EnvBool(False)
+
     # EPLB
     TOKENSPEED_EXPERT_DISTRIBUTION_RECORDER_DIR = EnvStr("/tmp")
 

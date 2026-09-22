@@ -1,0 +1,6021 @@
+{
+  "status": "complete",
+  "calls_per_graph": 8,
+  "replays": 2,
+  "pairs": 3,
+  "round_mode": "bf16_step",
+  "relative_l2_limit": 0.006,
+  "summary": [
+    {
+      "rows": 1,
+      "quantize": false,
+      "dispatch": {
+        "backend": "mnnvl",
+        "workspace_class": "MnnvlAllReduceFusionWorkspace",
+        "fp32_acc": false,
+        "use_oneshot": true,
+        "trigger_completion_at_end": true
+      },
+      "per_pair_max_rank_us": {
+        "baseline": [
+          9.415999986231327,
+          8.340000174939632,
+          8.21600016206503
+        ],
+        "candidate": [
+          41.322000324726105,
+          41.27199947834015,
+          42.53799840807915
+        ]
+      },
+      "median_max_rank_us": {
+        "baseline": 8.340000174939632,
+        "candidate": 41.322000324726105
+      },
+      "baseline_over_candidate": 0.20182953655196537
+    },
+    {
+      "rows": 1,
+      "quantize": true,
+      "dispatch": {
+        "backend": "mnnvl",
+        "workspace_class": "MnnvlAllReduceFusionWorkspace",
+        "fp32_acc": false,
+        "use_oneshot": true,
+        "trigger_completion_at_end": true
+      },
+      "per_pair_max_rank_us": {
+        "baseline": [
+          10.6819998472929,
+          9.701999835669994,
+          9.631999768316746
+        ],
+        "candidate": [
+          52.963998168706894,
+          49.559999257326126,
+          49.601998180150986
+        ]
+      },
+      "median_max_rank_us": {
+        "baseline": 9.701999835669994,
+        "candidate": 49.601998180150986
+      },
+      "baseline_over_candidate": 0.1955969555991073
+    },
+    {
+      "rows": 2,
+      "quantize": false,
+      "dispatch": {
+        "backend": "mnnvl",
+        "workspace_class": "MnnvlAllReduceFusionWorkspace",
+        "fp32_acc": false,
+        "use_oneshot": true,
+        "trigger_completion_at_end": true
+      },
+      "per_pair_max_rank_us": {
+        "baseline": [
+          9.631999768316746,
+          8.90399981290102,
+          9.457999840378761
+        ],
+        "candidate": [
+          46.29399999976158,
+          46.121999621391296,
+          47.00399935245514
+        ]
+      },
+      "median_max_rank_us": {
+        "baseline": 9.457999840378761,
+        "candidate": 46.29399999976158
+      },
+      "baseline_over_candidate": 0.2043029299785603
+    },
+    {
+      "rows": 2,
+      "quantize": true,
+      "dispatch": {
+        "backend": "mnnvl",
+        "workspace_class": "MnnvlAllReduceFusionWorkspace",
+        "fp32_acc": false,
+        "use_oneshot": true,
+        "trigger_completion_at_end": true
+      },
+      "per_pair_max_rank_us": {
+        "baseline": [
+          12.60599959641695,
+          11.1480001360178,
+          18.201999366283417
+        ],
+        "candidate": [
+          60.72400137782097,
+          59.16399881243706,
+          59.32199954986572
+        ]
+      },
+      "median_max_rank_us": {
+        "baseline": 12.60599959641695,
+        "candidate": 59.32199954986572
+      },
+      "baseline_over_candidate": 0.21250125909563147
+    },
+    {
+      "rows": 4,
+      "quantize": false,
+      "dispatch": {
+        "backend": "mnnvl",
+        "workspace_class": "MnnvlAllReduceFusionWorkspace",
+        "fp32_acc": false,
+        "use_oneshot": true,
+        "trigger_completion_at_end": true
+      },
+      "per_pair_max_rank_us": {
+        "baseline": [
+          9.80400014668703,
+          8.988000452518463,
+          8.870000019669533
+        ],
+        "candidate": [
+          51.688000559806824,
+          50.964001566171646,
+          51.86799913644791
+        ]
+      },
+      "median_max_rank_us": {
+        "baseline": 8.988000452518463,
+        "candidate": 51.688000559806824
+      },
+      "baseline_over_candidate": 0.17388949766239623
+    },
+    {
+      "rows": 4,
+      "quantize": true,
+      "dispatch": {
+        "backend": "mnnvl",
+        "workspace_class": "MnnvlAllReduceFusionWorkspace",
+        "fp32_acc": false,
+        "use_oneshot": true,
+        "trigger_completion_at_end": true
+      },
+      "per_pair_max_rank_us": {
+        "baseline": [
+          11.296000331640244,
+          10.66999975591898,
+          10.862000286579132
+        ],
+        "candidate": [
+          69.61199641227722,
+          70.81600278615952,
+          69.12600249052048
+        ]
+      },
+      "median_max_rank_us": {
+        "baseline": 10.862000286579132,
+        "candidate": 69.61199641227722
+      },
+      "baseline_over_candidate": 0.1560363277365141
+    },
+    {
+      "rows": 8,
+      "quantize": false,
+      "dispatch": {
+        "backend": "mnnvl",
+        "workspace_class": "MnnvlAllReduceFusionWorkspace",
+        "fp32_acc": false,
+        "use_oneshot": true,
+        "trigger_completion_at_end": true
+      },
+      "per_pair_max_rank_us": {
+        "baseline": [
+          10.978000238537788,
+          10.036000050604343,
+          10.27000043541193
+        ],
+        "candidate": [
+          64.10200148820877,
+          66.0879984498024,
+          64.68600034713745
+        ]
+      },
+      "median_max_rank_us": {
+        "baseline": 10.27000043541193,
+        "candidate": 64.68600034713745
+      },
+      "baseline_over_candidate": 0.1587669724561415
+    },
+    {
+      "rows": 8,
+      "quantize": true,
+      "dispatch": {
+        "backend": "mnnvl",
+        "workspace_class": "MnnvlAllReduceFusionWorkspace",
+        "fp32_acc": false,
+        "use_oneshot": true,
+        "trigger_completion_at_end": true
+      },
+      "per_pair_max_rank_us": {
+        "baseline": [
+          13.56200035661459,
+          13.683999888598919,
+          12.05000001937151
+        ],
+        "candidate": [
+          94.75000202655792,
+          93.84600073099136,
+          94.26599740982056
+        ]
+      },
+      "median_max_rank_us": {
+        "baseline": 13.56200035661459,
+        "candidate": 94.26599740982056
+      },
+      "baseline_over_candidate": 0.14386948347508505
+    }
+  ],
+  "hardware": "8 x NVIDIA H20 (SM90)",
+  "hidden": 5120,
+  "weight_dtype": "FP32",
+  "baseline_revision": "1a9631f7b8898e327b5ce7a69a3bc44ead4fed72",
+  "candidate_kernel_sha256": "7899304e0962a1e175392d4e5cd49d2aaf79f4cd4cf993434012ae9aeacfa6b9",
+  "local_epilogue_sha256": "78b9634552bc7c71efef17ffe3d7a968ea8aba0ce993cbd83cf7fc40058985f0",
+  "metric": "median across three pairs of maximum-rank complete-chain hot-input CUDA graph microseconds",
+  "promotion": "rejected: all eight measured configurations regress",
+  "end_to_end_gain": null,
+  "ranks": [
+    {
+      "rank": 0,
+      "status": "complete",
+      "cases": [
+        {
+          "rows": 1,
+          "quantize": false,
+          "seed": 1201,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 9.26399976015091,
+                "candidate": 40.77399894595146
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 40.50600156188011,
+                "baseline": 8.340000174939632
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 8.21600016206503,
+                "candidate": 40.58000072836876
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.41087960905861
+        },
+        {
+          "rows": 1,
+          "quantize": true,
+          "seed": 1202,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 52.13199928402901,
+                "baseline": 10.635999962687492
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 9.701999835669994,
+                "candidate": 48.847999423742294
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 48.74200001358986,
+                "baseline": 9.596000425517559
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                4.252268722590152e-06
+              ],
+              "max_absolute_error": 0.0009765625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "exact_candidate_quantization": true,
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                4.252268722590152e-06
+              ],
+              "max_absolute_error": 0.0009765625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.46335374400951
+        },
+        {
+          "rows": 2,
+          "quantize": false,
+          "seed": 1203,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 9.631999768316746,
+                "candidate": 45.52600160241127
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 45.409999787807465,
+                "baseline": 8.90399981290102
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 9.457999840378761,
+                "candidate": 45.542001724243164
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                5.745028657838094e-05,
+                0.0
+              ],
+              "max_absolute_error": 0.015625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                5.745028657838094e-05,
+                0.0
+              ],
+              "max_absolute_error": 0.015625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.48594313603826
+        },
+        {
+          "rows": 2,
+          "quantize": true,
+          "seed": 1204,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 60.0459985435009,
+                "baseline": 12.60599959641695
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 11.1480001360178,
+                "candidate": 58.43599885702133
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 58.57200175523758,
+                "baseline": 18.201999366283417
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                3.0215264722220613e-07
+              ],
+              "max_absolute_error": 6.103515625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "exact_candidate_quantization": true,
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                3.0215264722220613e-07
+              ],
+              "max_absolute_error": 6.103515625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.507670667022467
+        },
+        {
+          "rows": 4,
+          "quantize": false,
+          "seed": 1205,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 9.80400014668703,
+                "candidate": 51.020000129938126
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 50.303999334573746,
+                "baseline": 8.91599990427494
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 8.861999958753586,
+                "candidate": 51.0919988155365
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                2.460022512664151e-07,
+                0.0
+              ],
+              "max_absolute_error": 6.103515625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                2.460022512664151e-07,
+                0.0
+              ],
+              "max_absolute_error": 6.103515625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.533068384043872
+        },
+        {
+          "rows": 4,
+          "quantize": true,
+          "seed": 1206,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 68.77200305461884,
+                "baseline": 11.194000020623207
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 10.66999975591898,
+                "candidate": 70.02600282430649
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 68.48999857902527,
+                "baseline": 10.862000286579132
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "exact_candidate_quantization": true,
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.569687673007138
+        },
+        {
+          "rows": 8,
+          "quantize": false,
+          "seed": 1207,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 10.892000049352646,
+                "candidate": 63.426002860069275
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 65.92199951410294,
+                "baseline": 10.011999867856503
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 9.890000335872173,
+                "candidate": 64.64199721813202
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.1424665043762398e-05,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.00390625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.1424665043762398e-05,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.00390625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.599473057081923
+        },
+        {
+          "rows": 8,
+          "quantize": true,
+          "seed": 1208,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 94.63799744844437,
+                "baseline": 13.411999680101871
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 12.489999644458294,
+                "candidate": 92.93799847364426
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 93.66200119256973,
+                "baseline": 12.02400028705597
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                4.300345667441472e-08,
+                0.0
+              ],
+              "max_absolute_error": 1.52587890625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "exact_candidate_quantization": true,
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                4.300345667441472e-08,
+                0.0
+              ],
+              "max_absolute_error": 1.52587890625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.63288127304986
+        }
+      ]
+    },
+    {
+      "rank": 1,
+      "status": "complete",
+      "cases": [
+        {
+          "rows": 1,
+          "quantize": false,
+          "seed": 1201,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 9.1559998691082,
+                "candidate": 41.27800092101097
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 41.23000055551529,
+                "baseline": 8.24000034481287
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 8.124000392854214,
+                "candidate": 42.53799840807915
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.411880085943267
+        },
+        {
+          "rows": 1,
+          "quantize": true,
+          "seed": 1202,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 52.72600054740906,
+                "baseline": 10.653999634087086
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 9.692000225186348,
+                "candidate": 49.51399937272072
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 49.55200105905533,
+                "baseline": 9.531999938189983
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                4.252268722590152e-06
+              ],
+              "max_absolute_error": 0.0009765625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "exact_candidate_quantization": true,
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                4.252268722590152e-06
+              ],
+              "max_absolute_error": 0.0009765625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.464343238971196
+        },
+        {
+          "rows": 2,
+          "quantize": false,
+          "seed": 1203,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 9.378000162541866,
+                "candidate": 45.99799960851669
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 45.9819994866848,
+                "baseline": 8.684000000357628
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 9.333999827504158,
+                "candidate": 46.73599824309349
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                5.745028657838094e-05,
+                0.0
+              ],
+              "max_absolute_error": 0.015625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                5.745028657838094e-05,
+                0.0
+              ],
+              "max_absolute_error": 0.015625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.48694008390885
+        },
+        {
+          "rows": 2,
+          "quantize": true,
+          "seed": 1204,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 60.13999879360199,
+                "baseline": 12.493999674916267
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 10.990000329911709,
+                "candidate": 59.043999761343
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 58.79800021648407,
+                "baseline": 18.007999286055565
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                3.0215264722220613e-07
+              ],
+              "max_absolute_error": 6.103515625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "exact_candidate_quantization": true,
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                3.0215264722220613e-07
+              ],
+              "max_absolute_error": 6.103515625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.508660850930028
+        },
+        {
+          "rows": 4,
+          "quantize": false,
+          "seed": 1205,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 9.580000303685665,
+                "candidate": 51.44999921321869
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 50.374001264572144,
+                "baseline": 8.988000452518463
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 8.870000019669533,
+                "candidate": 51.222000271081924
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                2.460022512664151e-07,
+                0.0
+              ],
+              "max_absolute_error": 6.103515625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                2.460022512664151e-07,
+                0.0
+              ],
+              "max_absolute_error": 6.103515625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.53405968588777
+        },
+        {
+          "rows": 4,
+          "quantize": true,
+          "seed": 1206,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 68.9539983868599,
+                "baseline": 11.296000331640244
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 10.54800022393465,
+                "candidate": 70.7859992980957
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 68.5340017080307,
+                "baseline": 10.80199982970953
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "exact_candidate_quantization": true,
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.570677168900147
+        },
+        {
+          "rows": 8,
+          "quantize": false,
+          "seed": 1207,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 10.276000015437603,
+                "candidate": 63.308000564575195
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 65.23799896240234,
+                "baseline": 10.036000050604343
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 10.27000043541193,
+                "candidate": 63.97800147533417
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.1424665043762398e-05,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.00390625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.1424665043762398e-05,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.00390625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.60044895496685
+        },
+        {
+          "rows": 8,
+          "quantize": true,
+          "seed": 1208,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 94.11799907684326,
+                "baseline": 13.56200035661459
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 13.683999888598919,
+                "candidate": 93.16200017929077
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 93.79400312900543,
+                "baseline": 12.05000001937151
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                4.300345667441472e-08,
+                0.0
+              ],
+              "max_absolute_error": 1.52587890625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "exact_candidate_quantization": true,
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                4.300345667441472e-08,
+                0.0
+              ],
+              "max_absolute_error": 1.52587890625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.633869948913343
+        }
+      ]
+    },
+    {
+      "rank": 2,
+      "status": "complete",
+      "cases": [
+        {
+          "rows": 1,
+          "quantize": false,
+          "seed": 1201,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 9.069999679923058,
+                "candidate": 41.322000324726105
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 41.27199947834015,
+                "baseline": 8.25399998575449
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 8.13200045377016,
+                "candidate": 41.32600128650665
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.41219830699265
+        },
+        {
+          "rows": 1,
+          "quantize": true,
+          "seed": 1202,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 52.79799923300743,
+                "baseline": 10.665999725461006
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 9.557999670505524,
+                "candidate": 49.559999257326126
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 49.601998180150986,
+                "baseline": 9.631999768316746
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                4.252268722590152e-06
+              ],
+              "max_absolute_error": 0.0009765625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "exact_candidate_quantization": true,
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                4.252268722590152e-06
+              ],
+              "max_absolute_error": 0.0009765625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.464660695986822
+        },
+        {
+          "rows": 2,
+          "quantize": false,
+          "seed": 1203,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 8.678000420331955,
+                "candidate": 46.29399999976158
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 46.007998287677765,
+                "baseline": 8.8900001719594
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 9.345999918878078,
+                "candidate": 47.00399935245514
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                5.745028657838094e-05,
+                0.0
+              ],
+              "max_absolute_error": 0.015625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                5.745028657838094e-05,
+                0.0
+              ],
+              "max_absolute_error": 0.015625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.487261302070692
+        },
+        {
+          "rows": 2,
+          "quantize": true,
+          "seed": 1204,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 60.61999872326851,
+                "baseline": 12.529999949038029
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 10.991999879479408,
+                "candidate": 59.16399881243706
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 59.32199954986572,
+                "baseline": 18.16999912261963
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                3.0215264722220613e-07
+              ],
+              "max_absolute_error": 6.103515625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "exact_candidate_quantization": true,
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                3.0215264722220613e-07
+              ],
+              "max_absolute_error": 6.103515625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.50897717603948
+        },
+        {
+          "rows": 4,
+          "quantize": false,
+          "seed": 1205,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 9.415999986231327,
+                "candidate": 51.67999863624573
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 50.0820018351078,
+                "baseline": 8.853999897837639
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 8.816000074148178,
+                "candidate": 51.8140010535717
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                2.460022512664151e-07,
+                0.0
+              ],
+              "max_absolute_error": 6.103515625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                2.460022512664151e-07,
+                0.0
+              ],
+              "max_absolute_error": 6.103515625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.534388468018733
+        },
+        {
+          "rows": 4,
+          "quantize": true,
+          "seed": 1206,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 69.12799924612045,
+                "baseline": 11.214000172913074
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 10.639999993145466,
+                "candidate": 70.79199701547623
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 69.12600249052048,
+                "baseline": 10.77600009739399
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "exact_candidate_quantization": true,
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.570994480047375
+        },
+        {
+          "rows": 8,
+          "quantize": false,
+          "seed": 1207,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 10.710000060498714,
+                "candidate": 63.415996730327606
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 65.9639984369278,
+                "baseline": 9.990000165998936
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 10.251999832689762,
+                "candidate": 64.66399878263474
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.1424665043762398e-05,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.00390625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.1424665043762398e-05,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.00390625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.600780565058812
+        },
+        {
+          "rows": 8,
+          "quantize": true,
+          "seed": 1208,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 94.31800246238708,
+                "baseline": 13.489999808371067
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 13.621999882161617,
+                "candidate": 93.6100035905838
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 94.14400160312653,
+                "baseline": 11.963999830186367
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                4.300345667441472e-08,
+                0.0
+              ],
+              "max_absolute_error": 1.52587890625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "exact_candidate_quantization": true,
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                4.300345667441472e-08,
+                0.0
+              ],
+              "max_absolute_error": 1.52587890625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.63418701197952
+        }
+      ]
+    },
+    {
+      "rank": 3,
+      "status": "complete",
+      "cases": [
+        {
+          "rows": 1,
+          "quantize": false,
+          "seed": 1201,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 8.461999706923962,
+                "candidate": 41.29000008106232
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 41.15400090813637,
+                "baseline": 8.058000355958939
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 8.022000081837177,
+                "candidate": 41.345998644828796
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.411412050016224
+        },
+        {
+          "rows": 1,
+          "quantize": true,
+          "seed": 1202,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 49.61799830198288,
+                "baseline": 9.721999987959862
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 9.535999968647957,
+                "candidate": 49.375999718904495
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 49.36600103974342,
+                "baseline": 9.560000151395798
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                4.252268722590152e-06
+              ],
+              "max_absolute_error": 0.0009765625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "exact_candidate_quantization": true,
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                4.252268722590152e-06
+              ],
+              "max_absolute_error": 0.0009765625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.463877210975625
+        },
+        {
+          "rows": 2,
+          "quantize": false,
+          "seed": 1203,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 8.751999586820602,
+                "candidate": 46.06200009584427
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 46.121999621391296,
+                "baseline": 8.867999538779259
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 9.417999535799026,
+                "candidate": 46.81200161576271
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                5.745028657838094e-05,
+                0.0
+              ],
+              "max_absolute_error": 0.015625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                5.745028657838094e-05,
+                0.0
+              ],
+              "max_absolute_error": 0.015625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.486475332989357
+        },
+        {
+          "rows": 2,
+          "quantize": true,
+          "seed": 1204,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 60.72400137782097,
+                "baseline": 12.054000049829483
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 10.792000219225883,
+                "candidate": 58.96199867129326
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 58.63200128078461,
+                "baseline": 17.942000180482864
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                3.0215264722220613e-07
+              ],
+              "max_absolute_error": 6.103515625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "exact_candidate_quantization": true,
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                3.0215264722220613e-07
+              ],
+              "max_absolute_error": 6.103515625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.508194422000088
+        },
+        {
+          "rows": 4,
+          "quantize": false,
+          "seed": 1205,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 9.332000277936459,
+                "candidate": 51.55999958515167
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 50.13800039887428,
+                "baseline": 8.86400043964386
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 8.820000104606152,
+                "candidate": 51.86799913644791
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                2.460022512664151e-07,
+                0.0
+              ],
+              "max_absolute_error": 6.103515625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                2.460022512664151e-07,
+                0.0
+              ],
+              "max_absolute_error": 6.103515625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.53360518394038
+        },
+        {
+          "rows": 4,
+          "quantize": true,
+          "seed": 1206,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 69.44199651479721,
+                "baseline": 10.51000040024519
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 10.362000204622746,
+                "candidate": 70.81600278615952
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 68.7519982457161,
+                "baseline": 10.362000204622746
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "exact_candidate_quantization": true,
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.57021138293203
+        },
+        {
+          "rows": 8,
+          "quantize": false,
+          "seed": 1207,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 10.758000425994396,
+                "candidate": 63.95000219345093
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 66.0879984498024,
+                "baseline": 9.978000074625015
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 10.218000039458275,
+                "candidate": 64.64599817991257
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.1424665043762398e-05,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.00390625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.1424665043762398e-05,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.00390625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.599995760945603
+        },
+        {
+          "rows": 8,
+          "quantize": true,
+          "seed": 1208,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 94.24000233411789,
+                "baseline": 13.332000002264977
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 13.398000039160252,
+                "candidate": 93.84600073099136
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 94.25999969244003,
+                "baseline": 11.90400030463934
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                4.300345667441472e-08,
+                0.0
+              ],
+              "max_absolute_error": 1.52587890625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "exact_candidate_quantization": true,
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                4.300345667441472e-08,
+                0.0
+              ],
+              "max_absolute_error": 1.52587890625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.633404055959545
+        }
+      ]
+    },
+    {
+      "rank": 4,
+      "status": "complete",
+      "cases": [
+        {
+          "rows": 1,
+          "quantize": false,
+          "seed": 1201,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 9.232000447809696,
+                "candidate": 41.08799993991852
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 40.832001715898514,
+                "baseline": 8.245999924838543
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 8.042000234127045,
+                "candidate": 40.794000029563904
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.411406889907084
+        },
+        {
+          "rows": 1,
+          "quantize": true,
+          "seed": 1202,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 52.7379997074604,
+                "baseline": 10.6819998472929
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 9.506000205874443,
+                "candidate": 49.1040013730526
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 48.74600097537041,
+                "baseline": 9.576000273227692
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                4.252268722590152e-06
+              ],
+              "max_absolute_error": 0.0009765625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "exact_candidate_quantization": true,
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                4.252268722590152e-06
+              ],
+              "max_absolute_error": 0.0009765625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.46387544600293
+        },
+        {
+          "rows": 2,
+          "quantize": false,
+          "seed": 1203,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 9.572000242769718,
+                "candidate": 45.85599899291992
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 45.889999717473984,
+                "baseline": 8.813999593257904
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 9.425999596714973,
+                "candidate": 46.55599966645241
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                5.745028657838094e-05,
+                0.0
+              ],
+              "max_absolute_error": 0.015625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                5.745028657838094e-05,
+                0.0
+              ],
+              "max_absolute_error": 0.015625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.48646965296939
+        },
+        {
+          "rows": 2,
+          "quantize": true,
+          "seed": 1204,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 58.41999873518944,
+                "baseline": 10.073999874293804
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 10.676000267267227,
+                "candidate": 58.77799913287163
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 58.81800130009651,
+                "baseline": 9.65800043195486
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                3.0215264722220613e-07
+              ],
+              "max_absolute_error": 6.103515625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "exact_candidate_quantization": true,
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                3.0215264722220613e-07
+              ],
+              "max_absolute_error": 6.103515625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.508192505920306
+        },
+        {
+          "rows": 4,
+          "quantize": false,
+          "seed": 1205,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 9.720000438392162,
+                "candidate": 51.688000559806824
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 50.59000104665756,
+                "baseline": 8.870000019669533
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 8.79599992185831,
+                "candidate": 51.64799839258194
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                2.460022512664151e-07,
+                0.0
+              ],
+              "max_absolute_error": 6.103515625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                2.460022512664151e-07,
+                0.0
+              ],
+              "max_absolute_error": 6.103515625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.53360095899552
+        },
+        {
+          "rows": 4,
+          "quantize": true,
+          "seed": 1206,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 68.77599656581879,
+                "baseline": 11.060000397264957
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 10.552000254392624,
+                "candidate": 70.45400142669678
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 68.92000138759613,
+                "baseline": 10.727999731898308
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "exact_candidate_quantization": true,
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.570209883968346
+        },
+        {
+          "rows": 8,
+          "quantize": false,
+          "seed": 1207,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 10.834000073373318,
+                "candidate": 63.79000097513199
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 65.69399684667587,
+                "baseline": 9.93799977004528
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 10.243999771773815,
+                "candidate": 64.37599658966064
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.1424665043762398e-05,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.00390625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.1424665043762398e-05,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.00390625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.599986798944883
+        },
+        {
+          "rows": 8,
+          "quantize": true,
+          "seed": 1208,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 94.35199946165085,
+                "baseline": 13.439999893307686
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 13.44399992376566,
+                "candidate": 93.40800344944
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 94.04599666595459,
+                "baseline": 11.986000463366508
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                4.300345667441472e-08,
+                0.0
+              ],
+              "max_absolute_error": 1.52587890625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "exact_candidate_quantization": true,
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                4.300345667441472e-08,
+                0.0
+              ],
+              "max_absolute_error": 1.52587890625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.63340176397469
+        }
+      ]
+    },
+    {
+      "rank": 5,
+      "status": "complete",
+      "cases": [
+        {
+          "rows": 1,
+          "quantize": false,
+          "seed": 1201,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 9.27400030195713,
+                "candidate": 41.16800054907799
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 40.89000076055527,
+                "baseline": 8.212000131607056
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 8.02600011229515,
+                "candidate": 40.79600051045418
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.40846347704064
+        },
+        {
+          "rows": 1,
+          "quantize": true,
+          "seed": 1202,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 52.74999886751175,
+                "baseline": 10.603999719023705
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 9.472000412642956,
+                "candidate": 49.18999969959259
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 49.244001507759094,
+                "baseline": 9.568000212311745
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                4.252268722590152e-06
+              ],
+              "max_absolute_error": 0.0009765625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "exact_candidate_quantization": true,
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                4.252268722590152e-06
+              ],
+              "max_absolute_error": 0.0009765625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.460930590052158
+        },
+        {
+          "rows": 2,
+          "quantize": false,
+          "seed": 1203,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 9.283999912440777,
+                "candidate": 45.8419993519783
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 45.848000794649124,
+                "baseline": 8.383999578654766
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 8.469999767839909,
+                "candidate": 45.437999069690704
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                5.745028657838094e-05,
+                0.0
+              ],
+              "max_absolute_error": 0.015625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                5.745028657838094e-05,
+                0.0
+              ],
+              "max_absolute_error": 0.015625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.483527475968003
+        },
+        {
+          "rows": 2,
+          "quantize": true,
+          "seed": 1204,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 60.387998819351196,
+                "baseline": 12.512000277638435
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 10.824000462889671,
+                "candidate": 58.8419996201992
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 58.984000235795975,
+                "baseline": 18.00600066781044
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                3.0215264722220613e-07
+              ],
+              "max_absolute_error": 6.103515625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "exact_candidate_quantization": true,
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                3.0215264722220613e-07
+              ],
+              "max_absolute_error": 6.103515625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.505247356020845
+        },
+        {
+          "rows": 4,
+          "quantize": false,
+          "seed": 1205,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 9.65999998152256,
+                "candidate": 51.44200101494789
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 50.85200071334839,
+                "baseline": 8.75800009816885
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 8.716000244021416,
+                "candidate": 51.52000114321709
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                2.460022512664151e-07,
+                0.0
+              ],
+              "max_absolute_error": 6.103515625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                2.460022512664151e-07,
+                0.0
+              ],
+              "max_absolute_error": 6.103515625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.530655181966722
+        },
+        {
+          "rows": 4,
+          "quantize": true,
+          "seed": 1206,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 69.36600059270859,
+                "baseline": 11.18400041013956
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 10.528000071644783,
+                "candidate": 70.55799663066864
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 69.03400272130966,
+                "baseline": 10.730000212788582
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "exact_candidate_quantization": true,
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.567264206008986
+        },
+        {
+          "rows": 8,
+          "quantize": false,
+          "seed": 1207,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 10.598000138998032,
+                "candidate": 63.57800215482712
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 65.90999662876129,
+                "baseline": 9.850000031292439
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 10.201999917626381,
+                "candidate": 64.68600034713745
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.1424665043762398e-05,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.00390625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.1424665043762398e-05,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.00390625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.59704777703155
+        },
+        {
+          "rows": 8,
+          "quantize": true,
+          "seed": 1208,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 94.61800009012222,
+                "baseline": 12.227999977767467
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 11.91799994558096,
+                "candidate": 93.04600208997726
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 91.839998960495,
+                "baseline": 11.77200023084879
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                4.300345667441472e-08,
+                0.0
+              ],
+              "max_absolute_error": 1.52587890625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "exact_candidate_quantization": true,
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                4.300345667441472e-08,
+                0.0
+              ],
+              "max_absolute_error": 1.52587890625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.630457511986606
+        }
+      ]
+    },
+    {
+      "rank": 6,
+      "status": "complete",
+      "cases": [
+        {
+          "rows": 1,
+          "quantize": false,
+          "seed": 1201,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 9.415999986231327,
+                "candidate": 41.127998381853104
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 40.95600172877312,
+                "baseline": 8.221999742090702
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 8.081999607384205,
+                "candidate": 41.14599898457527
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.408444028929807
+        },
+        {
+          "rows": 1,
+          "quantize": true,
+          "seed": 1202,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 52.93799936771393,
+                "baseline": 10.583999566733837
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 9.51400026679039,
+                "candidate": 49.33200031518936
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 49.187999218702316,
+                "baseline": 9.487999603152275
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                4.252268722590152e-06
+              ],
+              "max_absolute_error": 0.0009765625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "exact_candidate_quantization": true,
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                4.252268722590152e-06
+              ],
+              "max_absolute_error": 0.0009765625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.460909529938363
+        },
+        {
+          "rows": 2,
+          "quantize": false,
+          "seed": 1203,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 9.460000321269035,
+                "candidate": 45.976001769304276
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 45.94799876213074,
+                "baseline": 8.766000159084797
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 9.38200019299984,
+                "candidate": 46.72199860215187
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                5.745028657838094e-05,
+                0.0
+              ],
+              "max_absolute_error": 0.015625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                5.745028657838094e-05,
+                0.0
+              ],
+              "max_absolute_error": 0.015625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.483507066965103
+        },
+        {
+          "rows": 2,
+          "quantize": true,
+          "seed": 1204,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 60.58799847960472,
+                "baseline": 12.165999971330166
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 10.875999927520752,
+                "candidate": 58.89400094747543
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 59.02799963951111,
+                "baseline": 18.00999976694584
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                3.0215264722220613e-07
+              ],
+              "max_absolute_error": 6.103515625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "exact_candidate_quantization": true,
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                3.0215264722220613e-07
+              ],
+              "max_absolute_error": 6.103515625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.505226156907156
+        },
+        {
+          "rows": 4,
+          "quantize": false,
+          "seed": 1205,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 9.76799987256527,
+                "candidate": 51.54399946331978
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 50.76000094413757,
+                "baseline": 8.832000195980072
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 8.763999678194523,
+                "candidate": 51.59600079059601
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                2.460022512664151e-07,
+                0.0
+              ],
+              "max_absolute_error": 6.103515625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                2.460022512664151e-07,
+                0.0
+              ],
+              "max_absolute_error": 6.103515625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.53063453291543
+        },
+        {
+          "rows": 4,
+          "quantize": true,
+          "seed": 1206,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 69.58799809217453,
+                "baseline": 11.132000014185905
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 10.463999584317207,
+                "candidate": 70.57200372219086
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 69.06600296497345,
+                "baseline": 10.689999908208847
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "exact_candidate_quantization": true,
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.567243256955408
+        },
+        {
+          "rows": 8,
+          "quantize": false,
+          "seed": 1207,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 10.966000147163868,
+                "candidate": 63.86999785900116
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 65.82199782133102,
+                "baseline": 9.850000031292439
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 10.143999941647053,
+                "candidate": 64.66999650001526
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.1424665043762398e-05,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.00390625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.1424665043762398e-05,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.00390625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.597027679905295
+        },
+        {
+          "rows": 8,
+          "quantize": true,
+          "seed": 1208,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 94.65999901294708,
+                "baseline": 13.439999893307686
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 13.518000021576881,
+                "candidate": 93.56799721717834
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 94.25800293684006,
+                "baseline": 11.93199958652258
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                4.300345667441472e-08,
+                0.0
+              ],
+              "max_absolute_error": 1.52587890625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "exact_candidate_quantization": true,
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                4.300345667441472e-08,
+                0.0
+              ],
+              "max_absolute_error": 1.52587890625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.6304360559443
+        }
+      ]
+    },
+    {
+      "rank": 7,
+      "status": "complete",
+      "cases": [
+        {
+          "rows": 1,
+          "quantize": false,
+          "seed": 1201,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 9.233999997377396,
+                "candidate": 41.308000683784485
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 41.005998849868774,
+                "baseline": 8.217999711632729
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 8.023999631404877,
+                "candidate": 41.02399945259094
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.404551947955042
+        },
+        {
+          "rows": 1,
+          "quantize": true,
+          "seed": 1202,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 52.963998168706894,
+                "baseline": 10.553999803960323
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 9.429999627172947,
+                "candidate": 49.295999109745026
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 49.33200031518936,
+                "baseline": 9.411999955773354
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                4.252268722590152e-06
+              ],
+              "max_absolute_error": 0.0009765625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "exact_candidate_quantization": true,
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                4.252268722590152e-06
+              ],
+              "max_absolute_error": 0.0009765625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.457016880973242
+        },
+        {
+          "rows": 2,
+          "quantize": false,
+          "seed": 1203,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 9.444000199437141,
+                "candidate": 46.02599889039993
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 46.08000069856644,
+                "baseline": 8.74400045722723
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 9.16799996048212,
+                "candidate": 46.776000410318375
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                5.745028657838094e-05,
+                0.0
+              ],
+              "max_absolute_error": 0.015625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                5.745028657838094e-05,
+                0.0
+              ],
+              "max_absolute_error": 0.015625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.479615195887163
+        },
+        {
+          "rows": 2,
+          "quantize": true,
+          "seed": 1204,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 60.561999678611755,
+                "baseline": 12.42200005799532
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 10.928000323474407,
+                "candidate": 58.93399938941002
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 59.130001813173294,
+                "baseline": 18.0440004914999
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                3.0215264722220613e-07
+              ],
+              "max_absolute_error": 6.103515625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "exact_candidate_quantization": true,
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                3.0215264722220613e-07
+              ],
+              "max_absolute_error": 6.103515625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.50133301690221
+        },
+        {
+          "rows": 4,
+          "quantize": false,
+          "seed": 1205,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 9.344000369310379,
+                "candidate": 51.45199969410896
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 50.964001566171646,
+                "baseline": 8.845999836921692
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 8.733999915421009,
+                "candidate": 51.646001636981964
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                2.460022512664151e-07,
+                0.0
+              ],
+              "max_absolute_error": 6.103515625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                2.460022512664151e-07,
+                0.0
+              ],
+              "max_absolute_error": 6.103515625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.52674241992645
+        },
+        {
+          "rows": 4,
+          "quantize": true,
+          "seed": 1206,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 69.61199641227722,
+                "baseline": 11.132000014185905
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 10.478000156581402,
+                "candidate": 70.61000168323517
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 69.12200152873993,
+                "baseline": 10.738000273704529
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "exact_candidate_quantization": true,
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.5633501149714
+        },
+        {
+          "rows": 8,
+          "quantize": false,
+          "seed": 1207,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 10.978000238537788,
+                "candidate": 64.10200148820877
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 65.82999974489212,
+                "baseline": 9.863999672234058
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 10.143999941647053,
+                "candidate": 64.59199637174606
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.1424665043762398e-05,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.00390625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.1424665043762398e-05,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.00390625
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.593132911948487
+        },
+        {
+          "rows": 8,
+          "quantize": true,
+          "seed": 1208,
+          "dispatch": {
+            "backend": "mnnvl",
+            "workspace_class": "MnnvlAllReduceFusionWorkspace",
+            "fp32_acc": false,
+            "use_oneshot": true,
+            "trigger_completion_at_end": true
+          },
+          "status": "complete",
+          "pairs": [
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 94.75000202655792,
+                "baseline": 13.341999612748623
+              }
+            },
+            {
+              "order": [
+                0,
+                1
+              ],
+              "us_per_complete_call": {
+                "baseline": 13.460000045597553,
+                "candidate": 93.72200071811676
+              }
+            },
+            {
+              "order": [
+                1,
+                0
+              ],
+              "us_per_complete_call": {
+                "candidate": 94.26599740982056,
+                "baseline": 11.901999823749065
+              }
+            }
+          ],
+          "eager_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                4.300345667441472e-08,
+                0.0
+              ],
+              "max_absolute_error": 1.52587890625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "exact_candidate_quantization": true,
+          "graph_correctness": [
+            {
+              "output": "hc",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                4.300345667441472e-08,
+                0.0
+              ],
+              "max_absolute_error": 1.52587890625e-05
+            },
+            {
+              "output": "normalized",
+              "row_relative_l2": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "max_absolute_error": 0.0
+            }
+          ],
+          "wall_seconds_since_start": 16.626542819896713
+        }
+      ]
+    }
+  ]
+}

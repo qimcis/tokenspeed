@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import gc
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 import torch
@@ -2118,6 +2118,23 @@ class DeepseekV4MoE(nn.Module):
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
     ) -> torch.Tensor:
+        return self._forward_normal_with_shared(
+            hidden_states,
+            input_ids,
+            num_global_tokens,
+            max_num_tokens_per_gpu,
+            self._forward_shared_experts,
+        )
+
+    def _forward_normal_with_shared(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        num_global_tokens: int,
+        max_num_tokens_per_gpu: int,
+        shared_forward: Callable[[torch.Tensor], torch.Tensor | None],
+    ) -> torch.Tensor:
+        """Run normal MoE with an explicit token-local shared-expert callable."""
         if hidden_states.shape[0] == 0:
             return hidden_states
         with nvtx_range("moe_select_experts"):
@@ -2142,7 +2159,7 @@ class DeepseekV4MoE(nn.Module):
                 if self.routed_scaling_factor != 1.0:
                     routed *= self.routed_scaling_factor
             with fork.branch():
-                shared = self._forward_shared_experts(hidden_states)
+                shared = shared_forward(hidden_states)
         return routed + shared if shared is not None else routed
 
     def forward(

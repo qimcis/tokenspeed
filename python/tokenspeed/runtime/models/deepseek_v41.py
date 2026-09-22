@@ -135,7 +135,8 @@ from tokenspeed.runtime.multimodal.inputs import (
 )
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
-from tokenspeed.runtime.utils.env import global_server_args_dict
+from tokenspeed.runtime.utils.env import envs, global_server_args_dict
+from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 logger = logging.getLogger(__name__)
 _ROPE_TABLES = WeakValueDictionary()
@@ -218,6 +219,17 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
         else:
             codes, scales = v41_quantize_fp8(x)
         return super().apply(layer, codes, bias, scales, x.dtype)
+
+    def apply_prequantized(
+        self,
+        layer: nn.Module,
+        codes: torch.Tensor,
+        scales: torch.Tensor,
+        bias: torch.Tensor | None,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Consume an exact V4.1 quantizer result without quantizing it again."""
+        return super().apply(layer, codes, bias, scales, output_dtype)
 
     def apply_with_activation(
         self,
@@ -508,6 +520,65 @@ def _v41_hc_input(x: torch.Tensor, pre: torch.Tensor, norm: RMSNorm) -> torch.Te
     out = x.new_empty((x.shape[0], x.shape[-1]))
     mhc_pre_layer_norm_hc4(pre, x, norm.weight, out, eps=norm.variance_epsilon)
     return out
+
+
+def _v41_hopper_epilogue_supported(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+    pre: torch.Tensor,
+    norm: RMSNorm,
+) -> bool:
+    """Limit the fused local epilogue to small V4.1 decode geometry."""
+    if (
+        not x.is_cuda
+        or x.dtype != torch.bfloat16
+        or x.ndim != 2
+        or x.shape[0] not in (1, 2, 4, 8)
+        or x.shape[1] != 5120
+        or residual.shape != (x.shape[0], 4, 5120)
+        or residual.dtype != torch.bfloat16
+        or norm.weight.shape != (5120,)
+        or norm.weight.dtype not in (torch.bfloat16, torch.float32)
+    ):
+        return False
+    for tensor, shape in (
+        (post, (x.shape[0], 4)),
+        (comb, (x.shape[0], 4, 4)),
+        (pre, (x.shape[0], 4)),
+    ):
+        if tensor.shape != shape or tensor.dtype != torch.float32:
+            return False
+    if any(
+        tensor.device != x.device or not tensor.is_contiguous()
+        for tensor in (x, residual, post, comb, pre, norm.weight)
+    ):
+        return False
+    from tokenspeed_kernel.platform import ArchVersion, Platform
+
+    platform = Platform.get()
+    return (
+        platform.is_nvidia
+        and platform.arch_version == ArchVersion(9, 0)
+        and platform.device_name == "NVIDIA H20"
+    )
+
+
+def _v41_shared_quantization_supported(ffn, comm_manager: CommManager) -> bool:
+    """Require the same token layout for the router and shared gate/up input."""
+    if ffn.use_mega_moe or ffn.shared_experts is None:
+        return False
+    mapping = comm_manager.mapping
+    if mapping.moe.has_tp_ep and not comm_manager.use_all_reduce(is_moe=True):
+        return False
+    gate_up = ffn.shared_experts.gate_up_proj
+    return (
+        isinstance(gate_up.quant_method, _ReferenceFp8LinearMethod)
+        and gate_up.weight.dtype == torch.float8_e4m3fn
+        and gate_up.bias is None
+        and not gate_up.gather_output
+    )
 
 
 class DeepseekV41Compressor(nn.Module):
@@ -929,6 +1000,60 @@ class DeepseekV41MoE(DeepseekV4MoE):
                     is_shared_expert=False,
                 )
 
+    def forward_with_shared_quantized(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        num_global_tokens: int,
+        max_num_tokens_per_gpu: int,
+        codes: torch.Tensor,
+        scales: torch.Tensor,
+    ) -> torch.Tensor:
+        """Keep BF16 routing/expert inputs and reuse exact shared-input FP8.
+
+        The caller owns this invocation's codes and scales. This normal-MoE
+        path has the same routing, expert scaling and stream ordering as V4;
+        only the shared gate/up projection receives a prequantized input.
+        """
+        if self.use_mega_moe or self.shared_experts is None:
+            raise ValueError("prequantized shared input requires normal V4.1 MoE")
+        shared_experts = self.shared_experts
+        gate_up = shared_experts.gate_up_proj
+        if (
+            not isinstance(gate_up.quant_method, _ReferenceFp8LinearMethod)
+            or gate_up.bias is not None
+            or gate_up.gather_output
+        ):
+            raise ValueError("shared gate/up must support exact local FP8 input")
+        if (
+            codes.shape != hidden_states.shape
+            or scales.shape
+            != (*hidden_states.shape[:-1], hidden_states.shape[-1] // 32)
+            or codes.dtype != torch.float8_e4m3fn
+            or scales.dtype != torch.uint8
+            or codes.device != hidden_states.device
+            or scales.device != hidden_states.device
+        ):
+            raise ValueError("shared FP8 codes/scales must match the BF16 input rows")
+
+        def shared_forward(bf16_input: torch.Tensor) -> torch.Tensor:
+            with nvtx_range("moe_shared_experts"):
+                gate_up_output = gate_up.quant_method.apply_prequantized(
+                    gate_up, codes, scales, None, bf16_input.dtype
+                )
+                shared, _ = shared_experts.down_proj.forward_with_activation(
+                    gate_up_output, shared_experts.act_fn
+                )
+                return shared
+
+        return self._forward_normal_with_shared(
+            hidden_states,
+            input_ids,
+            num_global_tokens,
+            max_num_tokens_per_gpu,
+            shared_forward,
+        )
+
     def _select_experts(self, hidden_states, image_mask):
         bias_vl = self.gate.bias_vl
         if hidden_states.is_cuda and (bias_vl is None or image_mask is None):
@@ -972,6 +1097,11 @@ class DeepseekV41DecoderLayer(nn.Module):
         self.norm_eps, self.hc_eps = config.rms_norm_eps, config.hc_eps
         self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
         self.hc_stream_fork = StreamFork(hc_stream)
+        # Experimental only: the standalone fused chain regresses on H20.
+        # Read once before graph capture so eager and captured dispatch agree.
+        self._experimental_hopper_ffn_epilogue = (
+            envs.TOKENSPEED_EXPERIMENTAL_V41_HOPPER_EPILOGUE.get()
+        )
         dense_quant = v41_mxfp8_config(quant_config)
         self.attn = DeepseekV41Attention(
             config,
@@ -1067,7 +1197,37 @@ class DeepseekV41DecoderLayer(nn.Module):
             )
             if image_mask is not None:
                 image_mask = image_mask.index_select(0, rows.keep_rows)
-        hidden_states = v41_hc_post(x, residual, post, comb)
+        normalized, shared_codes, shared_scales = None, None, None
+        if (
+            self._experimental_hopper_ffn_epilogue
+            and ctx.forward_mode is not None
+            and ctx.forward_mode.is_decode()
+            and rows.keep_rows is None
+            and _v41_hopper_epilogue_supported(
+                x, residual, post, comb, attn_pre, self.ffn_norm
+            )
+        ):
+            from tokenspeed_kernel.ops.residual.hopper_v41 import (
+                v41_post_pre_norm_quant,
+            )
+
+            quantize_shared = _v41_shared_quantization_supported(
+                self.ffn, self.comm_manager
+            )
+            hidden_states, normalized, shared_codes, shared_scales = (
+                v41_post_pre_norm_quant(
+                    x,
+                    residual,
+                    post,
+                    comb,
+                    attn_pre,
+                    self.ffn_norm.weight,
+                    self.ffn_norm.variance_epsilon,
+                    quantize_shared,
+                )
+            )
+        else:
+            hidden_states = v41_hc_post(x, residual, post, comb)
         residual = hidden_states
         if overlap:
             residual.record_stream(self.hc_stream_fork.aux_stream)
@@ -1085,7 +1245,11 @@ class DeepseekV41DecoderLayer(nn.Module):
             if overlap:
                 for tensor in (ffn_pre, post, comb):
                     tensor.record_stream(consumer)
-            x = _v41_hc_input(residual, attn_pre, self.ffn_norm)
+            x = (
+                _v41_hc_input(residual, attn_pre, self.ffn_norm)
+                if normalized is None
+                else normalized
+            )
             if self.ffn.use_mega_moe:
                 counts = self.comm_manager.moe_tp_ep_group_scattered_num_tokens(ctx)
                 x = self.ffn(
@@ -1099,7 +1263,14 @@ class DeepseekV41DecoderLayer(nn.Module):
             else:
                 x = self.comm_manager.pre_mlp_comm(x, ctx)
                 total, maximum = self.comm_manager.get_num_tokens(ctx)
-                x = self.ffn(x, image_mask, total, maximum, ctx=None, comm_manager=None)
+                if shared_codes is None:
+                    x = self.ffn(
+                        x, image_mask, total, maximum, ctx=None, comm_manager=None
+                    )
+                else:
+                    x = self.ffn.forward_with_shared_quantized(
+                        x, image_mask, total, maximum, shared_codes, shared_scales
+                    )
                 x, _ = self.comm_manager.post_mlp_comm(x, None, ctx)
         return v41_hc_post(x, residual, post, comb), ffn_pre
 
