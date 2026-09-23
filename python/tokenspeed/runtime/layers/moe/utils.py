@@ -72,6 +72,7 @@ class MoeBackend(Enum):
     TRITON = "triton"
     GLUON = "gluon"
     MARLIN = "marlin"
+    CUTLASS_W4A16 = "cutlass_w4a16"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"

@@ -300,6 +300,14 @@ class SchedulerControlClient:
         self: AsyncLLM,
         obj: InitWeightsUpdateGroupReqInput,
     ) -> tuple[bool, str]:
+        from tokenspeed.runtime.layers.moe.cutlass_w4a16 import (
+            cutlass_w4a16_weight_update_error,
+        )
+
+        error = cutlass_w4a16_weight_update_error(self.server_args)
+        if error is not None:
+            return False, error
+
         self.auto_create_handle_loop()
         if self.server_args.mapping.attn.has_dp:
             raise RuntimeError("dp_size must be 1 for init parameter update group")
@@ -321,6 +329,14 @@ class SchedulerControlClient:
         self: AsyncLLM,
         obj: UpdateWeightsFromDistributedReqInput,
     ) -> tuple[bool, str]:
+        from tokenspeed.runtime.layers.moe.cutlass_w4a16 import (
+            cutlass_w4a16_weight_update_error,
+        )
+
+        error = cutlass_w4a16_weight_update_error(self.server_args)
+        if error is not None:
+            return False, error
+
         self.auto_create_handle_loop()
         if self.server_args.mapping.attn.has_dp:
             raise RuntimeError("dp_size must be 1 for update weights from distributed")
@@ -335,6 +351,14 @@ class SchedulerControlClient:
         self: AsyncLLM,
         obj: UpdateWeightsFromTensorReqInput,
     ) -> tuple[bool, str]:
+        from tokenspeed.runtime.layers.moe.cutlass_w4a16 import (
+            cutlass_w4a16_weight_update_error,
+        )
+
+        error = cutlass_w4a16_weight_update_error(self.server_args)
+        if error is not None:
+            return False, error
+
         self.auto_create_handle_loop()
         if self.server_args.mapping.attn.has_dp:
             raise RuntimeError("dp_size must be 1 for update weights from tensor")

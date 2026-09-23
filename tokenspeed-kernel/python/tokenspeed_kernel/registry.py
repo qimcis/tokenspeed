@@ -179,7 +179,8 @@ class KernelSpec:
     priority: int = int(Priority.PERFORMANT) + 2
     tags: frozenset[str] = (
         frozenset()
-    )  # Standard tags: "throughput", "latency", "determinism", "portability"
+    )  # Tags include "throughput", "latency", "determinism", "portability",
+    # and "explicit_only" (requires a named solution or kernel override).
     weight_preprocessor: Callable | None = None
 
     def __post_init__(self) -> None:
@@ -327,6 +328,11 @@ class KernelRegistry:
             specs = [s for s in specs if tags.issubset(s.tags)]
         if solution:
             specs = [s for s in specs if s.solution == solution]
+        else:
+            # Explicit-only kernels must never enter automatic ranking, even
+            # when every ordinary implementation is unavailable. Named
+            # overrides resolve via get_by_name and remain explicit choices.
+            specs = [s for s in specs if "explicit_only" not in s.tags]
 
         return specs
 

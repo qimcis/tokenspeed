@@ -144,6 +144,13 @@ def _initialize_model(
     load_config: LoadConfig,
 ) -> nn.Module:
     """Initialize a model with the given configurations."""
+    from tokenspeed.runtime.layers.moe.cutlass_w4a16 import (
+        prepare_cutlass_w4a16_workspace,
+        validate_cutlass_w4a16_model,
+    )
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    validate_cutlass_w4a16_model(global_server_args_dict, model_config, load_config)
     model_class, _ = get_model_architecture(model_config)
     quant_config = _get_quantization_config(model_config, load_config)
     if quant_config is not None:
@@ -156,12 +163,15 @@ def _initialize_model(
     if model_config.is_multimodal:
         extra_kwargs["is_multimodal_active"] = model_config.is_multimodal_active
         extra_kwargs["mm_attention_backend"] = model_config.mm_attention_backend
-    return model_class(
+    model = model_class(
         config=model_config.hf_config,
         mapping=mapping,
         quant_config=quant_config,
         **extra_kwargs,
     )
+
+    prepare_cutlass_w4a16_workspace(model, global_server_args_dict)
+    return model
 
 
 class BaseModelLoader(ABC):
@@ -376,7 +386,13 @@ class DefaultModelLoader(BaseModelLoader):
             ):
                 process_group = torch.distributed.group.WORLD
             weights_iterator = instanttensor_weights_iterator(
-                hf_weights_files, process_group=process_group
+                hf_weights_files,
+                process_group=process_group,
+                accept=(
+                    (lambda name: weight_name_filter(source.prefix + name))
+                    if weight_name_filter is not None
+                    else None
+                ),
             )
         elif use_safetensors and weight_name_filter is not None:
             weights_iterator = safetensors_filtered_weights_iterator(

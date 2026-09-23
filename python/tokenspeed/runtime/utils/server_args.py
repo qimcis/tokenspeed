@@ -899,6 +899,12 @@ class ServerArgs:
     def validate(self):
         if self.low_latency_max_num_tokens_per_gpu <= 0:
             raise ValueError("--low-latency-max-num-tokens-per-gpu must be positive")
+        if "cutlass_w4a16" in (self.moe_backend, self.draft_moe_backend):
+            from tokenspeed.runtime.layers.moe.cutlass_w4a16 import (
+                validate_cutlass_w4a16_server,
+            )
+
+            validate_cutlass_w4a16_server(self)
         if self.device == "npu":
             if not self.disable_prefill_graph:
                 raise ValueError("NPU execution requires --disable-prefill-graph")
@@ -1463,7 +1469,8 @@ class ServerArgs:
             type=str,
             default=ServerArgs.moe_backend,
             help="MoE runner backend: auto, triton, gluon, flashinfer_trtllm, "
-            "flashinfer_cutlass, flashinfer_cutedsl, deep_gemm, mega_moe",
+            "flashinfer_cutlass, flashinfer_cutedsl, deep_gemm, mega_moe, marlin, "
+            "cutlass_w4a16 (SM90 V4.1 Flash prefill workers only)",
         )
         parser.add_argument(
             "--draft-moe-backend",

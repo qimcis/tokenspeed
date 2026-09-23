@@ -31,7 +31,8 @@ import struct
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Generator, Iterable
+from collections.abc import Callable, Generator, Iterable, Iterator
+from itertools import chain
 from typing import Any
 
 import filelock
@@ -639,6 +640,37 @@ _SUB_BYTE_SAFETENSORS_DTYPES = frozenset({"F4", "F6_E2M3", "F6_E3M2"})
 _MAX_SAFETENSORS_HEADER_BYTES = 128 * 1024 * 1024
 
 
+def _read_safetensors_header(path: str) -> dict[str, Any]:
+    with open(path, "rb") as f:
+        (header_len,) = struct.unpack("<Q", f.read(8))
+        if not 0 < header_len <= _MAX_SAFETENSORS_HEADER_BYTES:
+            raise ValueError(f"{path}: safetensors header claims {header_len} bytes")
+        raw_header = f.read(header_len)
+        if len(raw_header) != header_len:
+            raise ValueError(f"{path}: safetensors header is truncated")
+        header = json.loads(raw_header)
+    if not isinstance(header, dict):
+        raise ValueError(f"{path}: safetensors header is not a JSON object")
+    return header
+
+
+def _partition_safetensors_files_by_weight_names(
+    hf_weights_files: list[str], accept: Callable[[str], bool]
+) -> tuple[list[str], list[str]]:
+    full_files, mixed_files = [], []
+    for path in hf_weights_files:
+        accepted = [
+            accept(name)
+            for name in _read_safetensors_header(path)
+            if name != "__metadata__"
+        ]
+        if accepted and all(accepted):
+            full_files.append(path)
+        elif any(accepted):
+            mixed_files.append(path)
+    return full_files, mixed_files
+
+
 def _find_sub_byte_dtype(hf_weights_files: list[str]) -> str | None:
     """Return the first sub-byte dtype any shard declares, else ``None``.
 
@@ -653,17 +685,7 @@ def _find_sub_byte_dtype(hf_weights_files: list[str]) -> str | None:
     safe to load, so it must not wave through the shard it cannot inspect.
     """
     for path in hf_weights_files:
-        with open(path, "rb") as f:
-            (header_len,) = struct.unpack("<Q", f.read(8))
-            if header_len > _MAX_SAFETENSORS_HEADER_BYTES:
-                raise ValueError(
-                    f"{path}: safetensors header claims {header_len} bytes"
-                )
-            header = json.loads(f.read(header_len))
-
-        if not isinstance(header, dict):
-            raise ValueError(f"{path}: safetensors header is not a JSON object")
-
+        header = _read_safetensors_header(path)
         for name, meta in header.items():
             if name == "__metadata__" or not isinstance(meta, dict):
                 continue
@@ -676,7 +698,8 @@ def instanttensor_weights_iterator(
     hf_weights_files: list[str],
     *,
     process_group: torch.distributed.ProcessGroup | None,
-) -> Generator[tuple[str, torch.Tensor], None, None]:
+    accept: Callable[[str], bool] | None,
+) -> Iterator[tuple[str, torch.Tensor]]:
     """Iterate over the weights in the model safetensor files using the
     InstantTensor library.
 
@@ -689,10 +712,13 @@ def instanttensor_weights_iterator(
         hf_weights_files: Local paths to the ``*.safetensors`` shards to load.
         process_group: Ranks consuming the same weights, or None for local
             loading. Pipeline context models use their stage's TP group.
+        accept: Checkpoint-name predicate shared by all ranks in the process
+            group. Mixed shards use filtered CPU loading before excluded tensors
+            can be materialized on GPU.
 
     Yields:
-        ``(name, tensor)`` pairs for every tensor in the checkpoint, with the
-        tensors materialized on the current CUDA device.
+        ``(name, tensor)`` pairs for accepted tensors. Fully accepted shards
+        materialize on CUDA; mixed shards yield CPU tensors.
     """
     if not current_platform().is_nvidia:
         raise ValueError("InstantTensor requires NVIDIA GPUs")
@@ -712,7 +738,28 @@ def instanttensor_weights_iterator(
             "Use --load-format auto instead."
         )
 
-    return _instanttensor_tensors(instanttensor, hf_weights_files, process_group)
+    if accept is None:
+        return _instanttensor_tensors(instanttensor, hf_weights_files, process_group)
+
+    full_files, mixed_files = _partition_safetensors_files_by_weight_names(
+        hf_weights_files, accept
+    )
+    logger.info(
+        "InstantTensor shard routing: %d full, %d mixed, %d excluded",
+        len(full_files),
+        len(mixed_files),
+        len(hf_weights_files) - len(full_files) - len(mixed_files),
+    )
+    return chain(
+        (
+            _instanttensor_tensors(instanttensor, full_files, process_group)
+            if full_files
+            else ()
+        ),
+        safetensors_filtered_weights_iterator(
+            mixed_files, accept, prefetch=False, prefetch_num_threads=1
+        ),
+    )
 
 
 def _instanttensor_tensors(

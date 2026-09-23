@@ -56,6 +56,7 @@ from tokenspeed_kernel.ops.layernorm import (
     grouped_gemma_rmsnorm,
 )
 from tokenspeed_kernel.ops.moe import (
+    create_hopper_mxfp4_lane,
     dsv4_mega_moe_apply,
     dsv4_mega_moe_plan,
     dsv4_mega_moe_process_weights,
@@ -135,6 +136,7 @@ __all__ = [
     "silu_and_mul",
     "situ_and_mul",
     # moe
+    "create_hopper_mxfp4_lane",
     "dsv4_mega_moe_apply",
     "dsv4_mega_moe_plan",
     "dsv4_mega_moe_process_weights",

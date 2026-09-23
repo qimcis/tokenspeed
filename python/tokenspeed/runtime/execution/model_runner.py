@@ -248,6 +248,14 @@ class ModelRunner:
         the same private helper torch's own ``init_process_group`` uses) so it
         never collides with the engine's own world.
         """
+        from tokenspeed.runtime.layers.moe.cutlass_w4a16 import (
+            cutlass_w4a16_weight_update_error,
+        )
+
+        error = cutlass_w4a16_weight_update_error(self.server_args)
+        if error is not None:
+            return False, error
+
         from packaging.version import parse as _parse_version
         from torch.distributed.distributed_c10d import (
             Backend,
@@ -306,6 +314,14 @@ class ModelRunner:
 
     def update_weights_from_distributed(self, obj) -> tuple[bool, str]:
         """Receive trainer-broadcast weights over the NCCL group and load them."""
+        from tokenspeed.runtime.layers.moe.cutlass_w4a16 import (
+            cutlass_w4a16_weight_update_error,
+        )
+
+        error = cutlass_w4a16_weight_update_error(self.server_args)
+        if error is not None:
+            return False, error
+
         import torch.distributed as dist
 
         pg = getattr(self, "_weight_update_pg", None)

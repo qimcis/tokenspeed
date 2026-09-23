@@ -33,6 +33,8 @@ lives in ``thirdparty/cuda/csrc/marlin_moe`` and is pre-compiled.
 
 from __future__ import annotations
 
+import math
+
 import torch
 from tokenspeed_kernel.ops.activation.triton import situ_and_mul
 from tokenspeed_kernel.ops.moe.marlin.deepep_layout import (
@@ -53,6 +55,22 @@ from tokenspeed_kernel.thirdparty.cuda.marlin_moe import (
 )
 
 MXFP4_BLOCK = 32
+
+
+def _swiglu_limit(w: torch.nn.Module, activation: str) -> float | None:
+    if activation != "swiglu":
+        return None
+    arg = getattr(w, "swiglu_arg", None)
+    if getattr(arg, "alpha", None) not in {None, 1.0}:
+        raise ValueError("Marlin MXFP4 supports only SwiGLU alpha=1")
+    if getattr(w, "swiglu_beta", None) not in {None, 0.0}:
+        raise ValueError("Marlin MXFP4 supports only SwiGLU beta=0")
+    limit = getattr(arg, "limit", None)
+    if limit is not None:
+        limit = float(limit)
+        if not math.isfinite(limit) or limit <= 0:
+            raise ValueError("SwiGLU limit must be finite and positive")
+    return limit
 
 
 def _block_size_m(num_tokens: int, top_k: int, num_experts: int) -> int:
@@ -87,6 +105,7 @@ def marlin_mxfp4_moe_weights(plan: dict, w: torch.nn.Module) -> None:
     activation = plan.get("activation") or getattr(w, "activation", "silu")
     if activation not in {"silu", "situ", "swiglu"}:
         raise ValueError(f"Marlin MXFP4 MoE does not support activation {activation!r}")
+    _swiglu_limit(w, activation)
 
     w13 = w.w13_weight.data
     w2 = w.w2_weight.data
@@ -263,6 +282,7 @@ def marlin_mxfp4_local_moe_apply(
         raise TypeError(f"Marlin MXFP4 MoE requires bf16 activations, got {x.dtype}")
 
     activation = plan.get("activation") or getattr(w, "activation", "silu")
+    limit = _swiglu_limit(w, activation)
     hidden = int(getattr(w, "_marlin_hidden_size", x.shape[1]))
     ispp = int(getattr(w, "_marlin_ispp", w.w2_weight.shape[1] * 16))
     num_local_experts = int(getattr(w, "num_local_experts", w.w13_weight.shape[0]))
@@ -309,7 +329,7 @@ def marlin_mxfp4_local_moe_apply(
     else:
         from tokenspeed_kernel.ops.activation.triton import silu_and_mul
 
-        intermediate2 = silu_and_mul(intermediate1)
+        intermediate2 = silu_and_mul(intermediate1, limit=limit)
 
     # GEMM2: fold the route weights in (mul_topk_weights) so finalize is a
     # plain sum over top_k. EP-masked routes wrote nothing, so zero-init c.

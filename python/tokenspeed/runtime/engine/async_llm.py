@@ -525,6 +525,14 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         self,
         obj: UpdateWeightFromDiskReqInput,
     ) -> tuple[bool, str, Any]:
+        from tokenspeed.runtime.layers.moe.cutlass_w4a16 import (
+            cutlass_w4a16_weight_update_error,
+        )
+
+        error = cutlass_w4a16_weight_update_error(self.server_args)
+        if error is not None:
+            return False, error, 0
+
         self.auto_create_handle_loop()
 
         # default the load format to the server_args
