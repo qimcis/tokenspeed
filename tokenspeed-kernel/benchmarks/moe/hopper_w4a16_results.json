@@ -1,0 +1,1393 @@
+{
+  "schema": 1,
+  "experiment": "Hopper W4A16 MoE",
+  "decision": "reject",
+  "decision_scope": "Predeclared complete-chain micro timing gate; not a serving or production promotion.",
+  "timing_gate": {
+    "decision": "reject",
+    "selected_attempt": "micro-001",
+    "rule": "All six cold-cache shapes complete; independent correctness and arm parity pass; at least one prefill median paired speedup>=1.10; every decode candidate/baseline median ratio<=1.02. Hot-cache timings are secondary only."
+  },
+  "full_model_trial_admission": {
+    "decision": "reject",
+    "reason": "A complete passing timing gate and representative memory proof are required."
+  },
+  "serving": {
+    "decision": "incomplete",
+    "performance_claim": null,
+    "complete_matrix_records_in_ledger": 0,
+    "reason": "No paired serving metrics are ingested by this reporter. Even complete ledger matrix statuses alone do not establish matching payloads or a serving gain."
+  },
+  "semantics": {
+    "hidden": 5120,
+    "intermediate": 2304,
+    "top_k": 6,
+    "swiglu_limit": 10,
+    "local_experts": 48,
+    "ep_size": 8,
+    "routed_scale_inside_adapter": 1.0
+  },
+  "tolerances": {
+    "row_relative_l2": 0.006,
+    "max_absolute_base": 0.002,
+    "max_absolute_row_scale": 0.02,
+    "exact_zero_reference_rows": true
+  },
+  "baseline": {
+    "base_revision": "8eb6684b4cb18380e78868050228d7ba413df5b9",
+    "correction": "Marlin uses gate upper clamp10 and up clamp[-10,10]; negative gate is not clamped. Uncorrected historical timings cannot establish a gain for these semantics."
+  },
+  "accounting": {
+    "ledger_sha256": "9d0487a325118d8cad65b777c9bf3d9562357f8b65a744e9ba5cf7e480cc7b13",
+    "prior_charged_seconds": 3399.3888481816975,
+    "global_charged_seconds": 3439.5607803127496,
+    "global_limit_seconds": 3600,
+    "remaining_seconds": 160.43921968725044,
+    "stage5_spent_seconds": {
+      "validation": 27.850823247106746,
+      "micro": 12.321108883945271,
+      "serving": 0.0
+    },
+    "category_limits_seconds": {
+      "validation": 50.0,
+      "micro": 40.0,
+      "serving": 110.0
+    },
+    "original_category_limits_seconds": {
+      "validation": 40.0,
+      "micro": 40.0,
+      "serving": 110.0
+    },
+    "observed_category_limits_seconds": {
+      "validation": 50.0,
+      "micro": 40.0,
+      "serving": 110.0
+    },
+    "budget_amendment": {
+      "present": true,
+      "verified": true,
+      "original_limits_seconds": {
+        "validation": 40.0,
+        "micro": 40.0,
+        "serving": 110.0
+      },
+      "effective_limits_seconds": {
+        "validation": 50.0,
+        "micro": 40.0,
+        "serving": 110.0
+      },
+      "issues": [],
+      "amendment": "unallocated-to-validation-v1",
+      "receipt_sha256": "ebded4cb097c6f238d19bfed07c25ca275c76c38b79ac0b5a417450dbf9244fb",
+      "prior_ledger_sha256": "051d15a61915b5a2981ee8c6c309f76cd5dbb10f5f6337888a467b7ba9b5d7ce",
+      "helper_sha256": "0210bf3eef1a9876b4dd6709e72aa3e13ea1105cd47d939d045ec5dcf8c3bb3a",
+      "allocation": {
+        "from": "unallocated",
+        "to": "validation",
+        "seconds": 10
+      },
+      "carried_charged_seconds": 3413.265154964756,
+      "carried_stage5_spent_seconds": {
+        "validation": 13.87630678305868,
+        "micro": 0.0,
+        "serving": 0.0
+      },
+      "prior_record_count": 1,
+      "unallocated_before_seconds": 10.61115181830246,
+      "unallocated_after_seconds": 0.61115181830246,
+      "global_limit_seconds": 3600,
+      "verification_scope": "Receipt/helper/parent byte seals and unchanged history are checked read-only. This reporter does not execute the controller or substitute for its admission checks."
+    },
+    "records": [
+      {
+        "attempt": "attempt-001",
+        "source_record_sha256": "33b0e082f7f009e611eedbde40ccc0ccdbd35a4bf50a3b1e24d5a8b29ed26d9f",
+        "category": "validation",
+        "kind": "external",
+        "status": "failed",
+        "clean": true,
+        "reserved_seconds": 40.0,
+        "charged_seconds": 13.87630678305868,
+        "active_wall_seconds": 13.87630678305868,
+        "error": {
+          "present": true,
+          "type": "RuntimeError",
+          "evidence_sha256": "cd3f53b7e829b5d32f153455d1ce51aec3ec97ddeb27e5279a2202b48cd7db67"
+        },
+        "cleanup": {
+          "owned_group_drained": true,
+          "failed_server_drained": true
+        }
+      },
+      {
+        "attempt": "attempt-002",
+        "source_record_sha256": "6d01d708fb3fd2fa1d9855b824691387059c6d763d2df8ff7c630f57cfff1b55",
+        "category": "validation",
+        "kind": "external",
+        "status": "complete",
+        "clean": true,
+        "reserved_seconds": 35.0,
+        "charged_seconds": 13.974516464048065,
+        "active_wall_seconds": 13.974516464048065,
+        "error": null,
+        "cleanup": {
+          "owned_group_drained": true,
+          "failed_server_drained": true
+        }
+      },
+      {
+        "attempt": "attempt-003",
+        "source_record_sha256": "065903803f16b5ca8442b6b4c5d86069c47cd6b3c06ebd8dbcf29a2c4f3af016",
+        "category": "micro",
+        "kind": "external",
+        "status": "complete",
+        "clean": true,
+        "reserved_seconds": 40.0,
+        "charged_seconds": 12.321108883945271,
+        "active_wall_seconds": 12.321108883945271,
+        "error": null,
+        "cleanup": {
+          "owned_group_drained": true,
+          "failed_server_drained": true
+        }
+      }
+    ],
+    "status": "settled",
+    "issues": [],
+    "active_reservation_present": false,
+    "stage5_fatal": null,
+    "prior_fatal_retained": {
+      "present": true,
+      "type": "Stage3FailedInvocation",
+      "evidence_sha256": "ee9f501371e81014331fa6e947eb0481e4c7a39d232682bd333df8a39c7a1737"
+    },
+    "history_note": "Original global charges and prior failures are retained in the hashed input ledger; no failed attempt is refunded or reset by this report.",
+    "complete_serving_records": 0
+  },
+  "validation_attempts": [
+    {
+      "attempt": "validation-001",
+      "artifact_sha256": "34cbf4f6ad852808745befcb33c1d7f86237e8a70a94c5eb3ead91b4199f0d85",
+      "worker_status": "failed",
+      "decision": "reject",
+      "case_count": 8,
+      "passed_cases": 7,
+      "failed_cases": 1,
+      "skipped_cases": 0,
+      "gpu_cases_passed": 5,
+      "source_sha256": {
+        "candidate": "217084995a622d52de39b541f15bf1780d95878cbac43aa767a26ab13b3475eb",
+        "candidate_native": "dd0c6a8abc5b9126cea5cbf0118f05ce13534982c1aba625d12f754da2428ca2",
+        "marlin": "8cd5606549bbcc91e4ca7193854b08812e307d2ceea33316e96e44c10c05b345",
+        "baseline_activation": "d1ad7abbb71f0b5044585be378cef333b8aa51fc19fd3ba118b722fe5e262980",
+        "tests": "99a72efc71808311ea8a32174fc68c67c2bd112e0a6ea259ca39475589179632",
+        "driver": "5a64691663241ddfc8a51570845553949d548ae9c33da0c6ad5042300e7a8e6a"
+      },
+      "source_unchanged": true,
+      "wall_seconds": 12.660655744024552,
+      "issues": [
+        "Validation worker did not report passed.",
+        "Require all 28 distinct validation cases passed; skipped and missing cases do not pass.",
+        "Require the exact nine GPU validation cases.",
+        "Require successful pytest exit and unchanged validated source."
+      ],
+      "case_outcomes": [
+        {
+          "case": "case-001",
+          "outcome": "passed",
+          "seconds": 0.003803621046245098,
+          "failure": null
+        },
+        {
+          "case": "case-002",
+          "outcome": "passed",
+          "seconds": 0.003649850026704371,
+          "failure": null
+        },
+        {
+          "case": "case-003",
+          "outcome": "passed",
+          "seconds": 0.6515005229739472,
+          "failure": null
+        },
+        {
+          "case": "case-004",
+          "outcome": "passed",
+          "seconds": 0.02063600905239582,
+          "failure": null
+        },
+        {
+          "case": "case-005",
+          "outcome": "passed",
+          "seconds": 0.018444841960445046,
+          "failure": null
+        },
+        {
+          "case": "case-006",
+          "outcome": "passed",
+          "seconds": 0.01828934100922197,
+          "failure": null
+        },
+        {
+          "case": "case-007",
+          "outcome": "passed",
+          "seconds": 1.0604253859492019,
+          "failure": null
+        },
+        {
+          "case": "case-008",
+          "outcome": "failed",
+          "seconds": 0.018564017955213785,
+          "failure": {
+            "present": true,
+            "type": "recorded_error",
+            "evidence_sha256": "d7273a610e8ab102e6ee3ed6d78c28909dbda82c13cea4e29781fb43216404b3"
+          }
+        }
+      ],
+      "error": null,
+      "oracle_scope": "Bounded local-expert cases include actual H/I with E2/EP128; actual E48/EP8 independent oracle is not established. Micro arm parity is additionally required."
+    },
+    {
+      "attempt": "validation-002",
+      "artifact_sha256": "0414a5d08343b3e5119f3d341b8d14d133710adfefe982cab97f285b99f69647",
+      "worker_status": "passed",
+      "decision": "pass",
+      "case_count": 28,
+      "passed_cases": 28,
+      "failed_cases": 0,
+      "skipped_cases": 0,
+      "gpu_cases_passed": 9,
+      "source_sha256": {
+        "candidate": "8297fb3226291b25befda49e8fc06d71a40a9abdb5fd8f5358118b7aea92d18f",
+        "candidate_native": "dd0c6a8abc5b9126cea5cbf0118f05ce13534982c1aba625d12f754da2428ca2",
+        "marlin": "8cd5606549bbcc91e4ca7193854b08812e307d2ceea33316e96e44c10c05b345",
+        "baseline_activation": "d1ad7abbb71f0b5044585be378cef333b8aa51fc19fd3ba118b722fe5e262980",
+        "tests": "99a72efc71808311ea8a32174fc68c67c2bd112e0a6ea259ca39475589179632",
+        "driver": "5a64691663241ddfc8a51570845553949d548ae9c33da0c6ad5042300e7a8e6a"
+      },
+      "source_unchanged": true,
+      "wall_seconds": 12.826758284005336,
+      "issues": [],
+      "case_outcomes": [
+        {
+          "case": "case-001",
+          "outcome": "passed",
+          "seconds": 0.0037590800784528255,
+          "failure": null
+        },
+        {
+          "case": "case-002",
+          "outcome": "passed",
+          "seconds": 0.0037149639101698995,
+          "failure": null
+        },
+        {
+          "case": "case-003",
+          "outcome": "passed",
+          "seconds": 0.43553656293079257,
+          "failure": null
+        },
+        {
+          "case": "case-004",
+          "outcome": "passed",
+          "seconds": 0.01805894693825394,
+          "failure": null
+        },
+        {
+          "case": "case-005",
+          "outcome": "passed",
+          "seconds": 0.01722440088633448,
+          "failure": null
+        },
+        {
+          "case": "case-006",
+          "outcome": "passed",
+          "seconds": 0.023432915098965168,
+          "failure": null
+        },
+        {
+          "case": "case-007",
+          "outcome": "passed",
+          "seconds": 1.0627277519088238,
+          "failure": null
+        },
+        {
+          "case": "case-008",
+          "outcome": "passed",
+          "seconds": 0.03098391799721867,
+          "failure": null
+        },
+        {
+          "case": "case-009",
+          "outcome": "passed",
+          "seconds": 0.0057844179682433605,
+          "failure": null
+        },
+        {
+          "case": "case-010",
+          "outcome": "passed",
+          "seconds": 0.001960508991032839,
+          "failure": null
+        },
+        {
+          "case": "case-011",
+          "outcome": "passed",
+          "seconds": 0.046315673971548676,
+          "failure": null
+        },
+        {
+          "case": "case-012",
+          "outcome": "passed",
+          "seconds": 0.018379389075562358,
+          "failure": null
+        },
+        {
+          "case": "case-013",
+          "outcome": "passed",
+          "seconds": 0.016815040027722716,
+          "failure": null
+        },
+        {
+          "case": "case-014",
+          "outcome": "passed",
+          "seconds": 0.016737769008614123,
+          "failure": null
+        },
+        {
+          "case": "case-015",
+          "outcome": "passed",
+          "seconds": 0.0018915539840236306,
+          "failure": null
+        },
+        {
+          "case": "case-016",
+          "outcome": "passed",
+          "seconds": 0.0018570621032267809,
+          "failure": null
+        },
+        {
+          "case": "case-017",
+          "outcome": "passed",
+          "seconds": 0.001871890970505774,
+          "failure": null
+        },
+        {
+          "case": "case-018",
+          "outcome": "passed",
+          "seconds": 0.0018596439622342587,
+          "failure": null
+        },
+        {
+          "case": "case-019",
+          "outcome": "passed",
+          "seconds": 0.001876753056421876,
+          "failure": null
+        },
+        {
+          "case": "case-020",
+          "outcome": "passed",
+          "seconds": 0.0018476119730621576,
+          "failure": null
+        },
+        {
+          "case": "case-021",
+          "outcome": "passed",
+          "seconds": 0.07102057908196002,
+          "failure": null
+        },
+        {
+          "case": "case-022",
+          "outcome": "passed",
+          "seconds": 0.0027113049291074276,
+          "failure": null
+        },
+        {
+          "case": "case-023",
+          "outcome": "passed",
+          "seconds": 0.0027387639274820685,
+          "failure": null
+        },
+        {
+          "case": "case-024",
+          "outcome": "passed",
+          "seconds": 0.0018932910170406103,
+          "failure": null
+        },
+        {
+          "case": "case-025",
+          "outcome": "passed",
+          "seconds": 0.00244188797660172,
+          "failure": null
+        },
+        {
+          "case": "case-026",
+          "outcome": "passed",
+          "seconds": 0.002058211946859956,
+          "failure": null
+        },
+        {
+          "case": "case-027",
+          "outcome": "passed",
+          "seconds": 0.002592068980447948,
+          "failure": null
+        },
+        {
+          "case": "case-028",
+          "outcome": "passed",
+          "seconds": 0.0017967119347304106,
+          "failure": null
+        }
+      ],
+      "error": null,
+      "oracle_scope": "Bounded local-expert cases include actual H/I with E2/EP128; actual E48/EP8 independent oracle is not established. Micro arm parity is additionally required."
+    }
+  ],
+  "micro_attempts": [
+    {
+      "attempt": "micro-001",
+      "artifact_sha256": "892fad783ee8c7d25acdb1c6ab977afff6c8c5251a574211992ba1224814af77",
+      "worker_status": "complete",
+      "decision": "reject",
+      "issues": [
+        "At least one decode shape regresses by more than 2%."
+      ],
+      "source_sha256": {
+        "candidate": "8297fb3226291b25befda49e8fc06d71a40a9abdb5fd8f5358118b7aea92d18f",
+        "candidate_native": "dd0c6a8abc5b9126cea5cbf0118f05ce13534982c1aba625d12f754da2428ca2",
+        "marlin": "8cd5606549bbcc91e4ca7193854b08812e307d2ceea33316e96e44c10c05b345",
+        "baseline_activation": "d1ad7abbb71f0b5044585be378cef333b8aa51fc19fd3ba118b722fe5e262980",
+        "tests": "99a72efc71808311ea8a32174fc68c67c2bd112e0a6ea259ca39475589179632",
+        "driver": "5a64691663241ddfc8a51570845553949d548ae9c33da0c6ad5042300e7a8e6a",
+        "marlin_binding": "d125db985df4c9f5ad85b4131d57f42b38da19f6a0c672281d16ad2095a8afcd"
+      },
+      "source_unchanged": true,
+      "benchmark_sha256": "f2813a0b383535a483914d98bb386b048d8aed472f929bd9d3d5d79804f14407",
+      "validation_artifact_sha256": "0414a5d08343b3e5119f3d341b8d14d133710adfefe982cab97f285b99f69647",
+      "rows": [
+        {
+          "m": 1,
+          "worker_status": "complete",
+          "complete": true,
+          "parity_passed": true,
+          "parity_failed": false,
+          "local_routes": 1,
+          "global_routes": 6,
+          "replays_per_sample": 1,
+          "pairs": [
+            {
+              "repeat": 0,
+              "order": [
+                "marlin",
+                "hopper_w4a16"
+              ],
+              "marlin_us": 67.87200272083282,
+              "candidate_us": 61.535999178886414,
+              "speedup": 1.10296417749759,
+              "valid": true
+            },
+            {
+              "repeat": 1,
+              "order": [
+                "hopper_w4a16",
+                "marlin"
+              ],
+              "marlin_us": 66.6240006685257,
+              "candidate_us": 61.43999844789505,
+              "speedup": 1.0843750382745696,
+              "valid": true
+            },
+            {
+              "repeat": 2,
+              "order": [
+                "hopper_w4a16",
+                "marlin"
+              ],
+              "marlin_us": 68.41599941253662,
+              "candidate_us": 60.92799827456474,
+              "speedup": 1.1228991818216003,
+              "valid": true
+            },
+            {
+              "repeat": 3,
+              "order": [
+                "marlin",
+                "hopper_w4a16"
+              ],
+              "marlin_us": 66.39999896287918,
+              "candidate_us": 61.535999178886414,
+              "speedup": 1.0790431592709337,
+              "valid": true
+            },
+            {
+              "repeat": 4,
+              "order": [
+                "marlin",
+                "hopper_w4a16"
+              ],
+              "marlin_us": 68.06399673223495,
+              "candidate_us": 60.83200126886368,
+              "speedup": 1.118884720418904,
+              "valid": true
+            }
+          ],
+          "medians": {
+            "marlin_us": 67.87200272083282,
+            "candidate_us": 61.43999844789505,
+            "paired_speedup": 1.10296417749759
+          },
+          "issues": [],
+          "hot_cache": {
+            "m": 1,
+            "worker_status": "complete",
+            "complete": true,
+            "parity_passed": true,
+            "parity_failed": false,
+            "local_routes": 1,
+            "global_routes": 6,
+            "replays_per_sample": 31,
+            "pairs": [
+              {
+                "repeat": 0,
+                "order": [
+                  "hopper_w4a16",
+                  "marlin"
+                ],
+                "marlin_us": 59.18348220086867,
+                "candidate_us": 53.11896724085654,
+                "speedup": 1.1141685404483466,
+                "valid": true
+              },
+              {
+                "repeat": 1,
+                "order": [
+                  "marlin",
+                  "hopper_w4a16"
+                ],
+                "marlin_us": 59.40954915938839,
+                "candidate_us": 53.14270911678191,
+                "speedup": 1.1179247378758017,
+                "valid": true
+              },
+              {
+                "repeat": 2,
+                "order": [
+                  "marlin",
+                  "hopper_w4a16"
+                ],
+                "marlin_us": 59.43535604784566,
+                "candidate_us": 53.14167853324644,
+                "speedup": 1.1184320421994531,
+                "valid": true
+              },
+              {
+                "repeat": 3,
+                "order": [
+                  "hopper_w4a16",
+                  "marlin"
+                ],
+                "marlin_us": 59.46116293630293,
+                "candidate_us": 53.14786972538118,
+                "speedup": 1.1187873238107753,
+                "valid": true
+              },
+              {
+                "repeat": 4,
+                "order": [
+                  "marlin",
+                  "hopper_w4a16"
+                ],
+                "marlin_us": 59.37238662473617,
+                "candidate_us": 53.10761159466159,
+                "speedup": 1.1179637879008726,
+                "valid": true
+              }
+            ],
+            "medians": {
+              "marlin_us": 59.40954915938839,
+              "candidate_us": 53.14167853324644,
+              "paired_speedup": 1.1179637879008726
+            },
+            "issues": []
+          }
+        },
+        {
+          "m": 2,
+          "worker_status": "complete",
+          "complete": true,
+          "parity_passed": true,
+          "parity_failed": false,
+          "local_routes": 2,
+          "global_routes": 12,
+          "replays_per_sample": 1,
+          "pairs": [
+            {
+              "repeat": 0,
+              "order": [
+                "hopper_w4a16",
+                "marlin"
+              ],
+              "marlin_us": 73.98399710655212,
+              "candidate_us": 81.08799904584885,
+              "speedup": 0.912391450980558,
+              "valid": true
+            },
+            {
+              "repeat": 1,
+              "order": [
+                "marlin",
+                "hopper_w4a16"
+              ],
+              "marlin_us": 72.73600250482559,
+              "candidate_us": 79.45600152015686,
+              "speedup": 0.9154249032576035,
+              "valid": true
+            },
+            {
+              "repeat": 2,
+              "order": [
+                "hopper_w4a16",
+                "marlin"
+              ],
+              "marlin_us": 72.31999933719635,
+              "candidate_us": 79.83999699354172,
+              "speedup": 0.9058116490541243,
+              "valid": true
+            },
+            {
+              "repeat": 3,
+              "order": [
+                "marlin",
+                "hopper_w4a16"
+              ],
+              "marlin_us": 73.2479989528656,
+              "candidate_us": 78.59200239181519,
+              "speedup": 0.932003215641365,
+              "valid": true
+            },
+            {
+              "repeat": 4,
+              "order": [
+                "marlin",
+                "hopper_w4a16"
+              ],
+              "marlin_us": 72.95999675989151,
+              "candidate_us": 79.39200103282928,
+              "speedup": 0.9189842277652369,
+              "valid": true
+            }
+          ],
+          "medians": {
+            "marlin_us": 72.95999675989151,
+            "candidate_us": 79.45600152015686,
+            "paired_speedup": 0.9154249032576035
+          },
+          "issues": [],
+          "hot_cache": {
+            "m": 2,
+            "worker_status": "complete",
+            "complete": true,
+            "parity_passed": true,
+            "parity_failed": false,
+            "local_routes": 2,
+            "global_routes": 12,
+            "replays_per_sample": 26,
+            "pairs": [
+              {
+                "repeat": 0,
+                "order": [
+                  "hopper_w4a16",
+                  "marlin"
+                ],
+                "marlin_us": 64.92307552924522,
+                "candidate_us": 70.76676992269662,
+                "speedup": 0.917423186054205,
+                "valid": true
+              },
+              {
+                "repeat": 1,
+                "order": [
+                  "marlin",
+                  "hopper_w4a16"
+                ],
+                "marlin_us": 64.82707537137546,
+                "candidate_us": 70.83938671992375,
+                "speedup": 0.9151275635358187,
+                "valid": true
+              },
+              {
+                "repeat": 2,
+                "order": [
+                  "marlin",
+                  "hopper_w4a16"
+                ],
+                "marlin_us": 64.95015437786395,
+                "candidate_us": 70.82953819861778,
+                "speedup": 0.916992486887786,
+                "valid": true
+              },
+              {
+                "repeat": 3,
+                "order": [
+                  "marlin",
+                  "hopper_w4a16"
+                ],
+                "marlin_us": 64.8418481533344,
+                "candidate_us": 70.83815336227417,
+                "speedup": 0.915352039482537,
+                "valid": true
+              },
+              {
+                "repeat": 4,
+                "order": [
+                  "hopper_w4a16",
+                  "marlin"
+                ],
+                "marlin_us": 64.80246323805589,
+                "candidate_us": 70.75569262871376,
+                "speedup": 0.9158621848011993,
+                "valid": true
+              }
+            ],
+            "medians": {
+              "marlin_us": 64.8418481533344,
+              "candidate_us": 70.82953819861778,
+              "paired_speedup": 0.9158621848011993
+            },
+            "issues": []
+          }
+        },
+        {
+          "m": 4,
+          "worker_status": "complete",
+          "complete": true,
+          "parity_passed": true,
+          "parity_failed": false,
+          "local_routes": 3,
+          "global_routes": 24,
+          "replays_per_sample": 1,
+          "pairs": [
+            {
+              "repeat": 0,
+              "order": [
+                "marlin",
+                "hopper_w4a16"
+              ],
+              "marlin_us": 82.78399705886841,
+              "candidate_us": 96.3520035147667,
+              "speedup": 0.8591829338160167,
+              "valid": true
+            },
+            {
+              "repeat": 1,
+              "order": [
+                "hopper_w4a16",
+                "marlin"
+              ],
+              "marlin_us": 81.85599744319916,
+              "candidate_us": 96.67199850082397,
+              "speedup": 0.8467394769179357,
+              "valid": true
+            },
+            {
+              "repeat": 2,
+              "order": [
+                "marlin",
+                "hopper_w4a16"
+              ],
+              "marlin_us": 81.82399719953537,
+              "candidate_us": 96.28800302743912,
+              "speedup": 0.849783925586431,
+              "valid": true
+            },
+            {
+              "repeat": 3,
+              "order": [
+                "hopper_w4a16",
+                "marlin"
+              ],
+              "marlin_us": 81.7599967122078,
+              "candidate_us": 95.71199864149094,
+              "speedup": 0.8542293325046607,
+              "valid": true
+            },
+            {
+              "repeat": 4,
+              "order": [
+                "marlin",
+                "hopper_w4a16"
+              ],
+              "marlin_us": 81.11999928951263,
+              "candidate_us": 95.20000219345093,
+              "speedup": 0.8521008132402449,
+              "valid": true
+            }
+          ],
+          "medians": {
+            "marlin_us": 81.82399719953537,
+            "candidate_us": 96.28800302743912,
+            "paired_speedup": 0.8521008132402449
+          },
+          "issues": [],
+          "hot_cache": {
+            "m": 4,
+            "worker_status": "complete",
+            "complete": true,
+            "parity_passed": true,
+            "parity_failed": false,
+            "local_routes": 3,
+            "global_routes": 24,
+            "replays_per_sample": 21,
+            "pairs": [
+              {
+                "repeat": 0,
+                "order": [
+                  "marlin",
+                  "hopper_w4a16"
+                ],
+                "marlin_us": 76.94019022442046,
+                "candidate_us": 90.84647610073998,
+                "speedup": 0.8469254232723481,
+                "valid": true
+              },
+              {
+                "repeat": 1,
+                "order": [
+                  "hopper_w4a16",
+                  "marlin"
+                ],
+                "marlin_us": 76.96914105188279,
+                "candidate_us": 90.76114495595296,
+                "speedup": 0.8480406575879631,
+                "valid": true
+              },
+              {
+                "repeat": 2,
+                "order": [
+                  "marlin",
+                  "hopper_w4a16"
+                ],
+                "marlin_us": 77.13371231442406,
+                "candidate_us": 90.78399907974969,
+                "speedup": 0.8496399486286734,
+                "valid": true
+              },
+              {
+                "repeat": 3,
+                "order": [
+                  "hopper_w4a16",
+                  "marlin"
+                ],
+                "marlin_us": 77.05752622513543,
+                "candidate_us": 90.7398121697562,
+                "speedup": 0.8492140812565941,
+                "valid": true
+              },
+              {
+                "repeat": 4,
+                "order": [
+                  "marlin",
+                  "hopper_w4a16"
+                ],
+                "marlin_us": 77.20228603907994,
+                "candidate_us": 90.83428837004162,
+                "speedup": 0.8499244880366377,
+                "valid": true
+              }
+            ],
+            "medians": {
+              "marlin_us": 77.05752622513543,
+              "candidate_us": 90.78399907974969,
+              "paired_speedup": 0.8492140812565941
+            },
+            "issues": []
+          }
+        },
+        {
+          "m": 8,
+          "worker_status": "complete",
+          "complete": true,
+          "parity_passed": true,
+          "parity_failed": false,
+          "local_routes": 6,
+          "global_routes": 48,
+          "replays_per_sample": 1,
+          "pairs": [
+            {
+              "repeat": 0,
+              "order": [
+                "marlin",
+                "hopper_w4a16"
+              ],
+              "marlin_us": 120.67200243473053,
+              "candidate_us": 149.56800639629364,
+              "speedup": 0.8068035761270991,
+              "valid": true
+            },
+            {
+              "repeat": 1,
+              "order": [
+                "hopper_w4a16",
+                "marlin"
+              ],
+              "marlin_us": 118.367999792099,
+              "candidate_us": 148.22399616241455,
+              "speedup": 0.7985751488065318,
+              "valid": true
+            },
+            {
+              "repeat": 2,
+              "order": [
+                "marlin",
+                "hopper_w4a16"
+              ],
+              "marlin_us": 119.90399658679962,
+              "candidate_us": 149.63200688362122,
+              "speedup": 0.8013258599148306,
+              "valid": true
+            },
+            {
+              "repeat": 3,
+              "order": [
+                "hopper_w4a16",
+                "marlin"
+              ],
+              "marlin_us": 118.8800036907196,
+              "candidate_us": 149.47199821472168,
+              "speedup": 0.7953329393505825,
+              "valid": true
+            },
+            {
+              "repeat": 4,
+              "order": [
+                "marlin",
+                "hopper_w4a16"
+              ],
+              "marlin_us": 119.10399794578552,
+              "candidate_us": 149.1840034723282,
+              "speedup": 0.7983697660176942,
+              "valid": true
+            }
+          ],
+          "medians": {
+            "marlin_us": 119.10399794578552,
+            "candidate_us": 149.47199821472168,
+            "paired_speedup": 0.7985751488065318
+          },
+          "issues": [],
+          "hot_cache": {
+            "m": 8,
+            "worker_status": "complete",
+            "complete": true,
+            "parity_passed": true,
+            "parity_failed": false,
+            "local_routes": 6,
+            "global_routes": 48,
+            "replays_per_sample": 14,
+            "pairs": [
+              {
+                "repeat": 0,
+                "order": [
+                  "hopper_w4a16",
+                  "marlin"
+                ],
+                "marlin_us": 114.41143069948468,
+                "candidate_us": 143.93600395747595,
+                "speedup": 0.7948770811595275,
+                "valid": true
+              },
+              {
+                "repeat": 1,
+                "order": [
+                  "marlin",
+                  "hopper_w4a16"
+                ],
+                "marlin_us": 114.03885909489223,
+                "candidate_us": 144.0868547984532,
+                "speedup": 0.7914591463212122,
+                "valid": true
+              },
+              {
+                "repeat": 2,
+                "order": [
+                  "hopper_w4a16",
+                  "marlin"
+                ],
+                "marlin_us": 114.51428277151925,
+                "candidate_us": 144.1554341997419,
+                "speedup": 0.7943806170556716,
+                "valid": true
+              },
+              {
+                "repeat": 3,
+                "order": [
+                  "marlin",
+                  "hopper_w4a16"
+                ],
+                "marlin_us": 114.33828728539604,
+                "candidate_us": 144.18743337903703,
+                "speedup": 0.79298371991147,
+                "valid": true
+              },
+              {
+                "repeat": 4,
+                "order": [
+                  "marlin",
+                  "hopper_w4a16"
+                ],
+                "marlin_us": 114.39543110983712,
+                "candidate_us": 144.09143584115165,
+                "speedup": 0.7939086070038763,
+                "valid": true
+              }
+            ],
+            "medians": {
+              "marlin_us": 114.39543110983712,
+              "candidate_us": 144.09143584115165,
+              "paired_speedup": 0.7939086070038763
+            },
+            "issues": []
+          }
+        },
+        {
+          "m": 128,
+          "worker_status": "complete",
+          "complete": true,
+          "parity_passed": true,
+          "parity_failed": false,
+          "local_routes": 97,
+          "global_routes": 768,
+          "replays_per_sample": 1,
+          "pairs": [
+            {
+              "repeat": 0,
+              "order": [
+                "marlin",
+                "hopper_w4a16"
+              ],
+              "marlin_us": 1550.3360033035278,
+              "candidate_us": 833.3759903907776,
+              "speedup": 1.8603079776471136,
+              "valid": true
+            },
+            {
+              "repeat": 1,
+              "order": [
+                "hopper_w4a16",
+                "marlin"
+              ],
+              "marlin_us": 1547.8719472885132,
+              "candidate_us": 832.7360153198242,
+              "speedup": 1.8587786751291533,
+              "valid": true
+            },
+            {
+              "repeat": 2,
+              "order": [
+                "marlin",
+                "hopper_w4a16"
+              ],
+              "marlin_us": 1549.023985862732,
+              "candidate_us": 833.0240249633789,
+              "speedup": 1.8595189807770904,
+              "valid": true
+            },
+            {
+              "repeat": 3,
+              "order": [
+                "hopper_w4a16",
+                "marlin"
+              ],
+              "marlin_us": 1556.0959577560425,
+              "candidate_us": 836.7360234260559,
+              "speedup": 1.8597214822717119,
+              "valid": true
+            },
+            {
+              "repeat": 4,
+              "order": [
+                "marlin",
+                "hopper_w4a16"
+              ],
+              "marlin_us": 1547.104001045227,
+              "candidate_us": 834.33598279953,
+              "speedup": 1.85429375328399,
+              "valid": true
+            }
+          ],
+          "medians": {
+            "marlin_us": 1549.023985862732,
+            "candidate_us": 833.3759903907776,
+            "paired_speedup": 1.8595189807770904
+          },
+          "issues": [],
+          "hot_cache": {
+            "m": 128,
+            "worker_status": "complete",
+            "complete": true,
+            "parity_passed": true,
+            "parity_failed": false,
+            "local_routes": 97,
+            "global_routes": 768,
+            "replays_per_sample": 2,
+            "pairs": [
+              {
+                "repeat": 0,
+                "order": [
+                  "hopper_w4a16",
+                  "marlin"
+                ],
+                "marlin_us": 1545.904040336609,
+                "candidate_us": 830.24001121521,
+                "speedup": 1.8619965545552208,
+                "valid": true
+              },
+              {
+                "repeat": 1,
+                "order": [
+                  "marlin",
+                  "hopper_w4a16"
+                ],
+                "marlin_us": 1545.2959537506104,
+                "candidate_us": 829.9679756164551,
+                "speedup": 1.8618741917154678,
+                "valid": true
+              },
+              {
+                "repeat": 2,
+                "order": [
+                  "hopper_w4a16",
+                  "marlin"
+                ],
+                "marlin_us": 1545.1200008392334,
+                "candidate_us": 830.2080035209656,
+                "speedup": 1.861123952414672,
+                "valid": true
+              },
+              {
+                "repeat": 3,
+                "order": [
+                  "marlin",
+                  "hopper_w4a16"
+                ],
+                "marlin_us": 1545.85599899292,
+                "candidate_us": 830.128014087677,
+                "speedup": 1.862189894521074,
+                "valid": true
+              },
+              {
+                "repeat": 4,
+                "order": [
+                  "marlin",
+                  "hopper_w4a16"
+                ],
+                "marlin_us": 1544.76797580719,
+                "candidate_us": 829.5999765396118,
+                "speedup": 1.862063668625755,
+                "valid": true
+              }
+            ],
+            "medians": {
+              "marlin_us": 1545.2959537506104,
+              "candidate_us": 830.128014087677,
+              "paired_speedup": 1.8619965545552208
+            },
+            "issues": []
+          }
+        },
+        {
+          "m": 1024,
+          "worker_status": "complete",
+          "complete": true,
+          "parity_passed": true,
+          "parity_failed": false,
+          "local_routes": 768,
+          "global_routes": 6144,
+          "replays_per_sample": 1,
+          "pairs": [
+            {
+              "repeat": 0,
+              "order": [
+                "marlin",
+                "hopper_w4a16"
+              ],
+              "marlin_us": 2906.1760902404785,
+              "candidate_us": 952.5120258331299,
+              "speedup": 3.0510649854510183,
+              "valid": true
+            },
+            {
+              "repeat": 1,
+              "order": [
+                "marlin",
+                "hopper_w4a16"
+              ],
+              "marlin_us": 2903.2320976257324,
+              "candidate_us": 951.2640237808228,
+              "speedup": 3.0519729802108606,
+              "valid": true
+            },
+            {
+              "repeat": 2,
+              "order": [
+                "marlin",
+                "hopper_w4a16"
+              ],
+              "marlin_us": 2900.5119800567627,
+              "candidate_us": 949.7920274734497,
+              "speedup": 3.0538390470305807,
+              "valid": true
+            },
+            {
+              "repeat": 3,
+              "order": [
+                "hopper_w4a16",
+                "marlin"
+              ],
+              "marlin_us": 2903.808116912842,
+              "candidate_us": 950.0160217285156,
+              "speedup": 3.0565885737689777,
+              "valid": true
+            },
+            {
+              "repeat": 4,
+              "order": [
+                "hopper_w4a16",
+                "marlin"
+              ],
+              "marlin_us": 2900.928020477295,
+              "candidate_us": 950.2080082893372,
+              "speedup": 3.0529399827937107,
+              "valid": true
+            }
+          ],
+          "medians": {
+            "marlin_us": 2903.2320976257324,
+            "candidate_us": 950.2080082893372,
+            "paired_speedup": 3.0529399827937107
+          },
+          "issues": [],
+          "hot_cache": {
+            "m": 1024,
+            "worker_status": "complete",
+            "complete": true,
+            "parity_passed": true,
+            "parity_failed": false,
+            "local_routes": 768,
+            "global_routes": 6144,
+            "replays_per_sample": 1,
+            "pairs": [
+              {
+                "repeat": 0,
+                "order": [
+                  "hopper_w4a16",
+                  "marlin"
+                ],
+                "marlin_us": 2905.344009399414,
+                "candidate_us": 947.9359984397888,
+                "speedup": 3.0649157898648536,
+                "valid": true
+              },
+              {
+                "repeat": 1,
+                "order": [
+                  "marlin",
+                  "hopper_w4a16"
+                ],
+                "marlin_us": 2901.695966720581,
+                "candidate_us": 949.4079947471619,
+                "speedup": 3.056321394779634,
+                "valid": true
+              },
+              {
+                "repeat": 2,
+                "order": [
+                  "marlin",
+                  "hopper_w4a16"
+                ],
+                "marlin_us": 2903.3279418945312,
+                "candidate_us": 949.6319890022278,
+                "speedup": 3.0573190199132183,
+                "valid": true
+              },
+              {
+                "repeat": 3,
+                "order": [
+                  "marlin",
+                  "hopper_w4a16"
+                ],
+                "marlin_us": 2903.2320976257324,
+                "candidate_us": 948.415994644165,
+                "speedup": 3.061137848813898,
+                "valid": true
+              },
+              {
+                "repeat": 4,
+                "order": [
+                  "hopper_w4a16",
+                  "marlin"
+                ],
+                "marlin_us": 2902.143955230713,
+                "candidate_us": 947.7440118789673,
+                "speedup": 3.0621601601860973,
+                "valid": true
+              }
+            ],
+            "medians": {
+              "marlin_us": 2903.2320976257324,
+              "candidate_us": 948.415994644165,
+              "paired_speedup": 3.061137848813898
+            },
+            "issues": []
+          }
+        }
+      ],
+      "primary_measurement": "cold_cache",
+      "secondary_measurement": "hot_cache",
+      "cold_cache_protocol": {
+        "validated": true,
+        "expected": {
+          "eviction_bytes": 268435456,
+          "eviction_dtype": "torch.int32",
+          "eviction_operation": "add_(1)",
+          "initialization": "independent-seed uniform random int32",
+          "eviction_seed": 1331913736,
+          "repeats": 5,
+          "replays_per_sample": 1,
+          "flush_inside_timed_interval": false
+        },
+        "limitation": "Cache-cold surrogate, not guaranteed physical L2 state or full-model behavior."
+      },
+      "worker_wall_seconds": 11.139551853993908,
+      "candidate_workspace_bytes": 252358528,
+      "persistent_distinct_storage_bytes": 1154838976,
+      "persistent_scratch_bytes": 252407680,
+      "peak_cuda_allocated_bytes": 3225384448,
+      "canonical_source_released": true,
+      "error": null,
+      "memory_scope": "One-layer measurement only. Full-model capacity, shared serialized scratch and single retained packed layout are unproven."
+    }
+  ],
+  "build_attempts": [
+    {
+      "attempt": "build-001",
+      "artifact_sha256": "14249925addac0f9d93663af8e3b706b2b6da12f41aebc0f9057dfda8a59cc92",
+      "status": "ready",
+      "library_sha256": "683442cce88566c769e150c9425b41e0f8a23643da24439c8300e08598484072",
+      "library_bytes": 140173992,
+      "seconds": null,
+      "cuda_initialized": null,
+      "error": null
+    }
+  ],
+  "profile_context": {
+    "kind": "counterfactual model from an earlier pre-clamp GPU profile, not measured candidate speedup",
+    "two_times_gemm_decode_throughput_gain_fraction": 0.0612,
+    "two_times_gemm_prefill_throughput_gain_fraction": 0.1016,
+    "removed_route_fixed_shared_decode_gain_fraction": 0.0944,
+    "limits": "Shared-expert completion is held fixed. Actual route occupancy and effects of corrected clamping require new measurement."
+  },
+  "measurement_scope": "Single-layer, single-GPU EP-partial complete-chain graphs. Primary cold-cache surrogate evicts through a persistent 256 MiB int32 buffer outside each one-call timed interval; physical L2 state is not guaranteed. Hot-cache repeats are secondary. Excludes router-score/top-k selection, communication, shared experts and model factor1.5. Does not establish end-to-end throughput.",
+  "privacy": "Only allowlisted numerical/status/hash fields are published. Original identifiers, private paths, machine names, addresses and free-form errors remain only in hashed source evidence.",
+  "reporter_sha256": "f7d0b328da33eb0ebab0a5f74d4d0ce163da246e3bb60a5a8c86b5d79ddffb89"
+}
