@@ -350,6 +350,15 @@ def _pre_reduce_apply_is_supported(
     return hidden_size_multiple is None or hidden_size % hidden_size_multiple == 0
 
 
+def _pre_reduce_apply_num_split(pre_reduce_apply_impl, n_splits: int) -> int:
+    # Round down to a split count the fused reduce accepts, e.g. 39 -> 32 on
+    # 78-SM GPUs, so it is not dropped for the unfused Triton path.
+    supported = getattr(pre_reduce_apply_impl, "supported_n_splits", None)
+    if supported is None:
+        return n_splits
+    return max((split for split in supported if split <= n_splits), default=n_splits)
+
+
 def _pre_reduce_apply_fuses_norm(
     pre_reduce_apply_impl, use_pre_reduce_apply: bool, has_norm_weight: bool
 ) -> bool:
@@ -637,11 +646,15 @@ def _mhc_post_triton_kernel(
     hidden_size: tl.constexpr,
     hc_mult: tl.constexpr,
     block_h: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     token_id = tl.program_id(0)
     hidden_block_id = tl.program_id(1)
     hidden_offsets = hidden_block_id * block_h + tl.arange(0, block_h)
     hidden_mask = hidden_offsets < hidden_size
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     hidden_values = tl.load(
         hidden_states + token_id * hidden_size + hidden_offsets,
         mask=hidden_mask,
@@ -682,6 +695,7 @@ def _mhc_post_hc4_triton_kernel(
     out,
     hidden_size: tl.constexpr,
     block_h: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     token_id = tl.program_id(0)
     hidden_block_id = tl.program_id(1)
@@ -690,6 +704,9 @@ def _mhc_post_hc4_triton_kernel(
     token_hidden_offset = token_id * hidden_size
     token_residual_offset = token_id * 4 * hidden_size
 
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     hidden_values = tl.load(
         hidden_states + token_hidden_offset + hidden_offsets,
         mask=hidden_mask,
@@ -790,12 +807,15 @@ def _mhc_pre_impl(
     post_mix = torch.empty(
         num_tokens, hc_mult, dtype=torch.float32, device=residual.device
     )
+    fused_n_splits = _pre_reduce_apply_num_split(pre_reduce_apply_impl, n_splits)
     use_pre_reduce_apply = _pre_reduce_apply_is_supported(
         pre_reduce_apply_impl,
-        n_splits,
+        fused_n_splits,
         hc_mult=hc_mult,
         hidden_size=hidden_size,
     )
+    if use_pre_reduce_apply:
+        n_splits = fused_n_splits
     pre_mix = (
         None
         if use_pre_reduce_apply
@@ -1099,6 +1119,10 @@ def triton_mhc_post(
     post_flat = post.view(-1, hc_mult)
     comb_flat = comb.view(-1, hc_mult, hc_mult)
     num_tokens = residual_flat.shape[0]
+    enable_pdl = pdl_enabled()
+    launch_kwargs = (
+        {"launch_pdl": True} if enable_pdl and current_platform().is_nvidia else {}
+    )
     if hc_mult == 4:
         block_h = 256
         _mhc_post_hc4_triton_kernel[(num_tokens, triton.cdiv(hidden_size, block_h))](
@@ -1109,7 +1133,9 @@ def triton_mhc_post(
             out,
             hidden_size=hidden_size,
             block_h=block_h,
+            ENABLE_PDL=enable_pdl,
             num_warps=4,
+            **launch_kwargs,
         )
         return out
 
@@ -1123,7 +1149,9 @@ def triton_mhc_post(
         hidden_size=hidden_size,
         hc_mult=hc_mult,
         block_h=block_h,
+        ENABLE_PDL=enable_pdl,
         num_warps=4,
+        **launch_kwargs,
     )
     return out
 
