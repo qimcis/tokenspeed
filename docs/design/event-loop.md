@@ -41,6 +41,11 @@ by every DeepEP backend. Runtime orchestration supplies configuration but does
 not infer token layouts or capacities from model names. Backend dispatchers
 reuse that storage when model execution begins.
 
+After weight loading, kernel workspace preparers reserve shared scratch before
+cache sizing. The runtime supplies the forward-token bound, including gathered
+DP tokens; the selected kernel sizes its own scratch. Callers re-fetch views
+from the workspace pool, whose address is frozen before graph capture.
+
 Attention construction returns a frozen, named `AttentionBuild` containing its
 backends, pools, cache storage, field placement/readiness and optional logical plan.
 `build_device_side` consumes this result locally and passes stage field

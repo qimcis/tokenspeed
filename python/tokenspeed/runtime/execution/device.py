@@ -905,6 +905,11 @@ def build_device_side(
     if draft is not None:
         draft.prepare_communication_runtime(max_forward_tokens)
 
+    max_moe_tokens = max_forward_tokens * server_args.mapping.attn.dp_size
+    target.prepare_kernel_workspace(max_moe_tokens)
+    if draft is not None:
+        draft.prepare_kernel_workspace(max_moe_tokens)
+
     attention = create_attn_components(
         server_args,
         model_config,

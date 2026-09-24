@@ -179,6 +179,22 @@ class ModelRunner:
             return False
         return bool(prepare(max_num_tokens))
 
+    def prepare_kernel_workspace(self, max_num_tokens: int) -> None:
+        from tokenspeed.runtime.execution.workspace import workspace_pool
+        from tokenspeed.runtime.layers.moe.expert import MoELayer
+
+        for layer in self.model.modules():
+            if not isinstance(layer, MoELayer):
+                continue
+            prepare = layer.plan.get("prepare_workspace")
+            if prepare is not None:
+                prepare(
+                    layer.plan,
+                    layer,
+                    max_num_tokens,
+                    workspace_pool(self.device).allocate,
+                )
+
     @staticmethod
     def _forward_accepts_kwarg(model, name: str) -> bool:
         try:
