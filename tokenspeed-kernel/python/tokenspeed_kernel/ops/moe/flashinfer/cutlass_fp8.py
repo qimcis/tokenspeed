@@ -36,6 +36,39 @@ platform = current_platform()
 if platform.is_nvidia:
     from flashinfer import ActivationType, cutlass_fused_moe
 
+    def flashinfer_cutlass_fp8_moe_workspace(plan, w, max_num_tokens, allocate):
+        from flashinfer import fused_moe
+
+        workspace_size = getattr(fused_moe, "cutlass_fused_moe_workspace_size", None)
+        if workspace_size is None:
+            return
+        size = workspace_size(
+            max_num_tokens=max_num_tokens,
+            hidden_size=w.w2_weight.shape[1],
+            intermediate_size=w.w2_weight.shape[2],
+            num_experts_total=w.w2_weight.shape[0] * w.ep_size,
+            top_k=w.top_k,
+            x_dtype=w.input_dtype,
+            weight_dtype=w.w13_weight.dtype,
+            output_dtype=w.input_dtype,
+            activation_type=(
+                ActivationType.SwigluBias
+                if any(
+                    getattr(w, name, None) is not None
+                    for name in ("swiglu_alpha_t", "swiglu_beta_t", "swiglu_limit_t")
+                )
+                else ActivationType.Swiglu
+            ),
+            tp_size=w.tp_size,
+            tp_rank=w.tp_rank,
+            ep_size=w.ep_size,
+            ep_rank=w.ep_rank,
+            use_deepseek_fp8_block_scale=True,
+            device=w.w13_weight.device,
+        )
+        allocate(((size,), torch.uint8))
+        plan["workspace"] = (allocate, size, max_num_tokens)
+
     def flashinfer_cutlass_fp8_moe_weights(plan: dict, w: torch.nn.Module):
         half_w = w.w13_weight.shape[1] // 2
         first_half = w.w13_weight.data[:, :half_w, :].clone()
@@ -79,6 +112,7 @@ if platform.is_nvidia:
             w.swiglu_limit_t = (
                 _per_expert(swiglu_arg.limit) if swiglu_arg.limit is not None else None
             )
+        plan["prepare_workspace"] = flashinfer_cutlass_fp8_moe_workspace
         return None
 
     @register_kernel(
@@ -139,6 +173,16 @@ if platform.is_nvidia:
             activation_type = ActivationType.Swiglu
         else:
             activation_type = ActivationType.SwigluBias
+        workspace_args = {}
+        workspace = plan.get("workspace")
+        if workspace is not None:
+            allocate, size, max_num_tokens = workspace
+            if x.shape[0] > max_num_tokens:
+                raise ValueError(
+                    f"MoE input has {x.shape[0]} tokens; workspace covers {max_num_tokens}"
+                )
+            (buffer,) = allocate(((size,), torch.uint8))
+            workspace_args["workspace_buffer"] = buffer
         return cutlass_fused_moe(
             output=output,
             input=x,
@@ -160,4 +204,5 @@ if platform.is_nvidia:
             swiglu_limit=swiglu_limit,
             use_deepseek_fp8_block_scale=True,
             enable_pdl=enable_pdl,
+            **workspace_args,
         )[0]

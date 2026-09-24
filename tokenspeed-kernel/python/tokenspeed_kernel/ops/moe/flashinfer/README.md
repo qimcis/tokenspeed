@@ -32,3 +32,13 @@ partitions, PDL on/off, changing routing within one captured shape, graph replay
 after workspace corruption, and output equality with the upstream operator.
 Expert-partition tests retain the loader's global activation input scales while
 sharding expert weights, and select SiTU through FlashInfer's activation enum.
+
+## FP8 CUTLASS workspace
+
+When FlashInfer exposes `cutlass_fused_moe_workspace_size`, the runtime reserves
+FP8 MoE scratch in its shared workspace before KV-cache sizing. The bound includes
+prefill, speculative decode and gathered DP tokens. Each call obtains a fresh
+view from the pool; graph capture freezes its address. Layers and the drafter
+reuse the buffer through the runtime's serial execution contract. Inputs beyond
+the prepared token bound fail explicitly. Older FlashInfer versions retain their
+internal allocation path.
