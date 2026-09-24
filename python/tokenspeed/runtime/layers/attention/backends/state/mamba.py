@@ -395,6 +395,9 @@ class MambaForwardMetadata:
     state_out_blocks_by_group: dict[str, torch.Tensor] | None = None
     state_checkpoint_blocks_by_group: dict[str, torch.Tensor] | None = None
     prefill_checkpoint_batch: _PrefillCheckpointBatch | None = None
+    # Verify metadata for a MIXED target round's decode rows; the fields above
+    # then cover only its extend rows.
+    verify: MambaForwardMetadata | None = None
 
     @property
     def prefill_token_extent(self) -> int | None:
@@ -417,6 +420,9 @@ class _GDNReplayWorkspace:
 _StateLayerGeometry = tuple[
     tuple[int, tuple[int, ...], torch.dtype, tuple[int, ...], torch.dtype], ...
 ]
+
+# Per-token inputs of ``forward_extend``; weights and scalars serve every row.
+_TOKEN_INPUTS = ("mixed_qkv", "a", "b", "g_raw", "f_a_out", "beta_raw")
 
 
 class MambaAttnBackend(AttentionBackend):
@@ -1105,18 +1111,28 @@ class MambaAttnBackend(AttentionBackend):
             return
 
         # The extend rows lead with their new-token counts; a MIXED round's
-        # decode rows each carry spec_num_tokens verify tokens.
+        # decode rows each carry spec_num_tokens tokens. A target verifies
+        # them as a decode round does, so its scan covers the extend rows only.
+        verify = None
+        scan_bs = bs
+        if forward_mode.is_mixed() and not self.is_draft and self.spec_num_tokens > 1:
+            verify = self._mixed_verify_metadata(
+                bs, num_extends, seq_lens, block_tables
+            )
+            scan_bs = num_extends
         query_lens = torch.full(
-            (bs,), self.spec_num_tokens, dtype=torch.int32, device=self.device
+            (scan_bs,), self.spec_num_tokens, dtype=torch.int32, device=self.device
         )
         query_lens[:num_extends] = extend_seq_lens[:num_extends]
-        query_start_loc = torch.zeros(bs + 1, dtype=torch.int32, device=self.device)
+        query_start_loc = torch.zeros(
+            scan_bs + 1, dtype=torch.int32, device=self.device
+        )
         torch.cumsum(query_lens, dim=0, out=query_start_loc[1:])
         extend_seq_lens_cpu = torch.cat(
             (
                 extend_seq_lens_cpu[:num_extends],
                 torch.full(
-                    (bs - num_extends,), self.spec_num_tokens, dtype=torch.int32
+                    (scan_bs - num_extends,), self.spec_num_tokens, dtype=torch.int32
                 ),
             )
         )
@@ -1152,9 +1168,9 @@ class MambaAttnBackend(AttentionBackend):
                     prefill_checkpoint_batch.tail_query_start_loc
                 ),
             )
-        if bs > 0:
+        if scan_bs > 0:
             before, after = self._extend_state_block_bounds(
-                bs, seq_lens, num_extends, extend_prefix_lens
+                scan_bs, seq_lens, num_extends, extend_prefix_lens
             )
             (
                 state_in_blocks_by_group,
@@ -1181,6 +1197,47 @@ class MambaAttnBackend(AttentionBackend):
             state_out_blocks_by_group=state_out_blocks_by_group,
             state_checkpoint_blocks_by_group=state_checkpoint_blocks_by_group,
             prefill_checkpoint_batch=prefill_checkpoint_batch,
+            verify=verify,
+        )
+
+    def _mixed_verify_metadata(
+        self,
+        bs: int,
+        num_extends: int,
+        seq_lens: torch.Tensor,
+        block_tables: Mapping[str, torch.Tensor],
+    ) -> MambaForwardMetadata:
+        """Target-verify metadata for a MIXED round's decode rows.
+
+        Mirrors the verify branch of ``refresh_decode_metadata`` with fresh
+        tensors, as MIXED rounds never replay a decode graph, and arms the
+        post-round commit.
+        """
+        num_decodes = bs - num_extends
+        draft_token_num = int(self.speculative_num_draft_tokens)
+        self._ensure_verify_scratch(num_decodes, draft_token_num)
+        pages_by_group, committed, tables = self._verify_state_blocks(
+            num_decodes,
+            seq_lens[num_extends:bs],
+            draft_token_num,
+            {
+                group_id: self._state_rows(block_tables, group_id)[num_extends:bs]
+                for group_id in self._state_groups()
+            },
+        )
+        self._verify_commit_ctx = (committed, tables, draft_token_num, pages_by_group)
+        # Verify writes no slab page; the commit writes the accepted one.
+        no_pages = torch.full(
+            (num_decodes,), self.pad_slot_id, dtype=torch.int32, device=self.device
+        )
+        return MambaForwardMetadata(
+            query_start_loc=None,
+            scan_query_start_loc=None,
+            mamba_output_indices=self._verify_scratch_grid(
+                num_decodes, draft_token_num
+            ),
+            state_in_blocks_by_group=pages_by_group,
+            state_out_blocks_by_group=dict.fromkeys(pages_by_group, no_pages),
         )
 
     # ---- CUDA graph state ----
@@ -2032,6 +2089,71 @@ class MambaAttnBackend(AttentionBackend):
         # decode-output convention (matches gdn_chunk_prefill's B=1-leading out).
         return core_attn_out.transpose(0, 1)
 
+    def _forward_mixed_verify(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: PagedAttention,
+        token_to_kv_pool,
+        bs: int,
+        *,
+        save_kv_cache: bool,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Scan a MIXED round's extend rows and verify its decode rows.
+
+        A scan over the decode rows would fold the whole verify window into
+        the state before acceptance is known. Prefill-graph padding rows after
+        the decode rows are returned as zeros.
+        """
+        metadata = self.forward_metadata
+        num_extends = metadata.extend_seq_lens_cpu.numel()
+        prefill_end = metadata.prefill_token_extent
+        verify_end = prefill_end + (bs - num_extends) * self.spec_num_tokens
+
+        def rows(start: int, end: int) -> dict:
+            sliced = {
+                name: kwargs[name][start:end]
+                for name in _TOKEN_INPUTS
+                if kwargs.get(name) is not None
+            }
+            return {**kwargs, **sliced, "seq_len": end - start}
+
+        prefill = self.forward_extend(
+            q,
+            k,
+            v,
+            layer,
+            token_to_kv_pool,
+            num_extends,
+            ForwardMode.EXTEND,
+            save_kv_cache=save_kv_cache,
+            **rows(0, prefill_end),
+        )
+        self.forward_metadata = metadata.verify
+        try:
+            verify = self.forward_decode(
+                q,
+                k,
+                v,
+                layer,
+                token_to_kv_pool,
+                bs - num_extends,
+                save_kv_cache=save_kv_cache,
+                **rows(prefill_end, verify_end),
+            )
+        finally:
+            self.forward_metadata = metadata
+        parts = [
+            prefill.reshape(prefill_end, *prefill.shape[-2:]),
+            verify.reshape(verify_end - prefill_end, *verify.shape[-2:]),
+        ]
+        num_padding = kwargs["seq_len"] - verify_end
+        if num_padding > 0:
+            parts.append(prefill.new_zeros(num_padding, *prefill.shape[-2:]))
+        return torch.cat(parts)
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -2044,6 +2166,17 @@ class MambaAttnBackend(AttentionBackend):
         save_kv_cache: bool = True,
         **kwargs,
     ):
+        if forward_mode.is_mixed() and self.forward_metadata.verify is not None:
+            return self._forward_mixed_verify(
+                q,
+                k,
+                v,
+                layer,
+                token_to_kv_pool,
+                bs,
+                save_kv_cache=save_kv_cache,
+                **kwargs,
+            )
         mixed_qkv = kwargs["mixed_qkv"]
         conv_weights = kwargs["conv_weights"]
         bias = kwargs["bias"]

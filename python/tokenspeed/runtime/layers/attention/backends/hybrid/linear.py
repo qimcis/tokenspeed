@@ -300,5 +300,5 @@ class HybridLinearAttnBackend(AttentionBackend):
     def commit_speculative_state_after_verify(
         self, accepted_lengths: torch.Tensor, *, num_extends: int
     ) -> None:
-        if num_extends == 0:
-            self.linear_attn_backend.commit_verified_state(accepted_lengths)
+        # A mixed round's leading extend rows sampled rather than verified.
+        self.linear_attn_backend.commit_verified_state(accepted_lengths[num_extends:])
