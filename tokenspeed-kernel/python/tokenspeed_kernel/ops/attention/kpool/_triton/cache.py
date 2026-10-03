@@ -218,14 +218,14 @@ def _kpool_prefill_tail_write_kernel(
     valid_counts_ptr,
     k_stride_row: tl.constexpr,
     gate_stride_row: tl.constexpr,
-    tail_k_stride_req: tl.constexpr,
+    tail_k_stride_page: tl.constexpr,
     tail_k_stride_pool: tl.constexpr,
-    tail_gate_stride_req: tl.constexpr,
+    tail_gate_stride_page: tl.constexpr,
     tail_gate_stride_pool: tl.constexpr,
     num_tokens,
     POOL_SIZE: tl.constexpr,
     TAIL_SIZE: tl.constexpr,
-    TAIL_NUM_REQUESTS: tl.constexpr,
+    TAIL_NUM_PAGES: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
@@ -238,8 +238,8 @@ def _kpool_prefill_tail_write_kernel(
     destination_position = tl.load(destination_positions_ptr + row).to(tl.int64)
     valid_count = tl.load(valid_counts_ptr + row).to(tl.int64)
     valid_destination = (
-        (destination_slot >= 0)
-        & (destination_slot < TAIL_NUM_REQUESTS)
+        (destination_slot > 0)
+        & (destination_slot < TAIL_NUM_PAGES)
         & (destination_position >= 0)
     )
     safe_destination_slot = tl.where(valid_destination, destination_slot, 0)
@@ -255,11 +255,11 @@ def _kpool_prefill_tail_write_kernel(
         safe_source_row = tl.where(active, source_row, 0)
         destination_row = (destination_position + pool_offset) % TAIL_SIZE
         k_destination_base = (
-            safe_destination_slot * tail_k_stride_req
+            safe_destination_slot * tail_k_stride_page
             + destination_row * tail_k_stride_pool
         )
         gate_destination_base = (
-            safe_destination_slot * tail_gate_stride_req
+            safe_destination_slot * tail_gate_stride_page
             + destination_row * tail_gate_stride_pool
         )
         k_source_base = safe_source_row * k_stride_row
@@ -288,15 +288,15 @@ def _triton_kpool_prefill_tail_write_impl(
     *,
     pool_size: int,
 ) -> None:
-    """Copy incomplete prefill pools into fixed request-local tail buffers.
+    """Copy incomplete prefill pools into paged tail buffers.
 
     Args:
         k: Full BF16 prefill keys shaped ``[tokens, 128]``.
         gate: Matching BF16 per-channel pool scores.
-        tail_k: Request-local key ring, updated in place.
-        tail_gate: Request-local score ring, updated in place.
+        tail_k: Paged key ring, updated in place.
+        tail_gate: Paged score ring, updated in place.
         source_starts: First source token for each fixed metadata row.
-        destination_slots: Stable request-tail slot for each metadata row.
+        destination_slots: Physical index page for each metadata row.
             Negative slots are ignored.
         destination_positions: First logical destination position per row.
         valid_counts: Number of live tokens in each row. Zero makes the row
@@ -367,7 +367,7 @@ def _triton_kpool_prefill_tail_write_impl(
         num_tokens=k.shape[0],
         POOL_SIZE=pool_size,
         TAIL_SIZE=tail_k.shape[1],
-        TAIL_NUM_REQUESTS=tail_k.shape[0],
+        TAIL_NUM_PAGES=tail_k.shape[0],
         HEAD_DIM=k.shape[1],
         BLOCK_D=triton.next_power_of_2(k.shape[1]),
         num_warps=4,
@@ -389,7 +389,7 @@ def _kpool_decode_append_kernel(
     ape_ptr,
     k_stride_req: tl.constexpr,
     k_stride_step: tl.constexpr,
-    tail_stride_req: tl.constexpr,
+    tail_stride_page: tl.constexpr,
     tail_stride_pool: tl.constexpr,
     index_table_stride_req: tl.constexpr,
     index_table_stride_col: tl.constexpr,
@@ -405,7 +405,6 @@ def _kpool_decode_append_kernel(
     HEAD_DIM: tl.constexpr,
     BLOCK_D: tl.constexpr,
     INDEX_TABLE_COLS: tl.constexpr,
-    TAIL_NUM_REQUESTS: tl.constexpr,
     INDEX_NUM_PAGES: tl.constexpr,
 ):
     req = tl.program_id(0)
@@ -415,16 +414,25 @@ def _kpool_decode_append_kernel(
     final_seq_len = tl.load(seq_lens_ptr + req).to(tl.int32)
     first_before = final_seq_len - NUM_STEPS
     request_slot = tl.load(request_slots_ptr + req).to(tl.int64)
-    valid_request = (request_slot > 0) & (request_slot < TAIL_NUM_REQUESTS)
-    request_slot = tl.where(valid_request, request_slot, 0)
-    active = (first_before >= 0) & valid_request
-    tail_base = request_slot * tail_stride_req
+    valid_request = (first_before >= 0) & (request_slot > 0)
 
     for step in tl.static_range(0, NUM_STEPS):
         before = first_before + step
         safe_before = tl.maximum(before, 0)
         logical_slot = safe_before % POOL_SIZE
         physical_slot = safe_before % TAIL_SIZE
+        pool_id = safe_before // POOL_SIZE
+        table_col = pool_id // INDEX_ROWS_PER_PAGE
+        index_page = tl.load(
+            index_table_ptr
+            + req * index_table_stride_req
+            + table_col * index_table_stride_col,
+            mask=valid_request & (table_col < INDEX_TABLE_COLS),
+            other=0,
+        ).to(tl.int64)
+        active = valid_request & (index_page > 0) & (index_page < INDEX_NUM_PAGES)
+        safe_index_page = tl.where(active, index_page, 0)
+        tail_base = safe_index_page * tail_stride_page
 
         token_base = req * k_stride_req + step * k_stride_step
         k_new = tl.load(k_ptr + token_base + offs, mask=mask & active, other=0.0)
@@ -502,19 +510,6 @@ def _kpool_decode_append_kernel(
 
             quantized, scale = _kpool_quantize(acc / denom)
 
-            pool_id = safe_before // POOL_SIZE
-            table_col = pool_id // INDEX_ROWS_PER_PAGE
-            index_page = tl.load(
-                index_table_ptr
-                + req * index_table_stride_req
-                + table_col * index_table_stride_col,
-                mask=is_full & (table_col < INDEX_TABLE_COLS),
-                other=0,
-            ).to(tl.int64)
-            index_page_valid = (
-                is_full & (index_page > 0) & (index_page < INDEX_NUM_PAGES)
-            )
-            safe_index_page = tl.where(index_page_valid, index_page, 0)
             index_row = pool_id % INDEX_ROWS_PER_PAGE
             value_base = (
                 safe_index_page * index_values_stride_page
@@ -523,13 +518,13 @@ def _kpool_decode_append_kernel(
             tl.store(
                 index_values_ptr + value_base + offs,
                 quantized.to(index_values_ptr.dtype.element_ty),
-                mask=mask & index_page_valid,
+                mask=mask,
             )
             scale_base = (
                 safe_index_page * index_scales_stride_page
                 + index_row * index_scales_stride_row
             )
-            tl.store(index_scales_ptr + scale_base, scale, mask=index_page_valid)
+            tl.store(index_scales_ptr + scale_base, scale)
 
 
 def _triton_kpool_decode_append_impl(
@@ -544,15 +539,15 @@ def _triton_kpool_decode_append_impl(
     index_scales: torch.Tensor,
     ape: torch.Tensor,
 ) -> None:
-    """Append a decode window to request-local tails and paged indices.
+    """Append a decode window to paged tails and indices.
 
     Args:
         k: BF16 index keys shaped ``[requests, steps, 128]``.
         gate: Matching per-channel pool scores.
-        tail_k: Request-local key rings.
-        tail_gate: Request-local score rings.
+        tail_k: Key rings indexed by physical index page.
+        tail_gate: Score rings indexed by physical index page.
         seq_lens: Final sequence length per request.
-        request_slots: Stable tail row per request.
+        request_slots: Stable request-pool IDs; zero marks padding.
         index_block_table: Logical-to-physical index-page mapping.
         index_values: Paged FP8 pool values.
         index_scales: Paged FP32 pool scales.
@@ -570,6 +565,8 @@ def _triton_kpool_decode_append_impl(
         or tail_gate.shape != tail_k.shape
         or tail_k.shape[-1] != head_dim
         or tail_size < pool_size
+        or tail_k.shape[0] != index_values.shape[0]
+        or tail_gate.stride() != tail_k.stride()
         or ape.shape != (pool_size, head_dim)
         or index_block_table.dim() != 2
         or index_block_table.shape[0] < requests
@@ -626,7 +623,6 @@ def _triton_kpool_decode_append_impl(
         HEAD_DIM=head_dim,
         BLOCK_D=triton.next_power_of_2(head_dim),
         INDEX_TABLE_COLS=index_block_table.shape[1],
-        TAIL_NUM_REQUESTS=tail_k.shape[0],
         INDEX_NUM_PAGES=index_values.shape[0],
         num_warps=4,
         num_stages=1,

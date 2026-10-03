@@ -192,15 +192,15 @@ def kpool_prefill_tail_write(
     *,
     pool_size: int,
 ) -> None:
-    """Copy incomplete prefill pools into fixed request-local tail buffers.
+    """Copy incomplete prefill pools into paged tail buffers.
 
     Args:
         k: Full index-key tensor shaped ``[tokens, head_dim]``.
         gate: Per-channel scores with the same shape as ``k``.
-        tail_k: Request-local key ring, updated in place.
-        tail_gate: Request-local score ring, updated in place.
+        tail_k: Paged key ring, updated in place.
+        tail_gate: Paged score ring, updated in place.
         source_starts: First source token for each fixed metadata row.
-        destination_slots: Stable request-tail slot for each metadata row.
+        destination_slots: Physical index page for each metadata row.
         destination_positions: First logical destination position per row.
         valid_counts: Live token count per row. Zero marks graph padding.
         pool_size: Maximum number of tokens copied by one metadata row.
@@ -266,15 +266,15 @@ def kpool_decode_append(
     index_scales: torch.Tensor,
     ape: torch.Tensor,
 ) -> None:
-    """Append a decode/verify window to request-local tails and paged indices.
+    """Append a decode/verify window to paged tails and indices.
 
     Args:
         k: Index keys shaped ``[requests, steps, head_dim]``.
         gate: Per-channel pool scores with the same shape as ``k``.
-        tail_k: Request-local raw KPool key tails, updated in place.
-        tail_gate: Request-local raw KPool score tails, updated in place.
+        tail_k: Raw KPool key tails per physical index page, updated in place.
+        tail_gate: Raw KPool score tails per physical index page, updated in place.
         seq_lens: Final sequence lengths after the decode window.
-        request_slots: Stable request-pool row for each batch request.
+        request_slots: Stable request-pool IDs; zero marks padding.
         index_block_table: Logical-pool-page to physical-index-page table.
         index_values: Paged FP8 pooled values, updated in place.
         index_scales: Paged FP32 pooled-row scales, updated in place.

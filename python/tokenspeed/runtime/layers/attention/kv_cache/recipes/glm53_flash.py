@@ -58,8 +58,7 @@ GLM53_FLASH_LOGICAL_BLOCK_TOKENS = 64
 # Full-attention pages per LCM parent, keyed by (attn tp size, MLA cache
 # element size). The compressed KPool index is a companion field of the same
 # 64-token CacheBlock and therefore shares this packing and block table. KDA
-# state groups always pack one checkpoint per parent; the bounded raw KPool
-# tail is request-local workspace and has no scheduler-facing packing.
+# state groups always pack one checkpoint per parent.
 _PACKING = {
     (1, 2): 72,
     (1, 1): 144,
@@ -74,28 +73,9 @@ _PACKING = {
 
 @dataclass(frozen=True)
 class Glm53FlashPoolOptions:
-    """Fixed request-local KPool tail geometry owned by the GLM cache pool."""
+    """Geometry shared by target and draft index caches."""
 
-    index_kpool: int
-    tail_extra_slots: int
     index_head_dim: int
-    num_request_slots: int
-    dsa_layer_ids: tuple[int, ...]
-
-    @property
-    def tail_width(self) -> int:
-        return self.index_kpool + self.tail_extra_slots
-
-    @property
-    def workspace_bytes(self) -> int:
-        return (
-            len(self.dsa_layer_ids)
-            * 2
-            * self.num_request_slots
-            * self.tail_width
-            * self.index_head_dim
-            * torch.bfloat16.itemsize
-        )
 
 
 def _require_non_negative_int(name: str, value: object) -> int:
@@ -163,13 +143,9 @@ def declare_glm53_flash_groups(
     attn_config: AttnConfig,
     draft_attn_config: AttnConfig | None = None,
     draft_layers: int = 0,
+    tail_extra_slots: int,
 ) -> tuple[CacheGroupDeclaration, ...]:
     """Declare GLM cache groups from its composite attention components."""
-    if attn_config.pd_disaggregation_enabled:
-        raise NotImplementedError(
-            "GLM-5.3-Flash disaggregated serving requires an explicit transfer "
-            "bridge for its request-local KPool tail"
-        )
     if draft_layers and draft_attn_config is None:
         raise TypeError("GLM-5.3-Flash draft layers require a draft attention config")
 
@@ -238,23 +214,35 @@ def declare_glm53_flash_groups(
     )
     kpool = require_positive_int("index_kpool", target_dsa.index_kpool)
     index_head_dim = require_positive_int("index_head_dim", target_dsa.index_head_dim)
+    if GLM53_FLASH_LOGICAL_BLOCK_TOKENS % kpool:
+        raise ValueError("GLM-5.3-Flash index_kpool must divide the cache page size")
+    # A pool never crosses a page; retain speculative writes within that page.
+    tail_width = min(
+        GLM53_FLASH_LOGICAL_BLOCK_TOKENS,
+        kpool + _require_non_negative_int("tail_extra_slots", tail_extra_slots),
+    )
     pooled_rows = GLM53_FLASH_LOGICAL_BLOCK_TOKENS // kpool
     index_fields = []
     index_plane_id = f"slot.{sum(gid == FULL_ATTENTION for gid in group_ids)}"
     for layer_id, group_id in enumerate(group_ids):
         if group_id != FULL_ATTENTION:
             continue
-        index_fields.append(
-            CacheFieldSpec(
-                f"layer.{layer_id}.index_k",
-                # Keep all flexible-stride index fields in the first plane
-                # not occupied by this group's exact-stride MLA pages. On the
-                # target-only topology that plane aliases otherwise-unused KDA
-                # slab space; a merged target+draft plan adds it explicitly.
-                index_plane_id,
-                (pooled_rows, index_head_dim + 4),
-                cache_dtype_name(torch.uint8),
-                exact_page_stride=False,
+        index_fields.extend(
+            (
+                CacheFieldSpec(
+                    f"layer.{layer_id}.index_k",
+                    index_plane_id,
+                    (pooled_rows, index_head_dim + 4),
+                    cache_dtype_name(torch.uint8),
+                    exact_page_stride=False,
+                ),
+                CacheFieldSpec(
+                    f"layer.{layer_id}.index_tail",
+                    index_plane_id,
+                    (2, tail_width, index_head_dim),
+                    cache_dtype_name(torch.bfloat16),
+                    exact_page_stride=False,
+                ),
             )
         )
     return tuple(
@@ -267,7 +255,7 @@ def declare_glm53_flash_groups(
 
 
 class Glm53FlashRecipe(CacheRecipe):
-    """DSA history plus KDA checkpoints and request-local KPool tails."""
+    """DSA history with paged KPool tails and KDA checkpoints."""
 
     family = "glm53_flash"
 
@@ -310,9 +298,12 @@ class Glm53FlashRecipe(CacheRecipe):
     def tail_extra_slots(self) -> int:
         if self.server_args.speculative_algorithm is None:
             return 0
-        return _require_non_negative_int(
-            "speculative_num_draft_tokens",
-            int(self.server_args.speculative_num_draft_tokens or 0),
+        return max(
+            self.attn_config.speculative_num_steps,
+            _require_non_negative_int(
+                "speculative_num_draft_tokens",
+                int(self.server_args.speculative_num_draft_tokens or 0),
+            ),
         )
 
     @override
@@ -322,6 +313,7 @@ class Glm53FlashRecipe(CacheRecipe):
             attn_config=self.attn_config,
             draft_attn_config=self.draft_attn_config,
             draft_layers=self.num_draft_layers,
+            tail_extra_slots=self.tail_extra_slots,
         )
 
     @override
@@ -342,30 +334,10 @@ class Glm53FlashRecipe(CacheRecipe):
         return kda_verify_scratch_in_pool(self.server_args, self.attn_config)
 
     @override
-    def workspace_bytes(self) -> int:
-        """Bounded raw KPool tails kept once per request and DSA layer."""
-        return self.pool_options().workspace_bytes
-
-    @override
     def pool_options(self) -> Glm53FlashPoolOptions:
-        max_bs = self.attn_config.max_bs
-        if self.draft_attn_config is not None:
-            max_bs = max(max_bs, self.draft_attn_config.max_bs)
         return Glm53FlashPoolOptions(
-            index_kpool=require_positive_int(
-                "index_kpool", self._dsa_config.index_kpool
-            ),
-            tail_extra_slots=self.tail_extra_slots,
             index_head_dim=require_positive_int(
                 "index_head_dim", self._dsa_config.index_head_dim
-            ),
-            # Scheduler request IDs are 1-based; row 0 and one graph-padding
-            # sentinel sit outside the live range.
-            num_request_slots=max_bs + 2,
-            dsa_layer_ids=tuple(
-                layer_id
-                for layer_id, group_id in enumerate(self.group_ids)
-                if group_id == FULL_ATTENTION
             ),
         )
 

@@ -160,10 +160,7 @@ class DSABackend(PagedAttentionBackend):
         )
 
     def set_request_slots(self, req_pool_indices: torch.Tensor) -> None:
-        # KPool's tail state is indexed by request-pool slot, and its
-        # per-forward plan must not outlive the metadata build that
-        # produced it: the router publishes the slots after every build,
-        # which is exactly the reset point.
+        # Reset the KPool plan and decode liveness after each metadata build.
         if self.kpool_runtime is not None:
             self.kpool_runtime.reset_forward(req_pool_indices)
 

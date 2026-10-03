@@ -22,11 +22,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import ClassVar
 
 import torch
-from typing_extensions import override
 
 from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
     HybridKDATokenToKVPool,
@@ -37,15 +35,8 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.glm53_flash import (
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
 
-@dataclass
-class _KPoolTailWorkspace:
-    options: Glm53FlashPoolOptions
-    storage: torch.Tensor
-    row_by_layer: dict[int, int]
-
-
 class HybridGlm53FlashTokenToKVPool(HybridKDATokenToKVPool):
-    """KDA/DSA pages with pooled-index fields and a request-local KPool tail."""
+    """KDA/DSA pages with pooled-index fields and raw KPool tails."""
 
     # Unlike the KDA hybrid it extends, its latent writes keep non-finite values.
     latent_write_sanitizes: ClassVar[bool] = False
@@ -53,47 +44,12 @@ class HybridGlm53FlashTokenToKVPool(HybridKDATokenToKVPool):
     def __init__(self, *args, pool_options: Glm53FlashPoolOptions, **kwargs):
         self.index_head_dim = pool_options.index_head_dim
         super().__init__(*args, **kwargs)
-        self._kpool_tail_workspace = self._bind_kpool_tail_workspace(pool_options)
 
     layer_plane_bindings: ClassVar[dict[str, str]] = {
         **HybridKDATokenToKVPool.layer_plane_bindings,
         "index_k": "_index_k",
+        "index_tail": "_index_tail",
     }
-
-    def _bind_kpool_tail_workspace(
-        self, options: Glm53FlashPoolOptions
-    ) -> _KPoolTailWorkspace:
-        """Allocate the model-private ring once and share it with draft views."""
-        attribute = "_glm53_flash_kpool_tail_workspace"
-        workspace = getattr(self.arena, attribute, None)
-        if workspace is None:
-            with self.arena.memory_saver_adapter.region(
-                tag="kv_cache", enable_cpu_backup=False
-            ):
-                storage = torch.zeros(
-                    (
-                        len(options.dsa_layer_ids),
-                        2,
-                        options.num_request_slots,
-                        options.tail_width,
-                        options.index_head_dim,
-                    ),
-                    dtype=torch.bfloat16,
-                    device=self.arena.device,
-                )
-            workspace = _KPoolTailWorkspace(
-                options=options,
-                storage=storage,
-                row_by_layer={
-                    layer_id: row for row, layer_id in enumerate(options.dsa_layer_ids)
-                },
-            )
-            setattr(self.arena, attribute, workspace)
-        elif workspace.options != options:
-            raise ValueError(
-                "GLM-5.3-Flash cache views disagree on KPool tail geometry"
-            )
-        return workspace
 
     def get_index_k_buffer(self, layer_id: int) -> torch.Tensor:
         try:
@@ -108,20 +64,8 @@ class HybridGlm53FlashTokenToKVPool(HybridKDATokenToKVPool):
         self, layer_id: int
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         index_k = self.get_index_k_buffer(layer_id)
-        try:
-            row = self._kpool_tail_workspace.row_by_layer[
-                self._field_layer_id(layer_id)
-            ]
-        except KeyError as exc:
-            raise ValueError(f"layer {layer_id} has no KPool tail cache") from exc
-        storage = self._kpool_tail_workspace.storage
-        return index_k, storage[row, 0], storage[row, 1]
-
-    @torch.no_grad()
-    @override
-    def clear_kv_buffers(self) -> None:
-        super().clear_kv_buffers()
-        self._kpool_tail_workspace.storage.zero_()
+        tail = self._index_tail[layer_id]
+        return index_k, tail[:, 0], tail[:, 1]
 
     def index_k_block_views(
         self, buf: torch.Tensor

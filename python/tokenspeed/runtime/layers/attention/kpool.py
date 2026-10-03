@@ -42,18 +42,16 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class KPoolWritePlan:
-    """Physical pooled-index writes and request-local tail updates."""
+    """Physical pooled-index writes and paged tail updates."""
 
-    pool_req_ids: torch.Tensor
     pool_n_from_tail: torch.Tensor
     pool_chunk_src: torch.Tensor
     pool_tail_logical_base: torch.Tensor
     pool_write_slots: torch.Tensor
-    tail_req_ids: torch.Tensor
+    tail_write_pages: torch.Tensor
     tail_chunk_src: torch.Tensor
     tail_dst_positions: torch.Tensor
     tail_write_counts: torch.Tensor
-    request_slots: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -103,18 +101,12 @@ def build_kpool_write_plan(
     req_start_positions: torch.Tensor,
     query_start_loc: torch.Tensor,
     index_block_table: torch.Tensor,
-    request_slots: torch.Tensor,
     kpool: int,
     index_rows_per_page: int,
 ) -> KPoolWritePlan:
-    """Map completed pools to index pages and remainders to request tail slots."""
+    """Map completed pools and remainders to physical index pages."""
     starts = req_start_positions.to(torch.int64).tolist()
     offsets = query_start_loc.to(torch.int64).tolist()
-    if request_slots.numel() != len(starts):
-        raise ValueError(
-            "KPool request-slot count differs from the request count: "
-            f"{request_slots.numel()} != {len(starts)}"
-        )
 
     pool_req_ids: list[int] = []
     pool_n_from_tail: list[int] = []
@@ -176,8 +168,12 @@ def build_kpool_write_plan(
         )
     else:
         pool_write_slots = torch.empty(0, dtype=torch.int64, device=device)
+    tail_positions = torch.tensor(tail_dst_positions, dtype=torch.int64, device=device)
+    tail_pages = index_block_table[
+        torch.tensor(tail_req_ids, dtype=torch.int64, device=device),
+        tail_positions // (kpool * index_rows_per_page),
+    ].to(torch.int64)
     return KPoolWritePlan(
-        pool_req_ids=pool_req_ids_tensor,
         pool_n_from_tail=torch.tensor(
             pool_n_from_tail, dtype=torch.int32, device=device
         ),
@@ -186,15 +182,12 @@ def build_kpool_write_plan(
             pool_tail_logical_base, dtype=torch.int64, device=device
         ),
         pool_write_slots=pool_write_slots,
-        tail_req_ids=torch.tensor(tail_req_ids, dtype=torch.int32, device=device),
+        tail_write_pages=tail_pages,
         tail_chunk_src=torch.tensor(tail_chunk_src, dtype=torch.int64, device=device),
-        tail_dst_positions=torch.tensor(
-            tail_dst_positions, dtype=torch.int64, device=device
-        ),
+        tail_dst_positions=tail_positions,
         tail_write_counts=torch.tensor(
             tail_write_counts, dtype=torch.int32, device=device
         ),
-        request_slots=request_slots.to(device=device, dtype=torch.int64),
     )
 
 
@@ -203,7 +196,6 @@ def build_kpool_prefill_plan(
     prefix_lens_cpu: torch.Tensor,
     extend_lens_cpu: torch.Tensor,
     index_block_table: torch.Tensor,
-    request_slots: torch.Tensor,
     kpool: int,
     index_rows_per_page: int,
     token_capacity: int | None = None,
@@ -214,7 +206,6 @@ def build_kpool_prefill_plan(
         prefix_lens_cpu: Per-request prefix lengths on CPU.
         extend_lens_cpu: Per-request extend lengths on CPU.
         index_block_table: Logical-pool-page to physical-index-page table.
-        request_slots: Stable request-pool row for each batch request.
         kpool: Raw tokens represented by one compressed index row.
         index_rows_per_page: Compressed rows stored in one index page.
         token_capacity: Optional fixed token-row capacity. Rows after the real
@@ -310,7 +301,6 @@ def build_kpool_prefill_plan(
         req_start_positions=prefix_lens_cpu,
         query_start_loc=query_start_loc_cpu,
         index_block_table=index_block_table,
-        request_slots=request_slots,
         kpool=kpool,
         index_rows_per_page=index_rows_per_page,
     )
@@ -356,15 +346,10 @@ class KPoolRuntime:
         metadata = backend.chunked_prefill_metadata
         index_table = backend.kpool_prefill_page_table(ctx.num_extends)
         index_cache = ctx.token_to_kv_pool.get_kpool_buffers(layer_id)[0]
-        # The slots come from the backend's per-forward publication, not the
-        # prefill metadata: paged leaves' metadata carries no pool indices.
-        if self.req_pool_indices is None:
-            raise RuntimeError("DSA KPool prefill requires request-pool indices")
         self.prefill_plan = build_kpool_prefill_plan(
             prefix_lens_cpu=metadata.extend_prefix_lens_cpu[: ctx.num_extends],
             extend_lens_cpu=metadata.extend_seq_lens_cpu[: ctx.num_extends],
             index_block_table=index_table,
-            request_slots=self.req_pool_indices[: ctx.num_extends],
             kpool=self.pool_size,
             index_rows_per_page=index_cache.shape[1],
             token_capacity=token_capacity,
@@ -400,11 +385,9 @@ class KPoolRuntime:
                 plan.pool_tail_logical_base.unsqueeze(1) + offsets,
                 tail_k.shape[1],
             )
-            request_slots = plan.request_slots.index_select(
-                0, plan.pool_req_ids.to(torch.int64)
-            )
-            tail_keys = tail_k[request_slots.unsqueeze(1), tail_rows]
-            tail_scores = tail_gate[request_slots.unsqueeze(1), tail_rows]
+            pages = plan.pool_write_slots // index_cache.shape[1]
+            tail_keys = tail_k[pages.unsqueeze(1), tail_rows]
+            tail_scores = tail_gate[pages.unsqueeze(1), tail_rows]
             chunk_rows = plan.pool_chunk_src.unsqueeze(1) + torch.clamp(
                 offsets - plan.pool_n_from_tail.to(torch.int64).unsqueeze(1),
                 min=0,
@@ -428,16 +411,13 @@ class KPoolRuntime:
             )
 
         if plan.tail_write_counts.numel() > 0:
-            destination_slots = plan.request_slots.index_select(
-                0, plan.tail_req_ids.to(torch.int64)
-            )
             kpool_prefill_tail_write(
                 key,
                 gate,
                 tail_k,
                 tail_gate,
                 plan.tail_chunk_src,
-                destination_slots,
+                plan.tail_write_pages,
                 plan.tail_dst_positions,
                 plan.tail_write_counts,
                 pool_size=self.pool_size,
@@ -455,7 +435,7 @@ class KPoolRuntime:
         num_reqs: int,
         q_len_per_req: int,
     ) -> None:
-        """Append decode tokens to request tails and flush completed pools."""
+        """Append decode tokens to paged tails and flush completed pools."""
         metadata = backend.forward_decode_metadata
         row_start = int(metadata.num_extends or 0)
         seq_lens = metadata.seq_lens_k[row_start : row_start + num_reqs].to(torch.int32)
