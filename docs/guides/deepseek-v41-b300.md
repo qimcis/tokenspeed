@@ -1,21 +1,38 @@
 # DeepSeek V4.1 Flash on B300
 
-The recipes in `recipes/deepseek-v41-b300/` serve
-`deepseek-ai/DeepSeek-V4.1-Flash-1017` through the existing TokenSpeed runtime.
-They pin the checkpoint and allocate eight GPUs across complete workers.
+The B300 work targets `deepseek-ai/DeepSeek-V4.1-Flash-1017` through the existing
+TokenSpeed runtime, with complete workers distributed across a cluster.
 Encoder (E) means the vision tower and aligner; text requests bypass it.
 
-| Recipe | Allocation | Purpose |
-| --- | --- | --- |
-| `aggregate.toml` | One eight-GPU worker | Baseline |
-| `pd.toml` | P4/D4 | Prefill/decode separation |
-| `epd.toml` | E2/P2/D4 | Separate vision encoding |
-| `performance-affinity.toml` | One eight-GPU worker | Eager expert-affinity comparison |
-| `load-balancing.toml` | P4/D4 | Expert replicas and a complete-frontend routing proxy |
+The pinned recipes in `recipes/deepseek-v41-b300/` are local development
+examples; their allocations do not define the cluster size.
+
+| Recipe | Purpose |
+| --- | --- |
+| `aggregate.toml` | Aggregated baseline |
+| `pd.toml` | Prefill/decode separation |
+| `epd.toml` | Separate vision encoding |
+| `performance-affinity.toml` | Eager expert-affinity comparison |
+| `load-balancing.toml` | Expert replicas and a complete-frontend routing proxy |
 
 These are candidate layouts, not measured optima. GPU compilation, full model
 quality and end-to-end performance remain unqualified. Keep baseline recipes
 unchanged when comparing experimental paths.
+
+## Cluster scope
+
+Request routing accepts remote frontend endpoints and multiple complete workers.
+Adding worker replicas is separate from spreading one model-parallel worker
+across hosts. EPLB uses configured expert groups and rank topology; Engram
+caching is local to each rank, and compact DSpark exchanges candidates within
+its TP group. These algorithms have no fixed eight-GPU cluster limit.
+
+For workers spanning hosts, use TokenSpeed's [multi-node launcher](../serving/parallelism.md#multi-node)
+with external orchestration. Supported model geometry, backend communication
+and fabric still constrain each group. Cross-node MegaMoE, E/P/D transfers and
+the combined optimizations require hardware qualification. Affinity currently
+requires attention DP1 and TP equal to the worker world size; it does not yet
+support attention-DP scale-out within a worker.
 
 ## Dependencies and launch
 
@@ -24,6 +41,10 @@ kernel and scheduler packages from the same checkout. New placement, quota and
 compact-sampling options require their corresponding source-built components;
 disabled options preserve the baseline dependency path.
 
+### Local recipe helper
+
+The recipe helper emits `--nnodes 1` and loopback addresses, and starts one
+worker per configured role. It cannot launch a cluster or a worker across hosts.
 From the repository root, inspect a recipe without downloading weights or
 starting a server:
 
@@ -128,7 +149,8 @@ The example has one frontend and demonstrates wiring; balancing requires
 multiple verified frontends. It does not configure arbitrary stage overrides
 inside external SMG.
 
-The pool library provides bounded allocation and local process actuation.
+The pool library provides bounded allocation and local process actuation;
+its device inventory is local to the host, not a cluster-wide inventory.
 Automatic fleet operation still needs commands, registration, measured demand,
 a controller owner and independent engine-drain acknowledgments. It never
 infers that an HTTP disconnect means device work has stopped. API, lease and

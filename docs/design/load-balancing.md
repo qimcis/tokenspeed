@@ -5,6 +5,12 @@ frontends. It does not create a second inference scheduler. The
 [B300 guide](../guides/deepseek-v41-b300.md) covers configuration; the native
 [scheduler design](scheduler.md) defines affinity and prefill-quota invariants.
 
+Routing operates across complete workers at local or remote endpoints. Expert
+balancing operates within each worker's configured expert group, using rank/node
+topology. Neither fixes the fleet to a particular GPU count. Cross-host model
+parallelism additionally depends on qualified backend transports; remote HTTP
+routing alone does not establish support for it.
+
 ## Expert placement
 
 Logical expert selection and router weights remain unchanged. Physical slots
@@ -100,7 +106,8 @@ capacity, minima/maxima, spare inventory, hysteresis and a movement budget.
 Indivisible TP groups must fit the budget. Stale/regressed observations hold the
 current target. Starting and draining workers retain their GPU ownership.
 
-`LocalProcessBackend` uses owned process groups and requires explicit
+`LocalProcessBackend` manages one host's device inventory and owned process
+groups; multi-host actuation requires external orchestration. It requires explicit
 `apply=True`. The registry must be the sole ingress and each managed incarnation
 must be registered as draining before launch. Admission opens only after fresh
 ready/healthy reports. Stopping requires zero leases plus an independent, fresh,
