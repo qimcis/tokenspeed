@@ -26,6 +26,7 @@ from tokenspeed.runtime.moe.eplb_algorithms import deepseek
 
 
 class EplbAlgorithm(Enum):
+    trace = auto()
     deepseek = auto()
     deepseek_hierarchical = auto()
 

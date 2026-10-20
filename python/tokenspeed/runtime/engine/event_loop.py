@@ -441,7 +441,15 @@ class EventLoop:
             f"cache_groups={[group.group_id for group in cache_groups]!s}",
         )
         self.scheduler = Scheduler(scheduler_cfg)
+        if server_args.prefill_work_budget_ms is not None:
+            self.scheduler.configure_prefill_work_budget(
+                server_args.prefill_work_budget_ms,
+                server_args.prefill_work_linear_ms_per_token,
+                server_args.prefill_work_context_ms_per_token_squared,
+                server_args.prefill_work_quadratic_ms_per_token_squared,
+            )
         self._route_feedback_hooks = None
+        self._placement_feedback_hooks = None
         if server_args.expert_affinity:
             from tokenspeed.runtime.engine.route_feedback_hooks import (
                 RouteFeedbackHooks,
@@ -458,6 +466,27 @@ class EventLoop:
                 leader=self.attn_tp_rank == 0,
                 group=self.attn_tp_cpu_group,
                 source_rank=server_args.mapping.attn.tp_group[0],
+            )
+        if server_args.expert_affinity_placement:
+            from tokenspeed.runtime.engine.route_feedback_hooks import (
+                PlacementFeedbackHooks,
+            )
+
+            placement = specs.expert_placement
+            if placement is None:
+                raise RuntimeError(
+                    "placement affinity requires an initial placement snapshot"
+                )
+            self._placement_feedback_hooks = PlacementFeedbackHooks(
+                self.scheduler,
+                layer_ids=placement.layer_ids,
+                ep_rank_nodes=placement.ep_rank_nodes,
+            )
+            self._placement_feedback_hooks.publish(
+                placement.epoch,
+                placement.physical_to_logical,
+                placement.num_local_experts,
+                logical_to_all_physical=placement.logical_to_all_physical,
             )
         self._l3_hooks = L3CacheHooks(
             self.scheduler,
@@ -611,6 +640,11 @@ class EventLoop:
                 else None
             ),
             ep_group_ranks=tuple(mapping.moe.ep_group),
+            placement_applied=(
+                self._placement_feedback_hooks.publish
+                if self._placement_feedback_hooks is not None
+                else None
+            ),
         )
         # Full garbage collections: one every FULL_COLLECTION_INTERVAL
         # forwarded rounds, in the same round on every rank, once
@@ -780,9 +814,10 @@ class EventLoop:
                 # (engine identity, ready response) lives in zmq_msgpack.
                 from tokenspeed.runtime.engine import zmq_msgpack
 
-                self.recv_from_tokenizer, self.send_to_tokenizer = (
-                    zmq_msgpack.connect_msgpack_engine_for_loop(context, self)
-                )
+                (
+                    self.recv_from_tokenizer,
+                    self.send_to_tokenizer,
+                ) = zmq_msgpack.connect_msgpack_engine_for_loop(context, self)
             else:
                 self.recv_from_tokenizer = IpcReceiver(
                     get_zmq_socket(
@@ -837,9 +872,12 @@ class EventLoop:
         # Pause-state snapshot for withhold_admissions below: it must be
         # taken before process_requests, which may flip the state mid-batch.
         pause_blocked_before = self._pause.admit_blocked
-        new_req_specs, new_req_states, bootstrap_infos, abort_rids = (
-            self.request_handler.process_requests(recv_reqs)
-        )
+        (
+            new_req_specs,
+            new_req_states,
+            bootstrap_infos,
+            abort_rids,
+        ) = self.request_handler.process_requests(recv_reqs)
         # Sweep TTL-expired abort markers every iteration. Without this
         # the map only gets cleaned inside ``mark_abort``, so a burst of
         # stale-cancel traffic followed by silence leaves the last batch

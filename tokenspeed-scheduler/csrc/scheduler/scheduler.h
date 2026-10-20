@@ -56,6 +56,13 @@ public:
 
     // Explicit experimental policy; configure before submitting any requests.
     void ConfigureExpertAffinity(std::int32_t lookahead, std::int32_t max_deferrals, std::int32_t max_hint_age_tokens);
+    void SetExpertPlacement(std::uint64_t epoch, std::vector<std::uint64_t> expert_keys,
+                            std::vector<std::vector<double>> rank_weights);
+    std::uint64_t ExpertPlacementEpoch() const { return expert_placement_ ? expert_placement_->epoch : 0; }
+    void ConfigurePrefillWorkBudget(double budget_ms, double linear_ms_per_token, double context_ms_per_token_squared,
+                                    double quadratic_ms_per_token_squared);
+    double LastPrefillWorkMs() const { return round_prefill_work_ms_; }
+    std::uint64_t PrefillWorkOverruns() const { return prefill_work_overruns_; }
     std::uint64_t RequestGeneration(const std::string& request_id) const;
     bool UpdateExpertRoute(const std::string& request_id, std::uint64_t generation, std::int32_t computed_frontier,
                            std::vector<std::uint64_t> expert_keys);
@@ -329,6 +336,12 @@ private:
         // decode steps run against no chunk budget.
         if constexpr (std::is_same_v<Operation, PrefillOperation>) {
             build.token_budget -= operation.input_length;
+            if (prefill_work_) {
+                round_prefill_work_ms_ += prefillWork(operation.input_length, operation.extend_prefix_len);
+                if (!build.pushed_prefill && round_prefill_work_ms_ > prefill_work_->budget_ms)
+                    ++prefill_work_overruns_;
+                round_prefill_progress_ = true;
+            }
             build.pushed_prefill = true;
         } else if (config_.role != Role::kD) {
             build.token_budget -= operation.input_length;
@@ -461,7 +474,19 @@ private:
         std::int32_t max_hint_age_tokens;
     };
     SchedulerConfig config_;
+    bool submitted_requests_{false};
     std::optional<ExpertAffinityConfig> expert_affinity_;
+    std::optional<ExpertPlacementModel> expert_placement_;
+    struct PrefillWorkConfig {
+        double budget_ms, linear, context, quadratic;
+    };
+    std::optional<PrefillWorkConfig> prefill_work_;
+    double round_prefill_work_ms_{0};
+    bool round_prefill_progress_{false};
+    std::uint64_t prefill_work_overruns_{0};
+    double prefillWork(std::int32_t q, std::int32_t c) const;
+    std::int32_t prefillChunk(std::int32_t first_pos, bool resumes_hit, std::int32_t unscheduled,
+                              std::int32_t token_budget, std::int32_t junction_tokens) const;
     std::unordered_map<const Request*, ExpertRouteState> expert_routes_;
     std::uint64_t next_request_generation_{0};
     // Fair service order is enabled with a decode cap or affinity. It is

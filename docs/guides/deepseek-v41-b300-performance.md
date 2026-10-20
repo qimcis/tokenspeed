@@ -26,9 +26,11 @@ optional deployment `[performance]` section keeps baseline recipe behavior.
 
 Affinity additionally requires DP=PP=QCP=KVP=1, full attention TP over the worker
 world, and replicated request inputs. Expert parallelism may partition experts,
-but expert load balancing, redundant experts, custom placement and routing
-simulation are excluded. These constraints keep the observed logical expert IDs
-and scheduler hints coherent across ranks.
+but placement remains excluded unless the explicit placement-aware capability
+checks pass. The [load-balancing increment](deepseek-v41-b300-load-balancing.md)
+adds coherent static dispatch/epoch support and a restricted all-layer EPLB
+combination. Routing simulation remains excluded. Logical route identity and
+rank-coherent publication are required.
 
 Affinity bounds are `--expert-affinity-capture-interval` (16),
 `--expert-affinity-max-layers` (4), `--expert-affinity-lookahead` (256),

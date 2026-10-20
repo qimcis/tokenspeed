@@ -194,3 +194,20 @@ Python total includes the 247 native binding tests. Full repository hooks passed
 and independent review found no remaining blockers. No GPU compilation or
 performance run was performed. The detailed performance record owns the exact
 commands, review corrections and remaining qualification gates.
+
+## Load-balancing increment
+
+The [load-balancing plan](deepseek-v41-b300-load-balancing.md) extends the work
+with expert placement/trace EPLB, placement-aware batching, calibrated prefill
+quotas, P/D/E request policies, an executable compatible-path routing service,
+and a bounded local pool controller. Fifteen agent assignments implemented and
+cross-reviewed the increment. The [load-balancing record](deepseek-v41-b300-load-balancing-log.md)
+is the newest continuation memory; read its source-rank counting and external
+service/drain boundaries before extending the system. All paths remain opt-in,
+CPU-verified candidates; GPU and performance promotion are separate gates.
+
+Load-balancing increment final CPU evidence: 945 Python tests passed with
+29 explicit skips, plus 623 C++ tests passed after rebuilding the native source.
+Full hooks/diff checks and independent review passed. These totals overlap prior
+component results. GPU performance and external pool/service qualification remain
+unrun; the detailed load-balancing record owns the remaining capability limits.

@@ -520,6 +520,14 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("request_token_size", &tokenspeed::Scheduler::RequestTokenSize, nb::arg("id"))
         .def("configure_expert_affinity", &tokenspeed::Scheduler::ConfigureExpertAffinity, nb::arg("lookahead"),
              nb::arg("max_deferrals"), nb::arg("max_hint_age_tokens"))
+        .def("set_expert_placement", &tokenspeed::Scheduler::SetExpertPlacement, nb::arg("epoch"),
+             nb::arg("expert_keys"), nb::arg("rank_weights"))
+        .def("expert_placement_epoch", &tokenspeed::Scheduler::ExpertPlacementEpoch)
+        .def("configure_prefill_work_budget", &tokenspeed::Scheduler::ConfigurePrefillWorkBudget, nb::arg("budget_ms"),
+             nb::arg("linear_ms_per_token"), nb::arg("context_ms_per_token_squared"),
+             nb::arg("quadratic_ms_per_token_squared"))
+        .def("last_prefill_work_ms", &tokenspeed::Scheduler::LastPrefillWorkMs)
+        .def("prefill_work_overruns", &tokenspeed::Scheduler::PrefillWorkOverruns)
         .def("request_generation", &tokenspeed::Scheduler::RequestGeneration, nb::arg("request_id"))
         .def("update_expert_route", &tokenspeed::Scheduler::UpdateExpertRoute, nb::arg("request_id"),
              nb::arg("generation"), nb::arg("computed_frontier"), nb::arg("expert_keys"))

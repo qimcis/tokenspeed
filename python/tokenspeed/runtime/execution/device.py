@@ -104,6 +104,7 @@ from tokenspeed.runtime.execution.types import (
 )
 from tokenspeed.runtime.moe.expert_location import (
     ExpertLoadSnapshot,
+    ExpertPlacementSnapshot,
     get_global_expert_location_metadata,
 )
 from tokenspeed.runtime.moe.expert_rebalance import ExpertRebalanceSpecs, SlotMoves
@@ -239,6 +240,7 @@ class DeviceSpecs:
     num_snapshot_pages: int
     max_retracted_requests: int
     expert_rebalance: ExpertRebalanceSpecs | None
+    expert_placement: ExpertPlacementSnapshot | None = None
 
 
 def speculative_widths(
@@ -1750,6 +1752,7 @@ def build_device_side(
         executor.config.spec_num_steps,
         executor.config.spec_num_tokens,
     )
+    placement = get_global_expert_location_metadata()
     specs = DeviceSpecs(
         cache_geometry=views.cache_geometry,
         cache_groups=views.cache_groups,
@@ -1783,6 +1786,9 @@ def build_device_side(
             host_cache_executor.max_retracted_requests
             if host_cache_executor is not None
             else 0
+        ),
+        expert_placement=(
+            placement.placement_snapshot() if placement is not None else None
         ),
         expert_rebalance=(
             target.expert_location_updater.specs

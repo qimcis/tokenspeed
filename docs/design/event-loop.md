@@ -129,6 +129,15 @@ Consequences:
   `stop_profile`), so a rank reducing inside the request would block in the
   collective while its peer is still in `_dp_sync_and_check`.
   `--init-expert-location` sums the ranks' records where it consumes them.
+  Trace EPLB additionally reserves a bounded device ring before serving.
+  After each served target forward (including an idle rank's matching forward),
+  the execution stream appends the difference from its previous counters;
+  this runs outside graph capture and performs no device-to-host read. The
+  existing snapshot operation transfers the retained steps and maps replicas
+  to logical expert counts. Verification candidates count as actual target
+  work even when subsequently rejected; drafts and graph filler rows do not.
+  Placement switches advance the epoch and reset both counters and history,
+  so no snapshot attributes old physical slots to a new logical placement.
   Online expert rebalancing (`--enable-eplb`) adds two more named
   operations on the same counters: `snapshot_expert_load` (read the window
   to the host and zero it, one stream-ordered step) and

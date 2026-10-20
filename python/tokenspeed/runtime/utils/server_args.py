@@ -483,6 +483,13 @@ class ServerArgs:
         | None
     ) = None
     eplb_algorithm: str = "auto"
+    eplb_trace_window: int | None = None
+    eplb_trace_max_moved_slots: int | None = None
+    eplb_trace_movement_penalty: float | None = None
+    eplb_trace_min_relative_improvement: float | None = None
+    eplb_trace_objective: str | None = None
+    eplb_trace_expert_costs: str | None = None
+
     # 'stat': int64 route counters per physical expert, read by the
     # EXPERT_LOAD profile activity and by --enable-eplb.
     expert_distribution_recorder_mode: Literal["stat"] | None = None
@@ -590,7 +597,12 @@ class ServerArgs:
     deepseek_v4_prefill_chunk_size: int = 4
     # DeepSeek V4.1 Engram host tables. Off by default (GPU-sharded).
     # Experimental paths are inert unless explicitly selected.
+    prefill_work_budget_ms: float | None = None
+    prefill_work_linear_ms_per_token: float | None = None
+    prefill_work_context_ms_per_token_squared: float | None = None
+    prefill_work_quadratic_ms_per_token_squared: float | None = None
     expert_affinity: bool = False
+    expert_affinity_placement: bool = False
     expert_affinity_lookahead: int = 256
     expert_affinity_max_deferrals: int = 8
     expert_affinity_max_hint_age_tokens: int = 64
@@ -2209,6 +2221,32 @@ class ServerArgs:
         counters, a static dispatch algorithm, the snapshot interval and the
         layers switched per round -- rather than auto-setting any of them.
         """
+        from tokenspeed.runtime.performance_options import EplbTraceOptions
+
+        trace_values = (
+            self.eplb_trace_window,
+            self.eplb_trace_max_moved_slots,
+            self.eplb_trace_movement_penalty,
+            self.eplb_trace_min_relative_improvement,
+            self.eplb_trace_objective,
+        )
+        if self.eplb_algorithm == "trace":
+            if not self.enable_eplb or self.disaggregation_mode not in (
+                "prefill",
+                "decode",
+            ):
+                raise ValueError(
+                    "trace EPLB requires enable_eplb and a separate prefill or decode role"
+                )
+            if any(value is None for value in trace_values):
+                raise ValueError(
+                    "trace EPLB requires explicit window, max moved slots, movement penalty, improvement threshold and objective"
+                )
+            EplbTraceOptions(*trace_values, self.eplb_trace_expert_costs).validate()
+        elif any(
+            value is not None for value in (*trace_values, self.eplb_trace_expert_costs)
+        ):
+            raise ValueError("eplb trace options require eplb_algorithm=trace")
         if self.enable_eplb:
             if self.expert_distribution_recorder_mode != "stat":
                 raise ValueError(
@@ -2308,12 +2346,25 @@ class ServerArgs:
         from tokenspeed.runtime.performance_options import (
             PerformanceCapabilities,
             PerformanceOptions,
+            PrefillWorkOptions,
             require_scheduler_performance_support,
             validate_performance_options,
         )
 
+        quota = PrefillWorkOptions(
+            budget_ms=self.prefill_work_budget_ms,
+            linear_ms_per_token=self.prefill_work_linear_ms_per_token,
+            context_ms_per_token_squared=self.prefill_work_context_ms_per_token_squared,
+            quadratic_ms_per_token_squared=self.prefill_work_quadratic_ms_per_token_squared,
+        )
+        quota.validate(role=self.disaggregation_mode)
+        if quota.budget_ms is not None:
+            from tokenspeed_scheduler import Scheduler
+
+            quota.require_scheduler_support(Scheduler)
         options = PerformanceOptions(
             expert_affinity=self.expert_affinity,
+            expert_affinity_placement=self.expert_affinity_placement,
             expert_affinity_lookahead=self.expert_affinity_lookahead,
             expert_affinity_max_deferrals=self.expert_affinity_max_deferrals,
             expert_affinity_max_hint_age_tokens=self.expert_affinity_max_hint_age_tokens,
@@ -2378,6 +2429,23 @@ class ServerArgs:
                 host_engram=self.engram_host_table,
                 host_engram_layout=self.engram_host_table_layout,
                 load_format=self.load_format,
+                placement_feedback_supported=(
+                    expert_placement_requested(self)
+                    and self.ep_dispatch_algorithm == "static"
+                    and self.mapping.moe.ep_size > 1
+                    and self.mapping.moe.tp_size == 1
+                    and self.moe_backend in ("mega_moe", "deep_gemm_mega_moe")
+                    and (
+                        not self.enable_eplb
+                        or (
+                            checkpoint is not None
+                            and self.eplb_rebalance_layers_per_chunk
+                            == checkpoint.get("text_config", checkpoint).get(
+                                "num_hidden_layers"
+                            )
+                        )
+                    )
+                ),
             ),
         )
         if self.engram_hot_cache_capacity:
@@ -3108,8 +3176,16 @@ class ServerArgs:
             type=str,
             default=ServerArgs.eplb_algorithm,
             help="EPLB algorithm deriving the placement from a load record: "
-            "auto, deepseek or deepseek_hierarchical.",
+            "auto, deepseek, deepseek_hierarchical or trace.",
         )
+        parser.add_argument("--eplb-trace-window", type=int, default=None)
+        parser.add_argument("--eplb-trace-max-moved-slots", type=int, default=None)
+        parser.add_argument("--eplb-trace-movement-penalty", type=float, default=None)
+        parser.add_argument(
+            "--eplb-trace-min-relative-improvement", type=float, default=None
+        )
+        parser.add_argument("--eplb-trace-objective", type=str, default=None)
+        parser.add_argument("--eplb-trace-expert-costs", type=str, default=None)
         parser.add_argument(
             "--expert-distribution-recorder-mode",
             type=str,
@@ -3399,6 +3475,19 @@ class ServerArgs:
             help=(
                 "Maximum number of requests per DeepSeek V4 FlashMLA prefill " "chunk."
             ),
+        )
+        parser.add_argument("--prefill-work-budget-ms", type=float, default=None)
+        parser.add_argument(
+            "--prefill-work-linear-ms-per-token", type=float, default=None
+        )
+        parser.add_argument(
+            "--prefill-work-context-ms-per-token-squared", type=float, default=None
+        )
+        parser.add_argument(
+            "--prefill-work-quadratic-ms-per-token-squared", type=float, default=None
+        )
+        parser.add_argument(
+            "--expert-affinity-placement", action="store_true", default=False
         )
         parser.add_argument(
             "--expert-affinity",

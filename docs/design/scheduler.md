@@ -1225,3 +1225,46 @@ finished requests reject feedback and their records are removed at the next
 plan cleanup. Forward batches snapshot generations and expected completed
 frontiers before crossing the execution-thread boundary. No future routing,
 router change or extra model pass participates in scheduling.
+
+`SetExpertPlacement(epoch, expert_keys, rank_weights)` optionally changes the
+same affinity selector's score to the maximum predicted rank work after adding
+a candidate. Each successful request adds its logical support's per-rank work;
+repeated experts in different requests still add work. Rows may encode replica
+fractions and calibrated per-expert weights. Missing keys remain FIFO barriers.
+Publication validates the whole bounded map before replacing it, requires
+quiescent forwards, a strictly increasing positive epoch, and unchanged logical
+keys and rank count. Logical hints retain their generation/frontier identity
+across relocation; rank costs are rebuilt from the current map every plan.
+Without publication, affinity still uses the original union score. The runtime
+publishes an immutable CPU startup snapshot and complete EPLB updates; combining
+placement affinity with EPLB requires all layers to apply in one control op.
+For the supported replicated attention-TP layout, runtime weights count the
+physical owner selected by the production static mapper for every EP source
+rank. They sum to EP size, including the baseline replicated source-row work;
+replicas are not assumed to split work uniformly. The immutable startup snapshot
+includes actual replica ordering and EP node topology, and applied updates use
+the same ascending-slot reconstruction as the weight updater. These exact static
+destination counts weight predicted future logical supports, not measured time.
+
+## 7. Calibrated prefill work budget
+
+`ConfigurePrefillWorkBudget(budget_ms, linear, context, quadratic)` is an explicit
+opt-in for local prefill (fused/P). The cost in milliseconds is
+`linear*q + context*q*c + quadratic*q*q`, where `q` counts every forward input
+row, including replay, and `c` is the prefix before those input rows. The budget
+is positive and finite; coefficients are finite, nonnegative, and not all zero.
+No calibration or speed claim follows from accepting coefficients.
+
+Every successful prefill admission charges one shared round budget. Chunk sizing
+first finds the largest input count within the remaining predicted work, then
+uses the existing replay debit, final-window retention and cache-junction rules.
+The token cap and actual cache admission still bound every chunk; a failed
+admission charges nothing. The original incomplete-prefill priority and decode
+rules are unchanged. Remote D-role landing windows never use this local quota.
+
+When the first feasible prefill cannot fit the work budget, one minimum valid
+chunk may exceed it so a tiny budget cannot permanently stall a request. This
+exception applies only before any prefill progresses that round, still respects
+the token cap, and can carry an indivisible final replay window. The next round
+starts with a fresh budget. `last_prefill_work_ms` reports actual scheduled
+predicted work, and `prefill_work_overruns` counts these productive overruns.

@@ -6362,6 +6362,42 @@ protected:
     }
 };
 
+TEST_F(BoundedReplaySuite, WorkBudgetChargesReplayAndPreservesFinalWindow) {
+    scheduler_->ConfigurePrefillWorkBudget(32, 1, 0, 0);
+    const auto r1 = MakeRequestSpec("r1", 4);
+    RunLifecycle(r1);
+    auto tokens = r1.tokens;
+    const auto tail = MakeTokens(24, 901);
+    tokens.insert(tokens.end(), tail.begin(), tail.end());
+    Submit(MakeSpecWithTokens("r2", tokens));
+    auto plan = PlanOnce();
+    const auto* op = FindForwardBatch(plan);
+    ASSERT_NE(op, nullptr);
+    EXPECT_EQ(op->extend_replay_lens.at(0), 16);
+    // The nominal 16 new rows would leave a short final 8: retain 16.
+    EXPECT_EQ(op->input_lengths.at(0), 24);
+    EXPECT_DOUBLE_EQ(scheduler_->LastPrefillWorkMs(), 24);
+    SendForwardDone("r2", {});
+    plan = PlanOnce();
+    op = FindForwardBatch(plan);
+    ASSERT_NE(op, nullptr);
+    EXPECT_EQ(op->input_lengths.at(0), 16);
+    EXPECT_DOUBLE_EQ(scheduler_->LastPrefillWorkMs(), 16);
+}
+
+TEST_F(BoundedReplaySuite, TinyWorkBudgetEventuallyCarriesFinalReplayWindowWhole) {
+    scheduler_->ConfigurePrefillWorkBudget(0.01, 1, 0, 0);
+    Submit(MakeSpecWithTokens("r", MakeTokens(20, 1)));
+    for (int i = 0; i < 5; ++i) {
+        const auto plan = PlanOnce();
+        const auto* op = FindForwardBatch(plan);
+        ASSERT_NE(op, nullptr);
+        EXPECT_EQ(op->input_lengths.at(0), i == 4 ? 16 : 1);
+        SendForwardDone("r", i == 4 ? std::vector<std::int32_t>{99} : std::vector<std::int32_t>{});
+    }
+    EXPECT_EQ(scheduler_->PrefillWorkOverruns(), 5u);
+}
+
 TEST_F(BoundedReplaySuite, FirstChunkAfterHitReplaysWindow) {
     const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
     const RequestSpec r1 = MakeRequestSpec("r1", /*num_pages=*/4);  // 32 tokens

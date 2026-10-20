@@ -39,11 +39,15 @@ op and ``begin_manual_rebalance`` for ``POST /rebalance_experts``.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
+from collections.abc import Callable
+from pathlib import Path
 
 import torch
 
 from tokenspeed.runtime.moe import eplb_algorithms
+from tokenspeed.runtime.moe.eplb_algorithms.trace import TracePlacementOptions
 from tokenspeed.runtime.moe.expert_rebalance import (
     COMMIT_DELAY_FORWARDS,
     EplbApplyChunk,
@@ -84,6 +88,32 @@ def make_expert_rebalance_controller(
         raise RuntimeError(
             "the device side built an expert placement updater without --enable-eplb"
         )
+    trace_options = None
+    expert_costs = None
+    if server_args.eplb_algorithm == "trace":
+        trace_options = TracePlacementOptions(
+            max_steps=server_args.eplb_trace_window,
+            max_moved_slots=server_args.eplb_trace_max_moved_slots,
+            movement_penalty=server_args.eplb_trace_movement_penalty,
+            min_relative_improvement=server_args.eplb_trace_min_relative_improvement,
+            objective=server_args.eplb_trace_objective,
+        )
+        if server_args.eplb_trace_expert_costs is not None:
+            expert_costs = torch.tensor(
+                json.loads(Path(server_args.eplb_trace_expert_costs).read_text()),
+                dtype=torch.float64,
+            )
+            if tuple(expert_costs.shape) != (
+                specs.num_layers,
+                specs.num_logical_experts,
+            ):
+                raise ValueError(
+                    "EPLB measured costs must match [layers, logical experts]"
+                )
+            if not bool(torch.isfinite(expert_costs).all()) or bool(
+                (expert_costs < 0).any()
+            ):
+                raise ValueError("EPLB measured costs must be finite and nonnegative")
     return ExpertRebalanceController(
         specs,
         rebalance_num_iterations=server_args.eplb_rebalance_num_iterations,
@@ -95,6 +125,8 @@ def make_expert_rebalance_controller(
         ),
         commit_delay_forwards=COMMIT_DELAY_FORWARDS,
         compute_worker=PlacementComputeWorker() if specs.ep_rank == 0 else None,
+        trace_options=trace_options,
+        expert_costs=expert_costs,
     )
 
 
@@ -139,8 +171,10 @@ class EplbHooks:
         *,
         ep_cpu_group,
         ep_group_ranks: tuple[int, ...],
+        placement_applied: Callable[[int, torch.Tensor, int], None] | None = None,
     ) -> None:
         self._controller = controller
+        self._placement_applied = placement_applied
         self._request_handler = request_handler
         self._device = device
         self._ep_cpu_group = ep_cpu_group if len(ep_group_ranks) > 1 else None
@@ -179,7 +213,18 @@ class EplbHooks:
         elif isinstance(op, EplbApplyChunk):
             rows, moves = controller.chunk_payload(op.layer_ids)
             self._device.apply_expert_placement(op.layer_ids, rows, moves)
+            committed = (
+                controller.committed_placement
+                if self._placement_applied is not None
+                else None
+            )
             controller.on_chunk_applied(op.layer_ids)
+            if controller.is_idle and self._placement_applied is not None:
+                self._placement_applied(
+                    controller.placement_epoch,
+                    committed,
+                    controller.specs.num_local_physical_experts,
+                )
         else:
             raise TypeError(f"{type(op).__name__} is not an internal control op")
 
@@ -219,7 +264,34 @@ class EplbHooks:
                 # Every rank routed every token through identical tables, so
                 # the counters already are the group load -- and must agree.
                 self._assert_ranks_agree(physical)
-        controller.on_snapshot(physical, snapshot.physical_to_logical_map)
+        trace = snapshot.logical_trace
+        if controller.uses_trace and self._ep_cpu_group is not None:
+            # Shape/epoch agreement precedes variable-sized reductions. A short
+            # rank-local history must fail collectively rather than hang in gloo.
+            shape = tuple(trace.shape) if trace is not None else ()
+            identity = torch.tensor(
+                [*shape, snapshot.placement_epoch], dtype=torch.int64
+            )
+            self._assert_ranks_agree(identity)
+            self._assert_ranks_agree(snapshot.physical_to_logical_map)
+            if trace is None:
+                raise ValueError(
+                    "trace EPLB requires per-forward snapshots on every rank"
+                )
+            if controller.specs.all_to_all_ep:
+                torch.distributed.all_reduce(
+                    trace,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=self._ep_cpu_group,
+                )
+            else:
+                self._assert_ranks_agree(trace)
+        controller.on_snapshot(
+            physical,
+            snapshot.physical_to_logical_map,
+            logical_trace=trace,
+            placement_epoch=snapshot.placement_epoch,
+        )
 
     def _assert_ranks_agree(self, physical: torch.Tensor) -> None:
         """Fail loudly if replicated-input EP ranks counted different routes.

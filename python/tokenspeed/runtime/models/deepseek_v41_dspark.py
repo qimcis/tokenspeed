@@ -444,6 +444,8 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
 class DeepseekV41ForCausalLMDSpark(DeepseekV41ForCausalLM, TargetCaptureConfigurator):
     """Strict mtp-only adapter sharing embedding/head with its V4.1 target."""
 
+    supports_expert_placement = False
+
     def configure_target(self, target_model, target_config) -> None:
         """Install the checkpoint's target taps before draft execution exists."""
         del target_config

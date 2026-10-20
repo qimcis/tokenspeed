@@ -1879,6 +1879,15 @@ class ModelExecutor:
             device=self.device,
         )
 
+    def _record_expert_load_step(self) -> None:
+        from tokenspeed.runtime.moe.expert_location import (
+            get_global_expert_location_metadata,
+        )
+
+        placement = get_global_expert_location_metadata()
+        if placement is not None:
+            placement.record_load_step()
+
     def execute_idle_forward(self, dp_metadata: DpForwardMetadata):
         """Run a zero-token forward so this rank participates in NCCL collectives.
 
@@ -1946,6 +1955,7 @@ class ModelExecutor:
                         # No request, so no group tables on either side.
                         block_tables_cpu={},
                     )
+                self._record_expert_load_step()
                 return
 
             # Run model forward with IDLE mode — skips attention but still
@@ -1958,6 +1968,8 @@ class ModelExecutor:
                 positions=empty,
                 **self._model_input_kwargs(0, 0, slice(0, 0)),
             )
+
+            self._record_expert_load_step()
 
             # If a drafter is active, its model also has MoE layers that issue
             # NCCL collectives. Idle ranks must match those collectives: the
@@ -2534,6 +2546,9 @@ class ModelExecutor:
                         block_tables=block_tables,
                         block_tables_cpu=block_tables_cpu,
                     )
+                    # Outside capture, on execution_stream, once per replay.
+                    # Idle peers also append a step to keep EP traces aligned.
+                    self._record_expert_load_step()
                     if timing_enabled:
                         forward_step_ms = (
                             time.perf_counter() - forward_step_start

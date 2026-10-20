@@ -206,3 +206,15 @@ Repeated close calls may wait for cleanup but do not extend the drain deadline.
 A blocked filesystem write cannot be interrupted; close bounds the caller's wait,
 and the daemon releases its file after the write returns. Forced process exit can
 lose buffered observations. This reporter is diagnostic, not a durable audit log.
+
+### Encoder work observations
+
+With metrics enabled, encode TP rank zero emits `tokenspeed:encoder_*`
+queue and in-flight patch gauges plus cumulative cache-hit, completed-patch,
+and failed-patch counter deltas through the configured reporters. Input patches
+come from CPU preprocessing metadata; unknown counts remain an explicit item
+gauge. Completed patches describe encoder forward work, not transfer completion.
+These observations retain actual units and do not infer throughput, latency,
+cache-hit token lengths, or worker free capacity. The observer keeps constant
+state, and the reporter owns bounded asynchronous output. Other TP ranks do not
+publish duplicate copies of the same worker's observations.

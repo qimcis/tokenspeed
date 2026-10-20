@@ -37,6 +37,7 @@ from tokenspeed_kernel.thirdparty.cuda import routing_flash as cuda_routing_flas
 
 from tokenspeed.runtime.moe.dispatch_algorithm import STATIC_EP_DISPATCH_ALGORITHMS
 from tokenspeed.runtime.moe.expert_load_rows import LayerExpertLoad
+from tokenspeed.runtime.moe.rank_dispatch import dispatch_rank_local_topk_ids
 from tokenspeed.runtime.utils.env import envs, global_server_args_dict
 
 
@@ -209,8 +210,8 @@ def _topk_ids_logical_to_physical_static(
 ) -> torch.Tensor:
     if info.replica_dispatch is not None:
         return dispatch_topk_ids(topk_ids, info.replica_dispatch)
-    return info.partial_logical_to_rank_dispatch_physical_map[topk_ids].to(
-        topk_ids.dtype
+    return dispatch_rank_local_topk_ids(
+        topk_ids, info.partial_logical_to_rank_dispatch_physical_map
     )
 
 

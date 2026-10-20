@@ -145,6 +145,60 @@ TEST_F(ExpertAffinitySuite, UnsupportedModesRejectAffinityEarly) {
     EXPECT_THROW(speculative.ConfigureExpertAffinity(4, 1, 8), std::invalid_argument);
 }
 
+TEST_F(ExpertAffinitySuite, PlacementBalancesRankWorkAndRetainsLogicalHintsAcrossEpochs) {
+    Ready(true);
+    ASSERT_TRUE(Hint("a", 1));
+    ASSERT_TRUE(Hint("b", 1));
+    ASSERT_TRUE(Hint("c", 2));
+    scheduler_->SetExpertPlacement(1, {1, 2}, {{1, 0}, {0, 1}});
+    auto first = PlanOnce();
+    EXPECT_EQ(FindForwardBatch(first)->request_ids, (std::vector<std::string>{"b", "c"}));
+    EXPECT_THROW(scheduler_->SetExpertPlacement(2, {1, 2}, {{0, 1}, {1, 0}}), std::invalid_argument);
+    Complete(first);
+    const auto generation = scheduler_->RequestGeneration("a");
+    scheduler_->SetExpertPlacement(2, {1, 2}, {{0.5, 0.5}, {1, 0}});
+    EXPECT_EQ(scheduler_->RequestGeneration("a"), generation);
+    EXPECT_EQ(scheduler_->ExpertPlacementEpoch(), 2u);
+    EXPECT_THROW(scheduler_->SetExpertPlacement(2, {1, 2}, {{1, 0}, {0, 1}}), std::invalid_argument);
+    EXPECT_THROW(scheduler_->SetExpertPlacement(3, {1}, {{1, 0}}), std::invalid_argument);
+    EXPECT_EQ(scheduler_->ExpertPlacementEpoch(), 2u);
+    auto next = PlanOnce();
+    EXPECT_EQ(FindForwardBatch(next)->request_ids.front(), "a");
+}
+
+TEST_F(ExpertAffinitySuite, PlacementMissingKeysRemainFifoBarriers) {
+    Ready(true);
+    ASSERT_TRUE(Hint("a", 1));
+    ASSERT_TRUE(Hint("b", 1));
+    ASSERT_TRUE(Hint("c", 9));
+    scheduler_->SetExpertPlacement(1, {1, 2}, {{1, 0}, {0, 1}});
+    auto plan = PlanOnce();
+    EXPECT_EQ(FindForwardBatch(plan)->request_ids, (std::vector<std::string>{"b", "c"}));
+}
+
+TEST_F(ExpertAffinitySuite, WorkBudgetSharedAndTinyBudgetProgress) {
+    scheduler_->ConfigurePrefillWorkBudget(3, 1, 0, 0);
+    Submit(std::vector<RequestSpec>{{.request_id = "a", .tokens = {1, 2}, .max_new_tokens = 2},
+                                    {.request_id = "b", .tokens = {3, 4, 5}, .max_new_tokens = 2}});
+    auto plan = PlanOnce();
+    EXPECT_EQ(FindForwardBatch(plan)->input_lengths, (std::vector<std::int32_t>{2, 1}));
+    EXPECT_DOUBLE_EQ(scheduler_->LastPrefillWorkMs(), 3);
+    EXPECT_EQ(scheduler_->PrefillWorkOverruns(), 0u);
+}
+
+TEST_F(ExpertAffinitySuite, TinyBudgetNeverStallsAndContextChangesQuota) {
+    scheduler_->ConfigurePrefillWorkBudget(0.01, 1, 1, 1);
+    Submit(RequestSpec{.request_id = "a", .tokens = {1, 2, 3}, .max_new_tokens = 2});
+    for (int i = 0; i < 3; ++i) {
+        auto plan = PlanOnce();
+        ASSERT_NE(FindForwardBatch(plan), nullptr);
+        EXPECT_EQ(FindForwardBatch(plan)->input_lengths, (std::vector<std::int32_t>{1}));
+        EXPECT_DOUBLE_EQ(scheduler_->LastPrefillWorkMs(), 2 + i);
+        SendForwardDone("a", i == 2 ? std::vector<std::int32_t>{11} : std::vector<std::int32_t>{});
+    }
+    EXPECT_EQ(scheduler_->PrefillWorkOverruns(), 3u);
+}
+
 TEST_F(ExpertAffinitySuite, RejectsLateConfigurationAndUnboundedWindows) {
     EXPECT_THROW(scheduler_->ConfigureExpertAffinity(2, 1, 8), std::invalid_argument);
     EXPECT_THROW(scheduler_->ConfigureExpertAffinity(257, 1, 8), std::invalid_argument);

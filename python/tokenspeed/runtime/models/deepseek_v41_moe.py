@@ -41,14 +41,19 @@ from tokenspeed.runtime.layers.linear import (
 )
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.topk import (
+    ExpertLocationDispatchInfo,
     StandardTopKOutput,
     TopK,
     TopKOutput,
+    record_expert_load,
     simulated_router_logits,
+    topk_ids_logical_to_physical,
 )
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType, get_moe_backend
 from tokenspeed.runtime.layers.quantization import Fp8Config, Mxfp4Config
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.models.v41_expert_placement import validate_v41_placement
+from tokenspeed.runtime.moe.expert_location import get_global_expert_location_metadata
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import global_server_args_dict
@@ -277,38 +282,40 @@ class DeepseekV4MoE(nn.Module):
         # Petit's VMM-backed collective and auxiliary-stream shared experts do
         # not replay safely together. Keep both branches on the main stream.
         self.stream_fork = StreamFork(None if self.use_gluon_petit else aux_stream)
-        if mapping.moe.ep_size > 1:
+        self.expert_placement = get_global_expert_location_metadata()
+        if self.expert_placement is not None:
+            validate_v41_placement(
+                num_logical_experts=config.n_routed_experts,
+                layer_index=layer_index,
+                ep_size=mapping.moe.ep_size,
+                ep_rank=mapping.moe.ep_rank,
+                tp_size=mapping.moe.tp_size,
+                use_mega_moe=self.use_mega_moe,
+                expert_dtype=getattr(config, "expert_dtype", None),
+                dispatch_algorithm=global_server_args_dict["ep_dispatch_algorithm"],
+                placement=self.expert_placement,
+                eager=global_server_args_dict["enforce_eager"],
+                prefill_graph_disabled=global_server_args_dict["disable_prefill_graph"],
+                overlap_disabled=global_server_args_dict["disable_overlap_schedule"],
+            )
+        if self.use_mega_moe:
+            if mapping.moe.ep_size <= 1:
+                raise ValueError("DeepSeek V4 MegaMoE requires expert parallelism.")
+            if mapping.moe.tp_size != 1:
+                raise ValueError("DeepSeek V4 MegaMoE does not support mixed TP/EP.")
+        elif mapping.moe.ep_size > 1:
             if global_server_args_dict.get("enable_eplb", False):
+                raise ValueError("DeepSeek V4 normal EP does not support EPLB.")
+            if global_server_args_dict.get("ep_num_redundant_experts", 0):
                 raise ValueError(
-                    "DeepSeek V4 EP does not support EPLB with precomputed routing."
+                    "DeepSeek V4 normal EP does not support redundant experts."
                 )
             if global_server_args_dict.get("init_expert_location", "trivial") not in (
                 None,
                 "trivial",
             ):
                 raise ValueError(
-                    "DeepSeek V4 EP requires trivial expert placement with "
-                    "precomputed routing."
-                )
-        if self.use_mega_moe:
-            if mapping.moe.ep_size <= 1:
-                raise ValueError("DeepSeek V4 MegaMoE requires expert parallelism.")
-            if mapping.moe.tp_size != 1:
-                raise ValueError("DeepSeek V4 MegaMoE does not support mixed TP/EP.")
-            if global_server_args_dict.get("ep_num_redundant_experts", 0):
-                raise ValueError(
-                    "DeepSeek V4 MegaMoE does not support redundant EP experts."
-                )
-            if config.n_routed_experts % mapping.moe.ep_size != 0:
-                raise ValueError(
-                    "DeepSeek V4 MegaMoE requires n_routed_experts divisible by "
-                    "EP size."
-                )
-        elif mapping.moe.ep_size > 1:
-            if global_server_args_dict.get("ep_num_redundant_experts", 0):
-                raise ValueError(
-                    "DeepSeek V4 normal EP does not support redundant experts "
-                    "with precomputed routing."
+                    "DeepSeek V4 normal EP requires trivial expert placement."
                 )
             if mapping.attn.tp_size not in (1, mapping.moe.tp_ep_size):
                 raise ValueError(
@@ -354,7 +361,11 @@ class DeepseekV4MoE(nn.Module):
         )
         self.experts = MoELayer(
             top_k=config.num_experts_per_tok,
-            num_experts=config.n_routed_experts,
+            num_experts=(
+                config.n_routed_experts
+                if self.expert_placement is None
+                else self.expert_placement.num_physical_experts
+            ),
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             quant_config=routed_quant_config,
@@ -386,6 +397,29 @@ class DeepseekV4MoE(nn.Module):
             hash_routing=self.gate.tid2eid is not None,
             weights_dtype=self.experts.topk_weights_dtype,
         )
+
+        self.expert_dispatch_info: ExpertLocationDispatchInfo | None = None
+        if self.expert_placement is not None:
+            if not self.experts.supports_all_to_all_ep:
+                raise RuntimeError(
+                    "V4.1 expert placement requires the updated tokenspeed-kernel "
+                    "MXFP4 MegaMoE ownership capability"
+                )
+            # The selected plan reports actual token ownership, including
+            # MegaMoE's internal dispatch/combine without external DeepEP.
+            self.expert_dispatch_info = ExpertLocationDispatchInfo.init_new(
+                layer_id=layer_index,
+                ep_dispatch_algorithm=global_server_args_dict["ep_dispatch_algorithm"],
+                expert_location_metadata=self.expert_placement,
+                all_to_all_ep=self.experts.supports_all_to_all_ep,
+            )
+
+    def get_moe_routed_weights(self) -> list[torch.Tensor]:
+        if not self.use_mega_moe or not self.experts._weights_processed:
+            raise RuntimeError("V4.1 EPLB requires processed MegaMoE expert weights")
+        from tokenspeed_kernel.ops.moe import moe_expert_slot_tensors
+
+        return list(moe_expert_slot_tensors(self.experts.plan, self.experts))
 
     def warmup(self) -> None:
         warmup = self.experts.plan.get("warmup")
@@ -445,6 +479,16 @@ class DeepseekV4MoE(nn.Module):
         max_num_tokens_per_gpu: int,
         do_finalize: bool,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.expert_dispatch_info is not None:
+            # TopK hooks observe logical IDs. Convert only at the expert boundary
+            # so replicas never change router probabilities or top-k cardinality.
+            ids = topk_ids_logical_to_physical(
+                topk_output.topk_ids,
+                self.expert_dispatch_info,
+                self.config.n_routed_experts,
+            )
+            record_expert_load(self.expert_dispatch_info.load, ids)
+            topk_output = topk_output._replace(topk_ids=ids)
         return self.experts(
             hidden_states=hidden_states,
             topk_output=topk_output,

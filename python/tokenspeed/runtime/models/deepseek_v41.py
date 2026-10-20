@@ -156,7 +156,14 @@ from tokenspeed.runtime.models.deepseek_v41_engram import (
 )
 from tokenspeed.runtime.models.deepseek_v41_moe import DeepseekV4MLP, DeepseekV4MoE
 from tokenspeed.runtime.models.deepseek_v41_vision import DeepseekV41Vision
-from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
+from tokenspeed.runtime.models.v41_expert_placement import (
+    local_logical_experts,
+    pad_expert_tensor,
+)
+from tokenspeed.runtime.moe.expert_location import (
+    ModelConfigForExpertLocation,
+    get_global_expert_location_metadata,
+)
 from tokenspeed.runtime.multimodal.embedder import (
     EncoderSpec,
     VisionEmbedder,
@@ -2084,6 +2091,7 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
     """V4.1 language and vision model with strict checkpoint coverage."""
 
     model_cls = DeepseekV41Model
+    supports_expert_placement = True
 
     def __init__(
         self,
@@ -2093,6 +2101,25 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
         is_multimodal_active: bool,
         mm_attention_backend: str | None,
     ) -> None:
+        if get_global_expert_location_metadata() is not None:
+            # New kernel storage API is required only by placement. Check it
+            # before constructing any model weights; baseline wheels stay usable.
+            try:
+                from tokenspeed_kernel.ops.moe import moe_expert_slot_tensors
+            except ImportError as exc:
+                raise RuntimeError(
+                    "V4.1 expert placement requires updated tokenspeed-kernel "
+                    "with processed expert slot storage support"
+                ) from exc
+            if not callable(moe_expert_slot_tensors):
+                raise RuntimeError("invalid tokenspeed-kernel expert slot storage API")
+        if (
+            getattr(config, "encoder_only", False)
+            and get_global_expert_location_metadata() is not None
+        ):
+            raise ValueError(
+                "V4.1 encoder-only workers do not own routed expert placement"
+            )
         super().__init__(
             config=config,
             mapping=mapping,
@@ -2122,6 +2149,21 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                     )
             self.vision_embedder = VisionEmbedder(encoder_mapping=mapping.vision)
             self.image_encoder = self.vision.embed_media
+
+    @property
+    def expert_placement(self):
+        if self.model is None or not self.model.layers:
+            return None
+        return self.model.layers[0].ffn.expert_placement
+
+    @property
+    def routed_experts_weights_of_layer(self) -> dict[int, list[torch.Tensor]]:
+        if self.model is None:
+            return {}
+        return {
+            layer.ffn.layer_index: layer.ffn.get_moe_routed_weights()
+            for layer in self.model.layers
+        }
 
     def initialize_engram(self, tokenizer) -> None:
         if self.model is not None:
@@ -2275,10 +2317,13 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                     "weight_scale",
                 ):
                     raise ValueError(f"Unsupported V4.1 expert parameter: {name}")
-                count = self.model.config.n_routed_experts // self.mapping.moe.ep_size
-                for expert in range(
-                    self.mapping.moe.ep_rank * count,
-                    (self.mapping.moe.ep_rank + 1) * count,
+                layer_id = int(prefix.split(".")[1])
+                for expert in local_logical_experts(
+                    self.expert_placement,
+                    layer_id=layer_id,
+                    num_experts=self.model.config.n_routed_experts,
+                    ep_rank=self.mapping.moe.ep_rank,
+                    ep_size=self.mapping.moe.ep_size,
                 ):
                     for shard in ("w1", "w3") if projection == "w13" else ("w2",):
                         field = "scale" if suffix == "weight_scale" else "weight"
@@ -2413,7 +2458,12 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                 extra_names={},
             ),
             fused_schema=None,
-            num_experts=config.n_routed_experts,
+            num_experts=(
+                config.n_routed_experts
+                if self.expert_placement is None
+                else self.expert_placement.num_physical_experts
+            ),
+            expert_placement=self.expert_placement,
             ep_rank=self.mapping.moe.ep_rank,
             ep_size=self.mapping.moe.ep_size,
             fused_gate_up_as_w13=False,
@@ -2462,28 +2512,33 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                     raise TypeError(
                         f"{raw_name}: expected packed FP4/E8M0, got {tensor.dtype}"
                     )
-                local_count = config.n_routed_experts // self.mapping.moe.ep_size
-                if expert_id // local_count != self.mapping.moe.ep_rank:
+                if expert_id not in local_logical_experts(
+                    self.expert_placement,
+                    layer_id=layer_id,
+                    num_experts=config.n_routed_experts,
+                    ep_rank=self.mapping.moe.ep_rank,
+                    ep_size=self.mapping.moe.ep_size,
+                ):
                     skipped["remote_expert"] += 1
                     continue
                 if name not in targets:
                     raise ValueError(f"Unexpected V4.1 expert tensor: {raw_name}")
-                tensor = tensor.view(torch.uint8)
                 ffn = self.model.layers[layer_id].ffn
+                tensor = pad_expert_tensor(
+                    tensor,
+                    projection=expert[3],
+                    is_scale=expert[4] == "scale",
+                    intermediate_size=config.moe_intermediate_size,
+                    padded_intermediate_size=(
+                        ffn.experts.intermediate_size
+                        if ffn.use_mega_moe
+                        else config.moe_intermediate_size
+                    ),
+                )
+                # A full checkpoint reload overwrites the in-place processed
+                # layout. Rebuild it once after all six constituents land.
                 if ffn.use_mega_moe:
-                    extra = ffn.experts.intermediate_size - config.moe_intermediate_size
-                    if extra:
-                        padding = (
-                            (0, extra // (32 if expert[4] == "scale" else 2))
-                            if expert[3] == "w2"
-                            else (0, 0, 0, extra)
-                        )
-                        tensor = F.pad(
-                            tensor,
-                            padding,
-                            mode="constant",
-                            value=127 if expert[4] == "scale" else 0,
-                        )
+                    ffn.experts._weights_processed = False
                 mapped = "model." + name.replace(".scale", ".weight_scale")
                 moe_loader.load(mapped, tensor)
             elif name.endswith((".attn.wo_a.weight", ".attn.wo_a.scale")):

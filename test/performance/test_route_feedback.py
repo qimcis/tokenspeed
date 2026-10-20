@@ -214,7 +214,8 @@ def test_completed_routes_are_identical_on_real_cpu_replicas(tmp_path):
     )
 
 
-def test_captured_routes_drive_real_scheduler_and_reject_old_lifetimes():
+@pytest.mark.parametrize("placement", [False, True])
+def test_captured_routes_drive_real_scheduler_and_reject_old_lifetimes(placement):
     ts = pytest.importorskip("tokenspeed_scheduler")
     config = ts.SchedulerConfig()
     config.role = ts.SchedulerConfig.Role.Fused
@@ -293,8 +294,27 @@ def test_captured_routes_drive_real_scheduler_and_reject_old_lifetimes():
             )
             if row.request_id == "a":
                 old_observation = row
+    if placement:
+        from tokenspeed.runtime.engine.route_feedback_hooks import (
+            PlacementFeedbackHooks,
+        )
+
+        publisher = PlacementFeedbackHooks(
+            scheduler, layer_ids=(2,), ep_rank_nodes=(0, 0)
+        )
+        publisher.publish(
+            1,
+            ((0, 0, 1, 1),),
+            2,
+            logical_to_all_physical=(((1, 0), (3, 2)),),
+        )
+        with pytest.raises(ValueError):
+            publisher.publish(2, ((0, 0, 2, 2),), 2)
+        assert scheduler.expert_placement_epoch() == 1
+        publisher.publish(2, torch.tensor([[1, 1, 0, 0]]), 2)
+        assert scheduler.expert_placement_epoch() == 2
     grouped = scheduler.next_execution_plan().forward[0]
-    assert tuple(grouped.request_ids) == ("b", "a")
+    assert tuple(grouped.request_ids) == (("b", "c") if placement else ("b", "a"))
     complete(grouped)
     events = ts.ExecutionEvent()
     finish_event = ts.ForwardEvent.Abort()
@@ -310,3 +330,37 @@ def test_captured_routes_drive_real_scheduler_and_reject_old_lifetimes():
         old_observation.computed_frontier,
         list(old_observation.expert_keys),
     )
+
+
+@pytest.mark.parametrize(
+    ("nodes", "replicas", "expected"),
+    [
+        (
+            (0, 0, 0, 0),
+            [[0, 1, 6], [2, 3], [4, 5, 7]],
+            [[3, 0, 0, 1], [0, 4, 0, 0], [0, 0, 3, 1]],
+        ),
+        (
+            (0, 0, 1, 1),
+            [[0, 1, 6], [2, 3], [4, 5, 7]],
+            [[2, 0, 0, 2], [0, 4, 0, 0], [0, 0, 3, 1]],
+        ),
+        (
+            (0, 0, 0, 0),
+            [[6, 1, 0], [2, 3], [4, 5, 7]],
+            [[1, 0, 0, 3], [0, 4, 0, 0], [0, 0, 3, 1]],
+        ),
+    ],
+)
+def test_static_placement_work_counts_sources_not_uniform_replicas(
+    nodes, replicas, expected
+):
+    from tokenspeed.runtime.engine.route_feedback_hooks import (
+        _replicated_static_rank_work,
+    )
+
+    actual = _replicated_static_rank_work([replicas], 2, nodes)
+    assert actual == expected
+    assert all(sum(row) == len(nodes) for row in actual)
+    # Two copies on rank zero do not execute twice for a single source.
+    assert actual[0][0] != 4 * 2 / 3

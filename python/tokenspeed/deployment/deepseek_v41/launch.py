@@ -149,6 +149,8 @@ def validate_ports(manifest: dict) -> None:
     workers start. Upstream also chooses dynamic NCCL and Mooncake rank ports.
     """
     ports = [manifest["ports"]["gateway"], manifest["ports"]["gateway_metrics"]]
+    if "router" in manifest["ports"]:
+        ports.append(manifest["ports"]["router"])
     for worker in manifest["ports"]["workers"].values():
         ports.extend([worker["grpc"], *worker["control_cluster"]])
         if worker["bootstrap"] is not None:
@@ -358,10 +360,17 @@ def run(
     try:
         for sig in (signal.SIGINT, signal.SIGTERM):
             old_handlers[sig] = signal.signal(sig, stop)
-        for command in manifest["commands"][:-1]:
+        workers = [
+            command
+            for command in manifest["commands"]
+            if command["role"] not in ("gateway", "router")
+        ]
+        for command in workers:
             group.start(command, directory)
-        asyncio.run(_wait_workers(manifest["commands"][:-1], group, startup_timeout))
-        gateway = manifest["commands"][-1]
+        asyncio.run(_wait_workers(workers, group, startup_timeout))
+        gateway = next(
+            command for command in manifest["commands"] if command["role"] == "gateway"
+        )
         group.start(gateway, directory)
         deadline = time.monotonic() + startup_timeout
         while True:
@@ -378,8 +387,35 @@ def run(
             if time.monotonic() >= deadline:
                 raise TimeoutError("gateway did not serve the configured model")
             time.sleep(0.2)
+        router = next(
+            (
+                command
+                for command in manifest["commands"]
+                if command["role"] == "router"
+            ),
+            None,
+        )
+        if router is not None:
+            group.start(router, directory)
+            deadline = time.monotonic() + startup_timeout
+            while True:
+                group.check()
+                try:
+                    with urlopen(
+                        f"http://127.0.0.1:{router['port']}/v1/models", timeout=2
+                    ) as response:
+                        models = json.load(response)["data"]
+                    if any(model["id"] == config.served_model_name for model in models):
+                        break
+                except (URLError, TimeoutError, KeyError, json.JSONDecodeError):
+                    pass
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        "routing proxy did not serve the configured model"
+                    )
+                time.sleep(0.2)
         (directory / "ready.json").write_text(
-            json.dumps({"model": config.served_model_name, "port": gateway["port"]})
+            json.dumps({"model": config.served_model_name, "port": config.base_port})
             + "\n"
         )
         while True:

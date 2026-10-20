@@ -25,6 +25,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cmath>
 #include <limits>
 #include <span>
 #include <stdexcept>
@@ -326,7 +327,7 @@ void Scheduler::markKvEventBoundaryForReconcile(const CacheKey& boundary) {
 
 void Scheduler::ConfigureExpertAffinity(std::int32_t lookahead, std::int32_t max_deferrals,
                                         std::int32_t max_hint_age_tokens) {
-    if (!requests_.empty() || next_request_generation_ != 0) {
+    if (submitted_requests_) {
         throw std::invalid_argument("Expert affinity must be configured before submitting requests");
     }
     if (lookahead < 2 || lookahead > 256 || max_deferrals < 1 || max_deferrals > 1024 || max_hint_age_tokens < 1 ||
@@ -344,6 +345,56 @@ void Scheduler::ConfigureExpertAffinity(std::int32_t lookahead, std::int32_t max
             "Expert affinity requires fused/D ordinary non-overlapped decode without mixed prefill");
     }
     expert_affinity_ = ExpertAffinityConfig{lookahead, max_deferrals, max_hint_age_tokens};
+}
+
+void Scheduler::SetExpertPlacement(std::uint64_t epoch, std::vector<std::uint64_t> expert_keys,
+                                   std::vector<std::vector<double>> rank_weights) {
+    if (!expert_affinity_) throw std::invalid_argument("Expert placement requires expert affinity");
+    if (epoch == 0 || (expert_placement_ && epoch <= expert_placement_->epoch))
+        throw std::invalid_argument("Expert placement epoch must increase");
+    if (std::ranges::any_of(requests_, [](const auto& r) { return r->ResultsInFlight() != 0; }))
+        throw std::invalid_argument("Expert placement requires quiescent forwards");
+    if (expert_keys.empty() || expert_keys.size() > 65536 || rank_weights.size() != expert_keys.size() ||
+        rank_weights.front().empty() || rank_weights.front().size() > 256 ||
+        expert_keys.size() * rank_weights.front().size() > 4194304)
+        throw std::invalid_argument("Expert placement must have bounded nonempty keys and rank rows");
+    ExpertPlacementModel next{epoch, rank_weights.front().size(), {}};
+    for (std::size_t i = 0; i < expert_keys.size(); ++i) {
+        auto& row = rank_weights[i];
+        if (row.size() != next.num_ranks ||
+            !std::ranges::all_of(row, [](double w) { return std::isfinite(w) && w >= 0 && w <= 1e12; }) ||
+            !std::ranges::any_of(row, [](double w) { return w > 0; }) ||
+            !next.rank_weights.emplace(expert_keys[i], std::move(row)).second)
+            throw std::invalid_argument("Expert placement rows require unique keys and finite nonnegative work");
+    }
+    if (expert_placement_) {
+        if (next.num_ranks != expert_placement_->num_ranks ||
+            next.rank_weights.size() != expert_placement_->rank_weights.size())
+            throw std::invalid_argument("Placement changes must preserve logical expert identity");
+        for (const auto& [key, row] : expert_placement_->rank_weights)
+            if (!next.rank_weights.contains(key))
+                throw std::invalid_argument("Placement changes must preserve logical expert identity");
+    }
+    expert_placement_ = std::move(next);
+}
+
+void Scheduler::ConfigurePrefillWorkBudget(double budget_ms, double linear_ms_per_token,
+                                           double context_ms_per_token_squared, double quadratic_ms_per_token_squared) {
+    if (submitted_requests_ || config_.role == Role::kD)
+        throw std::invalid_argument("Prefill work budget requires local prefill and configuration before submission");
+    if (!std::isfinite(budget_ms) || budget_ms <= 0 || !std::isfinite(linear_ms_per_token) || linear_ms_per_token < 0 ||
+        !std::isfinite(context_ms_per_token_squared) || context_ms_per_token_squared < 0 ||
+        !std::isfinite(quadratic_ms_per_token_squared) || quadratic_ms_per_token_squared < 0 ||
+        (linear_ms_per_token == 0 && context_ms_per_token_squared == 0 && quadratic_ms_per_token_squared == 0))
+        throw std::invalid_argument(
+            "Prefill work requires positive finite milliseconds and nonnegative finite coefficients");
+    const double q = config_.max_scheduled_tokens;
+    const double c = max_single_request_tokens_;
+    if (!std::isfinite(linear_ms_per_token * q + context_ms_per_token_squared * q * c +
+                       quadratic_ms_per_token_squared * q * q))
+        throw std::invalid_argument("Prefill work model overflows the configured token capacity");
+    prefill_work_ =
+        PrefillWorkConfig{budget_ms, linear_ms_per_token, context_ms_per_token_squared, quadratic_ms_per_token_squared};
 }
 
 std::uint64_t Scheduler::RequestGeneration(const std::string& request_id) const {
@@ -418,6 +469,7 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
         FatalCheck(inserted, "validated request id became duplicate before insertion");
         invalidateExpertRoute(*pending_requests[i]);
         requests_.push_back(std::move(pending_requests[i]));
+        submitted_requests_ = true;
     }
 }
 

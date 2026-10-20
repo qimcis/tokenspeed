@@ -64,8 +64,18 @@ from enum import Enum
 import torch
 
 from tokenspeed.runtime.moe.eplb_algorithms import EplbAlgorithm
-from tokenspeed.runtime.moe.expert_location import load_balancedness, logical_count_of
-from tokenspeed.runtime.moe.placement_maps import compute_placement_maps
+from tokenspeed.runtime.moe.eplb_algorithms.trace import (
+    TracePlacementOptions,
+    TracePlacementResult,
+    compute_trace_placement,
+    validate_placement,
+    validate_trace,
+)
+from tokenspeed.runtime.moe.placement_maps import (
+    compute_placement_maps,
+    load_balancedness,
+    logical_count_of,
+)
 
 __all__ = [
     "COMMIT_DELAY_FORWARDS",
@@ -118,6 +128,12 @@ class PlacementComputeWorker:
         if logical_count.device.type != "cpu":
             raise ValueError("the placement worker takes host tensors only")
         return self._pool.submit(compute_placement_maps, logical_count, **kwargs)
+
+    def submit_trace(self, logical_trace: torch.Tensor, **kwargs) -> Future:
+        """Schedule bounded per-step optimization in the same spawned worker."""
+        if logical_trace.device.type != "cpu":
+            raise ValueError("the placement worker takes host tensors only")
+        return self._pool.submit(compute_trace_placement, logical_trace, **kwargs)
 
     def wait_ready(self, timeout: float | None = None) -> None:
         """Block until the worker process is up (tests and startup checks)."""
@@ -421,6 +437,8 @@ class ExpertRebalanceController:
         algorithm: EplbAlgorithm,
         commit_delay_forwards: int,
         compute_worker: PlacementComputeWorker | None,
+        trace_options: TracePlacementOptions | None = None,
+        expert_costs: torch.Tensor | None = None,
     ) -> None:
         """
         Args:
@@ -443,6 +461,16 @@ class ExpertRebalanceController:
                 "EP rank 0 derives the placement and needs a compute worker; "
                 "every other rank takes the broadcast map and must not have one"
             )
+        if (algorithm is EplbAlgorithm.trace) != (trace_options is not None):
+            raise ValueError(
+                "trace EPLB requires explicit trace options, only for that algorithm"
+            )
+        if expert_costs is not None and trace_options is None:
+            raise ValueError("expert costs require trace EPLB")
+        self._trace_options = trace_options
+        self._expert_costs = expert_costs
+        self.last_trace_result: TracePlacementResult | None = None
+        self.placement_epoch = 0
         self.specs = specs
         self._interval = rebalance_num_iterations
         self._commit_delay = commit_delay_forwards
@@ -465,6 +493,10 @@ class ExpertRebalanceController:
         self.rebalances_completed = 0
 
     # -------------------------------- round driving -------------------------------
+
+    @property
+    def uses_trace(self) -> bool:
+        return self._algorithm is EplbAlgorithm.trace
 
     @property
     def commit_delay_forwards(self) -> int:
@@ -515,7 +547,12 @@ class ExpertRebalanceController:
     # -------------------------------- op results ----------------------------------
 
     def on_snapshot(
-        self, physical_count: torch.Tensor, physical_to_logical_map: torch.Tensor
+        self,
+        physical_count: torch.Tensor,
+        physical_to_logical_map: torch.Tensor,
+        *,
+        logical_trace: torch.Tensor | None = None,
+        placement_epoch: int = 0,
     ) -> None:
         """Take the group-wide load; start the computation; schedule the commit.
 
@@ -532,7 +569,35 @@ class ExpertRebalanceController:
             raise ValueError(
                 f"expert load has shape {tuple(physical_count.shape)}, expected {expected}"
             )
-        self._old_map = physical_to_logical_map.to(device="cpu", dtype=torch.int32)
+        if self.uses_trace:
+            if logical_trace is None:
+                raise ValueError(
+                    "trace EPLB requires a per-forward logical trace snapshot"
+                )
+            validate_trace(
+                logical_trace,
+                options=self._trace_options,
+                expert_costs=self._expert_costs,
+            )
+            if tuple(logical_trace.shape[1:]) != (
+                specs.num_layers,
+                specs.num_logical_experts,
+            ):
+                raise ValueError("trace dimensions do not match the placement geometry")
+        validate_placement(
+            physical_to_logical_map,
+            layers=specs.num_layers,
+            experts=specs.num_logical_experts,
+            ep_size=specs.ep_size,
+        )
+        if tuple(physical_to_logical_map.shape) != expected:
+            raise ValueError(
+                "snapshot placement dimensions do not match the slot geometry"
+            )
+        self.placement_epoch = placement_epoch
+        self._old_map = physical_to_logical_map.to(
+            device="cpu", dtype=torch.int32
+        ).clone()
         self._logical_count = logical_count_of(
             physical_count.cpu(), self._old_map, specs.num_logical_experts
         )
@@ -543,14 +608,27 @@ class ExpertRebalanceController:
             f"mean {before.mean():.3f}; commit in {self._commit_delay} forwards"
         )
         if self._compute_worker is not None:
-            self._future = self._compute_worker.submit(
-                self._logical_count,
-                num_physical_experts=specs.num_physical_experts,
-                ep_size=specs.ep_size,
-                num_groups=specs.num_groups,
-                num_nodes=specs.num_nodes,
-                algorithm=self._algorithm,
-            )
+            if self._algorithm is EplbAlgorithm.trace:
+                if logical_trace is None:
+                    raise ValueError(
+                        "trace EPLB requires a per-forward logical trace snapshot"
+                    )
+                self._future = self._compute_worker.submit_trace(
+                    logical_trace,
+                    old_map=self._old_map,
+                    ep_size=specs.ep_size,
+                    options=self._trace_options,
+                    expert_costs=self._expert_costs,
+                )
+            else:
+                self._future = self._compute_worker.submit(
+                    self._logical_count,
+                    num_physical_experts=specs.num_physical_experts,
+                    ep_size=specs.ep_size,
+                    num_groups=specs.num_groups,
+                    num_nodes=specs.num_nodes,
+                    algorithm=self._algorithm,
+                )
         self._commit_at = self.forwards + self._commit_delay
 
     def placement_for_commit(self) -> torch.Tensor:
@@ -569,8 +647,19 @@ class ExpertRebalanceController:
             return torch.empty(
                 (specs.num_layers, specs.num_physical_experts), dtype=torch.int32
             )
-        physical_to_logical_map, _ = self._future.result()
+        result = self._future.result()
         self._future = None
+        if isinstance(result, TracePlacementResult):
+            self.last_trace_result = result
+            logger.info(
+                f"Trace EPLB epoch {self.placement_epoch}: predicted peak sum "
+                f"{result.before:.6g} -> {result.after:.6g}, "
+                f"{result.moved_slots} changed slots, reason={result.reason}; "
+                "uniform replica split prediction, not measured latency"
+            )
+            physical_to_logical_map = result.physical_to_logical
+        else:
+            physical_to_logical_map, _ = result
         return physical_to_logical_map.contiguous()
 
     def on_commit(self, new_map: torch.Tensor) -> None:
@@ -580,6 +669,12 @@ class ExpertRebalanceController:
                 f"unexpected expert placement commit in phase {self.phase}"
             )
         specs = self.specs
+        validate_placement(
+            new_map,
+            layers=specs.num_layers,
+            experts=specs.num_logical_experts,
+            ep_size=specs.ep_size,
+        )
         new_map = new_map.to(device="cpu", dtype=torch.int32)
         if tuple(new_map.shape) != tuple(self._old_map.shape):
             raise ValueError(
@@ -626,6 +721,13 @@ class ExpertRebalanceController:
             {layer_id: self._moves_by_layer[layer_id] for layer_id in layer_ids},
         )
 
+    @property
+    def committed_placement(self) -> torch.Tensor:
+        """A host copy of the entire agreed placement, while its chunks apply."""
+        if self._new_map is None:
+            raise RuntimeError("there is no committed placement")
+        return self._new_map.clone()
+
     def on_chunk_applied(self, layer_ids: Sequence[int]) -> None:
         """Advance the chunk cursor; the last chunk completes the rebalance."""
         layer_ids = tuple(int(layer_id) for layer_id in layer_ids)
@@ -634,6 +736,7 @@ class ExpertRebalanceController:
         self._pending_chunks.pop(0)
         if self._pending_chunks:
             return
+        self.placement_epoch += self.specs.num_layers
         self.phase = RebalancePhase.IDLE
         self._old_map = None
         self._new_map = None

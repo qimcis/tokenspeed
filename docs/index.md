@@ -71,3 +71,7 @@ See [Model recipes](./recipes/models.md) for concrete examples and
 [Server parameters](./configuration/server.md) for the parameter reference.
 
 See [Biweekly releases](./guides/weekly-release.md) for the release sequence and recovery.
+
+- [DeepSeek V4.1 load balancing](./guides/deepseek-v41-b300-load-balancing.md)
+
+- [DeepSeek V4.1 load balancing](./guides/deepseek-v41-b300-load-balancing.md)

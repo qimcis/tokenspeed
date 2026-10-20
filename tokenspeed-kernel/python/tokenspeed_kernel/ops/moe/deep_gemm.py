@@ -22,10 +22,16 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.ops.moe._deep_gemm.mega_moe_weights import (
+    _DeepGemmMegaMoEState,
+    _expected_shapes,
+    _interleave_gate_up_,
+    _pack_ue8m0_scale_,
+    _reorder_scale_rows_,
+)
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -61,96 +67,11 @@ if platform.is_blackwell:
     )
 
 
-_MXFP4_BLOCK_SIZE = 32
 _DISABLE_WARMUP_ENV = "TOKENSPEED_DISABLE_MEGA_MOE_WARMUP"
 _symm_buffer_cache: dict[tuple[int, int, int, int, int, int, int], object] = {}
 _warmed_configs: set[
     tuple[int, torch.device, int, int, int, int, int, float | None, bool]
 ] = set()
-
-
-@dataclass(frozen=True)
-class _DeepGemmMegaMoEState:
-    l1_weights: tuple[torch.Tensor, torch.Tensor]
-    l2_weights: tuple[torch.Tensor, torch.Tensor]
-    device: torch.device
-
-
-def _expected_shapes(
-    num_local_experts: int,
-    hidden_size: int,
-    intermediate_size: int,
-) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-    return (
-        (num_local_experts, 2 * intermediate_size, hidden_size // 2),
-        (
-            num_local_experts,
-            2 * intermediate_size,
-            hidden_size // _MXFP4_BLOCK_SIZE,
-        ),
-        (num_local_experts, hidden_size, intermediate_size // 2),
-        (
-            num_local_experts,
-            hidden_size,
-            intermediate_size // _MXFP4_BLOCK_SIZE,
-        ),
-    )
-
-
-def _interleave_gate_up_(weight: torch.Tensor, granularity: int) -> torch.Tensor:
-    """Interleave gate/up blocks in place with one-expert scratch space."""
-    squeeze_group_dim = weight.ndim == 2
-    if squeeze_group_dim:
-        weight = weight.unsqueeze(0)
-    groups, rows, *rest = weight.shape
-    half = rows // 2
-    blocks = half // granularity
-    for group in range(groups):
-        source = weight[group].clone().view(2, blocks, granularity, *rest)
-        weight[group].view(blocks, 2, granularity, *rest).copy_(source.transpose(0, 1))
-    return weight.squeeze(0) if squeeze_group_dim else weight
-
-
-def _pack_ue8m0_scale_(scale: torch.Tensor) -> torch.Tensor:
-    """Pack UE8M0 bytes into DeepGEMM's layout with one-expert scratch."""
-    squeeze_group_dim = scale.ndim == 2
-    if squeeze_group_dim:
-        scale = scale.unsqueeze(0)
-    groups, rows, columns = scale.shape
-    if columns % 4:
-        raise ValueError("MegaMoE UE8M0 scale columns must be divisible by four")
-    packed_columns = columns // 4
-    for group in range(groups):
-        source = scale[group].clone().view(rows, packed_columns, 4)
-        scale[group].view(packed_columns, rows, 4).copy_(source.permute(1, 0, 2))
-    packed = scale.view(torch.int32)
-    output = torch.as_strided(
-        packed,
-        size=(groups, rows, packed_columns),
-        stride=(rows * packed_columns, 1, rows),
-    )
-    return output.squeeze(0) if squeeze_group_dim else output
-
-
-def _reorder_scale_rows_(
-    scale: torch.Tensor, interleave_gate_up: bool, granularity: int
-) -> torch.Tensor:
-    """Apply MegaMoE gate/up and UTCCP row permutations in place."""
-    grouped = scale if scale.ndim == 3 else scale.unsqueeze(0)
-    groups, rows, packed_columns = grouped.shape
-    if rows % 128:
-        raise ValueError("MegaMoE scale rows must be divisible by 128")
-    for group in range(groups):
-        source = grouped[group].contiguous()
-        if interleave_gate_up:
-            half = rows // 2
-            blocks = half // granularity
-            source = source.view(2, blocks, granularity, packed_columns)
-            source = source.transpose(0, 1).reshape(rows, packed_columns)
-        source = source.view(-1, 4, 32, packed_columns)
-        source = source.transpose(1, 2).reshape(rows, packed_columns)
-        grouped[group].copy_(source)
-    return scale
 
 
 def deep_gemm_mxfp4_mega_moe_process_weights(

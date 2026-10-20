@@ -329,10 +329,10 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     const std::int32_t unscheduled = request->PrefillSize() - hit_tokens;
     // A remote landing completes the prompt in one transfer; no junction cut
     // can shorten it.
-    const std::int32_t tokens_this_round = source == fsm::PrefillSource::kRemote
-                                               ? unscheduled
-                                               : PrefillChunkTokens(coordinator_, hit_tokens, /*resumes_hit=*/true,
-                                                                    unscheduled, remaining, junction_tokens);
+    const std::int32_t tokens_this_round =
+        source == fsm::PrefillSource::kRemote
+            ? unscheduled
+            : prefillChunk(hit_tokens, /*resumes_hit=*/true, unscheduled, remaining, junction_tokens);
     if (tokens_this_round == 0) {
         return FirstChunkOutcome{};
     }
@@ -442,14 +442,54 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
                              }};
 }
 
+double Scheduler::prefillWork(std::int32_t q, std::int32_t c) const {
+    const double tokens = q;
+    return prefill_work_->linear * tokens + prefill_work_->context * tokens * c +
+           prefill_work_->quadratic * tokens * tokens;
+}
+
+std::int32_t Scheduler::prefillChunk(std::int32_t first_pos, bool resumes_hit, std::int32_t unscheduled,
+                                     std::int32_t token_budget, std::int32_t junction_tokens) const {
+    const auto chunk = [&](std::int32_t budget) {
+        return PrefillChunkTokens(coordinator_, first_pos, resumes_hit, unscheduled, budget, junction_tokens);
+    };
+    if (!prefill_work_) return chunk(token_budget);
+    const auto replay = resumes_hit ? coordinator_.ReplayTokens(first_pos) : 0;
+    const auto context = first_pos - replay;
+    const double remaining = std::max(0.0, prefill_work_->budget_ms - round_prefill_work_ms_);
+    std::int32_t lo = 0, hi = token_budget;
+    while (lo < hi) {
+        const auto mid = lo + static_cast<std::int32_t>((static_cast<std::int64_t>(hi) - lo + 1) / 2);
+        if (prefillWork(mid, context) <= remaining)
+            lo = mid;
+        else
+            hi = mid - 1;
+    }
+    const auto fitted = chunk(lo);
+    if (fitted > 0 || round_prefill_progress_) return fitted;
+    // One minimum feasible quantum may exceed the work budget. The existing
+    // token cap, final replay window and actual cache admission still apply.
+    if (chunk(token_budget) == 0) return 0;
+    lo = 0;
+    hi = token_budget;
+    while (lo < hi) {
+        const auto mid = lo + (hi - lo) / 2;
+        if (chunk(mid) > 0)
+            hi = mid;
+        else
+            lo = mid + 1;
+    }
+    return chunk(lo);
+}
+
 std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     ExecutionPlan& plan, AdmissionFeedback& feedback, Request* request, std::int32_t remaining,
     std::int32_t reserve_num_tokens_in_next_schedule_event) {
     const std::int32_t unscheduled = request->UnscheduledPrefillSize();
     const std::int32_t first_pos = request->PrefillSize() - unscheduled;
     fsm::CacheProgress cache_progress = request->CacheProgress();
-    const std::int32_t prefill_tokens = PrefillChunkTokens(coordinator_, first_pos, /*resumes_hit=*/false, unscheduled,
-                                                           remaining, cache_progress.junction_tokens);
+    const std::int32_t prefill_tokens =
+        prefillChunk(first_pos, /*resumes_hit=*/false, unscheduled, remaining, cache_progress.junction_tokens);
     if (prefill_tokens == 0) {
         return std::nullopt;
     }
@@ -1239,6 +1279,7 @@ void Scheduler::scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& buil
     // preserve the fair service order, including missing/stale hint barriers.
     std::vector<Request*> window;
     std::unordered_set<std::uint64_t> expert_union;
+    std::vector<double> rank_loads(expert_placement_ ? expert_placement_->num_ranks : 0, 0);
     const auto flush_window = [&] {
         while (!window.empty() && !full()) {
             std::vector<ExpertAffinityCandidate> scores;
@@ -1247,11 +1288,13 @@ void Scheduler::scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& buil
                 const auto& state = expert_routes_.at(request);
                 scores.push_back({state.keys, state.deferrals});
             }
-            const auto index = SelectExpertAffinity(scores, expert_union, expert_affinity_->max_deferrals);
+            const auto index = SelectExpertAffinity(scores, expert_union, expert_affinity_->max_deferrals,
+                                                    expert_placement_ ? &*expert_placement_ : nullptr, rank_loads);
             Request* request = window[index];
             auto& state = expert_routes_.at(request);
             if (schedule(request)) {
                 expert_union.insert(state.keys.begin(), state.keys.end());
+                if (expert_placement_) expert_placement_->Add(state.keys, rank_loads);
                 state.deferrals = 0;
             } else {
                 // A failed admission neither contributes routes nor incurs
@@ -1282,6 +1325,7 @@ void Scheduler::scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& buil
             // retain their original admission positions and form FIFO barriers.
             const bool eligible =
                 request->Is<fsm::Decoding>() && request->ResultsInFlight() == 0 && fresh && !state.keys.empty() &&
+                (!expert_placement_ || expert_placement_->Covers(state.keys)) &&
                 canConsumeReservedTokensInPlace(coordinator_, request->BlockTablesRef(),
                                                 request->ReserveNumTokensInNextScheduleEvent(), frontier);
             if (eligible) {
@@ -1422,6 +1466,8 @@ Scheduler::BuiltOperations Scheduler::buildForwardOperations(ExecutionPlan& plan
     AdmissionFeedback feedback;
     PlanBuild build{plan};
     build.token_budget = config_.max_scheduled_tokens;
+    round_prefill_work_ms_ = 0;
+    round_prefill_progress_ = false;
     switch (config_.role) {
         case Role::kP:
             buildPrefillWorkerPlan(feedback, build, candidates);

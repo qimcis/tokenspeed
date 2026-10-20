@@ -34,6 +34,9 @@ orchestrates them, so it is unit-testable with fakes.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import dataclass
+
 from tokenspeed.runtime.cache.embedding_cache import (
     EmbeddingCache,
     TieredEmbeddingCache,
@@ -43,6 +46,7 @@ from tokenspeed.runtime.epd.encode_scheduler import (
     EncodeScheduler,
     PendingEncodeItem,
 )
+from tokenspeed.runtime.load_balancing.encoder import preprocessed_patch_count
 from tokenspeed.runtime.multimodal.embedder import _item_token_count
 from tokenspeed.runtime.multimodal.inputs import MultimodalDataItem
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -72,6 +76,18 @@ def _nbytes(tensor) -> int:
     return tensor.numel() * tensor.element_size()
 
 
+@dataclass(frozen=True)
+class EncoderLoadSnapshot:
+    """Local execution observations; unknown shapes are never charged as zero work."""
+
+    queued_patch_work: int
+    unknown_patch_items: int
+    in_flight_patch_work: int
+    cache_hits: int
+    completed_patch_work: int
+    failed_patch_work: int
+
+
 class EncodeWorker:
     """Orchestrates cache + scheduler + executor for the encode role.
 
@@ -86,12 +102,20 @@ class EncodeWorker:
         executor,
         scheduler: EncodeScheduler,
         cache: EmbeddingCache | TieredEmbeddingCache,
+        *,
+        observer: Callable[[EncoderLoadSnapshot], None] | None = None,
     ):
         self.executor = executor
         self.scheduler = scheduler
         self.cache = cache
+        self.observer = observer
         # (request_id, item_index) -> item awaiting the tower
         self._pending: dict = {}
+        self._cache_hits = 0
+        self._in_flight_patch_work = 0
+        self._in_flight_keys: set[tuple[str, int]] = set()
+        self._completed_patch_work = 0
+        self._failed_patch_work = 0
 
     def submit(self, request: EncodeRequest) -> None:
         self.executor.register(
@@ -115,6 +139,7 @@ class EncodeWorker:
                 else:
                     handle.consume()
             if cached is not None:
+                self._cache_hits += 1
                 # Cache hit: tower skipped, but the embedding still must reach
                 # the prefill peer, so ship it directly. Entries are
                 # (main, deepstack) pairs and BOTH halves must be restored, else
@@ -135,6 +160,8 @@ class EncodeWorker:
                 )
                 self._pending[(request.request_id, idx)] = item
 
+        self._observe_load()
+
     def step(self) -> int:
         """Run one scheduler batch through the tower + transfer. Returns the
         number of items encoded (0 when nothing is pending)."""
@@ -153,6 +180,12 @@ class EncodeWorker:
         if not batch:
             return 0
         request_items = [(p.request_id, self._pending[p.key]) for p in batch]
+        self._in_flight_keys = {p.key for p in batch}
+        self._in_flight_patch_work = sum(
+            preprocessed_patch_count(item.model_specific_data) or 0
+            for _, item in request_items
+        )
+        self._observe_load()
         try:
             self.executor.execute(request_items)
         except Exception as e:
@@ -164,13 +197,20 @@ class EncodeWorker:
             # concluding the batch Failed never poisons an already-shipped room.
             # Per-item STAGING errors are handled finer-grained inside
             # _stage_and_send -> _fail_staged_room.
+            self._failed_patch_work += self._in_flight_patch_work
+            self._in_flight_patch_work = 0
+            self._in_flight_keys.clear()
             n_failed = self.executor.fail_rooms((rid for rid, _ in request_items), e)
             for p in batch:
                 self._pending.pop(p.key, None)
+            self._observe_load()
             logger.error(
                 f"encode batch failed ({n_failed:d} rooms concluded Failed): {e!s}",
             )
             return 0
+        self._completed_patch_work += self._in_flight_patch_work
+        self._in_flight_patch_work = 0
+        self._in_flight_keys.clear()
         for p in batch:
             item = self._pending.pop(p.key)
             if item.encoded is not None:
@@ -182,7 +222,38 @@ class EncodeWorker:
                     _nbytes(deep) if deep is not None else 0
                 )
                 self.cache.put(item.hash, (item.encoded, deep), nbytes)
+        self._observe_load()
         return len(batch)
+
+    def load_snapshot(self) -> EncoderLoadSnapshot:
+        """Read bounded counters from the real cache/queue/forward path.
+
+        Publish only from the worker leader: TP ranks execute the same request.
+        Transfer completion remains separate from completed tower patch work.
+        """
+        patches = [
+            (key, preprocessed_patch_count(item.model_specific_data))
+            for key, item in self._pending.items()
+        ]
+        return EncoderLoadSnapshot(
+            queued_patch_work=sum(
+                value
+                for key, value in patches
+                if value is not None and key not in self._in_flight_keys
+            ),
+            unknown_patch_items=sum(value is None for _, value in patches),
+            in_flight_patch_work=self._in_flight_patch_work,
+            cache_hits=self._cache_hits,
+            completed_patch_work=self._completed_patch_work,
+            failed_patch_work=self._failed_patch_work,
+        )
+
+    def _observe_load(self) -> None:
+        if self.observer is not None:
+            try:
+                self.observer(self.load_snapshot())
+            except Exception:
+                logger.warning("encoder load observer failed", exc_info=True)
 
     def has_pending(self) -> bool:
         return self.scheduler.pending_size() > 0

@@ -75,6 +75,8 @@ def main(argv: list[str] | None = None) -> None:
     hotset.add_argument("--capacity-rows", type=int, required=True)
     screen = commands.add_parser("performance-screen")
     screen.add_argument("observations", type=Path)
+    prefill_fit = commands.add_parser("fit-prefill")
+    prefill_fit.add_argument("observations", type=Path)
     measure = commands.add_parser("measure")
     measure.add_argument("workload", type=Path)
     measure.add_argument("--endpoint", required=True)
@@ -116,6 +118,21 @@ def main(argv: list[str] | None = None) -> None:
         )
 
         result = run_mechanism_screen(_read(args.observations))
+    elif args.command == "fit-prefill":
+        from tokenspeed.runtime.load_balancing.prefill import (
+            PrefillObservation,
+            fit_prefill_cost,
+        )
+
+        data = _read(args.observations)
+        if not isinstance(data, dict) or set(data) != {"training", "heldout"}:
+            raise ValueError(
+                "prefill calibration requires exactly training and heldout records"
+            )
+        result = fit_prefill_cost(
+            [PrefillObservation.model_validate(row) for row in data["training"]],
+            [PrefillObservation.model_validate(row) for row in data["heldout"]],
+        ).model_dump()
     elif args.command == "measure":
         from tokenspeed.deployment.deepseek_v41.workload import (
             ReplayConfig,

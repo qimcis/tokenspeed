@@ -49,6 +49,7 @@ __all__ = [
     "moe_apply",
     "moe_plan",
     "moe_process_weights",
+    "moe_expert_slot_tensors",
     "moe_warmup",
     "moe_topk",
     "softmax_bias_topk",
@@ -859,8 +860,7 @@ def _moe_sigmoid_bias_topk(
         or not logical_to_physical_map.is_contiguous()
     ):
         raise ValueError(
-            "logical_to_physical_map must be contiguous colocated INT32/INT64 "
-            "[experts]"
+            "logical_to_physical_map must be contiguous colocated INT32/INT64 [experts]"
         )
     if not 0 < topk <= experts:
         raise ValueError(f"topk must be in [1, {experts}], got {topk}")
@@ -1715,14 +1715,41 @@ def moe_plan(
         "supports_deferred_finalize": supports_deferred_finalize,
         "topk_weights_dtype": topk_weights_dtype,
         "supports_prequantized_input": supports_prequantized_input,
-        # All-to-all EP (DeepEP, Petit): each rank runs its own tokens'
-        # routes, so routing may pick per-rank replicas. Otherwise every
-        # rank routes every token and must agree on one replica per route.
-        "supports_all_to_all_ep": traits["supports_all_to_all_ep"],
+        # The selection trait names external all-to-all backends. MXFP4
+        # MegaMoE instead owns dispatch/combine internally. Report actual
+        # execution ownership here: replica dispatch and EPLB count reduction
+        # both depend on whether each rank routes its own token rows.
+        "supports_all_to_all_ep": (
+            traits["supports_all_to_all_ep"]
+            or (apply_spec.solution == "mega_moe" and weight_dtype == "mxfp4")
+        ),
         "solution": apply_spec.solution,
         "internal_activation_dtype": internal_activation_dtype,
         "fp32_correction_bias": fp32_correction_bias,
     }
+
+
+def moe_expert_slot_tensors(plan: dict, w: torch.nn.Module) -> tuple[torch.Tensor, ...]:
+    """Return processed expert storage views for an in-place slot update.
+
+    Args:
+        plan: The selected execution plan, after weight processing.
+        w: The processed weight owner consumed by that plan.
+
+    Returns:
+        Contiguous per-slot views sharing the kernel's weight and scale storage.
+        Currently implemented only for MXFP4 DeepGEMM MegaMoE. Unsupported or
+        unprocessed layouts fail rather than returning checkpoint-format copies.
+    """
+    from tokenspeed_kernel.ops.moe._deep_gemm.mega_moe_weights import (
+        _DeepGemmMegaMoEState,
+    )
+
+    if plan["solution"] != "mega_moe" or not isinstance(
+        w._moe_backend_state, _DeepGemmMegaMoEState
+    ):
+        raise ValueError("expert slot updates require processed MXFP4 MegaMoE weights")
+    return w._moe_backend_state.routed_expert_weights
 
 
 def moe_process_weights(plan: dict, w: torch.nn.Module):
@@ -1906,9 +1933,9 @@ import tokenspeed_kernel.ops.moe.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.marlin  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.native  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.triton  # noqa: E402,F401
-from tokenspeed_kernel.ops.moe.native import (
+from tokenspeed_kernel.ops.moe.native import (  # noqa: E402
     torch_softmax_topk,
     torch_softmax_bias_topk,
-)  # noqa: E402
+)
 
 # isort: on

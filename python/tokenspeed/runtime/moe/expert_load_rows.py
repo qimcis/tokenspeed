@@ -40,13 +40,14 @@ reserved once before the first forward, so captured graphs hold its address.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import torch
 
-from tokenspeed.runtime.distributed.comm_manager import moe_input_row_segments
-from tokenspeed.runtime.distributed.mapping import Mapping
+if TYPE_CHECKING:
+    from tokenspeed.runtime.distributed.mapping import Mapping
 
-__all__ = ["ExpertLoadRowMask", "LayerExpertLoad"]
+__all__ = ["ExpertLoadRowMask", "LayerExpertLoad", "ExpertLoadTrace"]
 
 
 class ExpertLoadRowMask:
@@ -109,6 +110,8 @@ class ExpertLoadRowMask:
                 global rank (uniform under a graph replay).
             live_global_num_tokens: Real token rows per global rank.
         """
+        from tokenspeed.runtime.distributed.comm_manager import moe_input_row_segments
+
         segments = moe_input_row_segments(
             self._mapping,
             padded_global_num_tokens=padded_global_num_tokens,
@@ -165,3 +168,48 @@ class LayerExpertLoad:
             topk_ids.masked_fill(~valid, 0).reshape(-1).long(),
             valid.reshape(-1).to(self.physical_load.dtype),
         )
+
+
+class ExpertLoadTrace:
+    """Bounded device ring of per-forward physical route counts.
+
+    Recording runs outside graph capture on the execution stream, after replay.
+    Counts include every target verification route actually executed (including
+    subsequently rejected candidates), but exclude masked/padded rows and drafts.
+    No device value is read on the per-forward path. Only ``snapshot`` transfers
+    the retained steps to the host, at the existing low-rate EPLB boundary.
+    """
+
+    def __init__(self, counters: torch.Tensor, *, max_steps: int) -> None:
+        if not 1 <= max_steps <= 4096:
+            raise ValueError("max_steps must be between 1 and 4096")
+        if counters.ndim != 2 or counters.dtype != torch.int64:
+            raise ValueError("counters must be [layers, physical] int64")
+        self._counters = counters
+        self._previous = counters.clone()
+        self._steps = torch.empty(
+            (max_steps, *counters.shape), dtype=counters.dtype, device=counters.device
+        )
+        self._next = 0
+        self._count = 0
+
+    def record(self) -> None:
+        """Append the routes since the previous execution boundary."""
+        torch.sub(self._counters, self._previous, out=self._steps[self._next])
+        self._previous.copy_(self._counters)
+        self._next = (self._next + 1) % self._steps.shape[0]
+        self._count = min(self._count + 1, self._steps.shape[0])
+
+    def reset(self) -> None:
+        """Discard history and take the current counters as the new baseline."""
+        self._previous.copy_(self._counters)
+        self._next = 0
+        self._count = 0
+
+    def snapshot(self) -> torch.Tensor:
+        """Return chronological [steps, layers, physical] counts on the host."""
+        if self._count < self._steps.shape[0]:
+            return self._steps[: self._count].to("cpu", copy=True)
+        # Transfer once. Reorder on CPU instead of allocating a second GPU ring.
+        host = self._steps.to("cpu", copy=True)
+        return torch.cat((host[self._next :], host[: self._next]), dim=0)

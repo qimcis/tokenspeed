@@ -56,10 +56,6 @@ from collections.abc import Mapping, Sequence
 import torch
 import torch.distributed as dist
 
-from tokenspeed.runtime.distributed.process_group_manager import (
-    process_group_manager as pg_manager,
-)
-from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.moe.expert_location import (
     ExpertLocationMetadata,
     ModelConfigForExpertLocation,
@@ -142,6 +138,8 @@ class ExpertLocationUpdater:
                     f"layer {layer_id} is outside the placement's "
                     f"{self._placement.num_layers} layers"
                 )
+            if not tensors:
+                raise ValueError(f"layer {layer_id} exposes no processed slot tensors")
             for index, tensor in enumerate(tensors):
                 if tensor.ndim < 1 or tensor.shape[0] != num_local:
                     raise ValueError(
@@ -219,6 +217,16 @@ class ExpertLocationUpdater:
                 self._move_weights(layer_id, tensors, moves)
             # The table switch follows the layer's weights on the same stream.
             self._placement.switch_layer(prepared, index)
+            moved_bytes = (
+                0
+                if tensors is None
+                else moves.num_changed_slots
+                * sum(tensor[0].numel() * tensor.element_size() for tensor in tensors)
+            )
+            logger.info(
+                f"Expert rebalance layer {layer_id}: moved_bytes={moved_bytes} "
+                f"placement_epoch={self._placement.placement_epoch}"
+            )
 
     def _move_weights(
         self, layer_id: int, tensors: Sequence[torch.Tensor], moves: SlotMoves
@@ -256,6 +264,8 @@ class ExpertLocationUpdater:
 
 def _all_to_all_ep(model: torch.nn.Module) -> bool:
     """Whether the model's MoE layers own all-to-all dispatch (uniform over layers)."""
+    from tokenspeed.runtime.layers.moe.expert import MoELayer
+
     flags = {
         module.supports_all_to_all_ep
         for module in model.modules()
@@ -279,6 +289,10 @@ def build_expert_location_updater(
     the cache profile sizes the KV arena. The EP device and gloo groups are
     created here if the MoE mapping did not already (idempotent).
     """
+    from tokenspeed.runtime.distributed.process_group_manager import (
+        process_group_manager as pg_manager,
+    )
+
     placement = get_global_expert_location_metadata()
     if placement is None or placement.physical_load is None:
         raise ValueError(

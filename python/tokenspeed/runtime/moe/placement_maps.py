@@ -131,3 +131,26 @@ def compute_placement_maps(
             replica_table_width(num_physical_experts, num_logical_experts),
         ),
     )
+
+
+def logical_count_of(
+    physical_count: torch.Tensor,
+    physical_to_logical_map: torch.Tensor,
+    num_logical_experts: int,
+) -> torch.Tensor:
+    """Sum a host ``[layers, physical]`` int64 count over each logical expert's replicas."""
+    num_layers = physical_to_logical_map.shape[0]
+    logical = torch.zeros((num_layers, num_logical_experts), dtype=torch.int64)
+    logical.scatter_add_(1, physical_to_logical_map.long(), physical_count)
+    return logical
+
+
+def load_balancedness(physical_count: torch.Tensor, ep_size: int) -> torch.Tensor:
+    """Per-layer mean rank load over the busiest rank's load, from a ``[layers, physical]`` count.
+
+    1.0 is perfectly balanced; the busiest rank is the layer's critical path.
+    Slots are owned contiguously, so the rank loads are the row's chunks.
+    """
+    num_layers = physical_count.shape[0]
+    per_rank = physical_count.view(num_layers, ep_size, -1).sum(-1).double()
+    return per_rank.mean(-1) / per_rank.max(-1).values.clamp_min(1)

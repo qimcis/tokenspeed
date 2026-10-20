@@ -231,8 +231,24 @@ def _build_encode_worker(server_args, port_args, gpu_id, global_rank):
         max_tokens_per_batch=server_args.chunked_prefill_size or 8192,
         max_items_per_batch=server_args.max_num_seqs,
     )
+    load_observer = None
+    if attn_tp_rank == 0 and server_args.enable_metrics:
+        from tokenspeed.runtime.load_balancing.telemetry import EncoderLoadMetrics
+        from tokenspeed.runtime.metrics.service import metrics_service
+
+        metrics_service.connect(port_args.metrics_producer_configs)
+        load_metrics = EncoderLoadMetrics(
+            {
+                "model_name": server_args.served_model_name,
+                "engine_rank": str(global_rank),
+            },
+            enabled=True,
+            reporters=server_args.metrics_reporters,
+            event_sink=metrics_service.get_event_sink(),
+        )
+        load_observer = load_metrics.observe
     return (
-        EncodeWorker(executor, scheduler, cache),
+        EncodeWorker(executor, scheduler, cache, observer=load_observer),
         model_config,
         model_runner.multimodal_encoder_dtype,
     )

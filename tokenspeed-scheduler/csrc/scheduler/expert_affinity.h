@@ -20,11 +20,14 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <span>
 #include <unordered_set>
+#include <unordered_map>
+#include <vector>
 
 namespace tokenspeed {
 
@@ -35,12 +38,29 @@ struct ExpertAffinityCandidate {
     std::int32_t deferrals;
 };
 
+// Immutable logical-key to expected per-rank work, published as one epoch.
+struct ExpertPlacementModel {
+    std::uint64_t epoch;
+    std::size_t num_ranks;
+    std::unordered_map<std::uint64_t, std::vector<double>> rank_weights;
+    bool Covers(std::span<const std::uint64_t> keys) const {
+        return std::ranges::all_of(keys, [this](auto key) { return rank_weights.contains(key); });
+    }
+    void Add(std::span<const std::uint64_t> keys, std::vector<double>& loads) const {
+        for (auto key : keys) {
+            const auto& weights = rank_weights.at(key);
+            for (std::size_t r = 0; r < num_ranks; ++r) loads[r] += weights[r];
+        }
+    }
+};
+
 inline std::size_t SelectExpertAffinity(std::span<const ExpertAffinityCandidate> candidates,
                                         const std::unordered_set<std::uint64_t>& expert_union,
-                                        std::int32_t max_deferrals) {
+                                        std::int32_t max_deferrals, const ExpertPlacementModel* placement = nullptr,
+                                        std::span<const double> rank_loads = {}) {
     std::size_t selected = 0;
     std::int32_t oldest = max_deferrals - 1;
-    std::size_t best_cost = std::numeric_limits<std::size_t>::max();
+    double best_cost = std::numeric_limits<double>::infinity();
     for (std::size_t i = 0; i < candidates.size(); ++i) {
         const auto& candidate = candidates[i];
         if (candidate.keys.empty()) break;
@@ -52,8 +72,14 @@ inline std::size_t SelectExpertAffinity(std::span<const ExpertAffinityCandidate>
             continue;
         }
         if (oldest >= max_deferrals || expert_union.empty()) continue;
-        std::size_t cost = 0;
-        for (const auto key : candidate.keys) cost += !expert_union.contains(key);
+        double cost = 0;
+        if (placement) {
+            std::vector<double> loads(rank_loads.begin(), rank_loads.end());
+            placement->Add(candidate.keys, loads);
+            cost = *std::max_element(loads.begin(), loads.end());
+        } else {
+            for (const auto key : candidate.keys) cost += !expert_union.contains(key);
+        }
         if (cost < best_cost) {
             best_cost = cost;
             selected = i;
