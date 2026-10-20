@@ -85,6 +85,9 @@ from tokenspeed.runtime.multimodal.inputs import (
     MultimodalForwardContext,
     MultimodalInputs,
 )
+from tokenspeed.runtime.multimodal.token_padding import (
+    pad_input_tokens as pad_input_tokens,
+)
 from tokenspeed.runtime.utils.env import envs
 
 EncoderFn = Callable[[list[MultimodalDataItem]], torch.Tensor]
@@ -172,38 +175,6 @@ def warmup_multimodal_encoders(
             f"{[tuple(item.feature.shape) if item.feature is not None else None for item in items]!s}"
             f" elapsed={(time.perf_counter() - start) * 1000.0:.3f} ms",
         )
-
-
-# ---------------------------------------------------------------------------
-# Input-id padding helper
-# ---------------------------------------------------------------------------
-
-
-def pad_input_tokens(input_ids: list[int], mm_inputs: MultimodalInputs) -> list[int]:
-    """Substitute placeholder token IDs with each item's ``pad_value``.
-
-    The gateway produces ``input_ids`` with a single placeholder token
-    repeated across every multimodal-token position (e.g. ``<image>``
-    repeated 1024 times for a 1024-token image). The prefix cache needs
-    each placeholder run to carry a content-derived ID so two different
-    images compare unequal. We rewrite each ``offsets`` range to the
-    item's pre-computed ``pad_value`` here.
-    """
-    if not input_ids or not mm_inputs.mm_items:
-        return input_ids
-
-    out = None
-    for item in mm_inputs.mm_items:
-        if item.pad_value is None or not item.offsets:
-            continue
-        if out is None:
-            out = list(input_ids)
-        pad_value = int(item.pad_value)
-        for offset_start, offset_end in item.offsets:
-            out[offset_start : offset_end + 1] = [pad_value] * (
-                offset_end - offset_start + 1
-            )
-    return input_ids if out is None else out
 
 
 # ---------------------------------------------------------------------------

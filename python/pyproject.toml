@@ -66,6 +66,8 @@ dependencies = [
     "python-multipart",
     "pyzmq",
     "requests",
+    # HTTP workload measurements use streaming HTTPResponse.read1.
+    "urllib3>=2.2",
     "setproctitle",
     "tiktoken",
     "torch",
@@ -92,6 +94,9 @@ dependencies = [
 [project.scripts]
 tokenspeed = "tokenspeed.cli:main"
 ts = "tokenspeed.cli:main"
+
+[project.entry-points."tokenspeed.plugins"]
+jsonl_metrics = "tokenspeed.runtime.metrics.jsonl:register"
 
 [project.urls]
 "Homepage" = "https://github.com/lightseekorg/tokenspeed"

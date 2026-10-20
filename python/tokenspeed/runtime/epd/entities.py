@@ -35,11 +35,11 @@ REGISTER_ROOM_SENTINEL = "None"
 
 def _pack_ptr(ptr: int) -> bytes:
     """Encode a device virtual address as 8 little-endian bytes (uint64)."""
-    return struct.pack("Q", ptr)
+    return struct.pack("<Q", ptr)
 
 
 def _unpack_ptr(frame: bytes) -> int:
-    return struct.unpack("Q", frame)[0]
+    return struct.unpack("<Q", frame)[0]
 
 
 def _b(value: object) -> bytes:
@@ -51,6 +51,8 @@ def _bool_frame(value: bool) -> bytes:
 
 
 def _parse_bool(frame: bytes) -> bool:
+    if frame not in (b"0", b"1"):
+        raise ValueError(f"malformed embedding boolean frame: {frame!r}")
     return frame == b"1"
 
 
@@ -179,7 +181,7 @@ class EmbeddingTransferInfo:
             raise ValueError(
                 f"malformed EmbeddingTransferInfo frame: {len(msg)} parts < 13"
             )
-        return cls(
+        info = cls(
             room=int(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
             dst_port=int(msg[2].decode("ascii")),
@@ -194,6 +196,17 @@ class EmbeddingTransferInfo:
             row_start=int(msg[11].decode("ascii")),
             span=int(msg[12].decode("ascii")),
         )
+        if info.required_dst_info_num <= 0:
+            raise ValueError("embedding receiver fanout must be positive")
+        # Empty shards are registration heartbeats and perform no write. For
+        # real payloads, a missing deepstack pointer would otherwise silently
+        # skip that write while reporting transfer success.
+        if info.n_tokens > 0:
+            if info.dst_embedding_ptr == 0:
+                raise ValueError("nonempty embedding transfer needs a destination")
+            if info.has_deepstack and info.dst_deepstack_ptr == 0:
+                raise ValueError("nonempty deepstack transfer needs a destination")
+        return info
 
 
 @dataclasses.dataclass
@@ -225,6 +238,10 @@ class EmbeddingArgsRegisterInfo:
 
     @classmethod
     def from_zmq(cls, msg: list[bytes]) -> "EmbeddingArgsRegisterInfo":
+        if len(msg) < 6:
+            raise ValueError(
+                f"malformed EmbeddingArgsRegisterInfo frame: {len(msg)} parts < 6"
+            )
         return cls(
             room=msg[0].decode("ascii"),
             endpoint=msg[1].decode("ascii"),

@@ -45,6 +45,7 @@ from tokenspeed.runtime.epd.entities import (
 from tokenspeed.runtime.epd.mooncake.conn import (
     MooncakeEmbeddingManagerBase,
 )
+from tokenspeed.runtime.epd.mooncake.fanout import notify_fanout, transfer_fanout
 from tokenspeed.runtime.pd.base.status import TransferPoll
 from tokenspeed.runtime.pd.utils import DisaggregationMode, FastQueue
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -262,10 +263,12 @@ class MooncakeEmbeddingManagerEncode(MooncakeEmbeddingManagerBase):
     ):
         while True:
             chunk: EmbeddingChunk = queue.get()
-            # Already concluded: a re-enqueued straggler copy from _flush_pending
-            # (which re-puts a parked chunk on each receiver registration). The
-            # room was already sent + popped, so drop it.
-            if self.request_status.get(chunk.room) == TransferPoll.Success:
+            # Already concluded: a re-enqueued straggler or a queued room that
+            # failed before sending must never read a released source ring slot.
+            if self.request_status.get(chunk.room) in (
+                TransferPoll.Success,
+                TransferPoll.Failed,
+            ):
                 continue
             # Snapshot via list(): the bootstrap listener inserts into this inner
             # dict without _pending_lock, so next(iter(...)) could raise "dict changed
@@ -309,22 +312,23 @@ class MooncakeEmbeddingManagerEncode(MooncakeEmbeddingManagerBase):
             # releases the GIL while waiting.
             if chunk.copy_event is not None:
                 chunk.copy_event.synchronize()
-            futures = [executor.submit(self._send, info, chunk) for info in infos]
-            failed = False
-            for info, future in zip(infos, futures):
-                ret = future.result()  # _send returns <0 on error, never raises
-                if ret != 0:
-                    self.record_failure(chunk.room, f"mooncake transfer ret={ret}")
-                    failed = True
-                else:
-                    # Per-receiver completion sync (each of the N prefill ranks gets
-                    # exactly one, matching its required_response_num == 1).
-                    self._sync_status(info, TransferPoll.Success)
-            if failed:
-                # Push Failed to EVERY receiver (idempotent on ones already
-                # Success'd: the rank-synced admission MIN aborts the request
-                # everywhere anyway).
-                self._fail_room(chunk.room, None, infos)
+            failures = transfer_fanout(executor, self._send, infos, chunk)
+            if failures:
+                reason = "; ".join(failures)
+                logger.error(
+                    f"embedding transfer failed for room {chunk.room}: {reason}"
+                )
+                self._fail_room(chunk.room, reason, infos)
+                continue
+            # Notify only after all writes have settled: a notification failure
+            # can mark the room Failed and permit reuse of its source ring slot.
+            failures = notify_fanout(self._sync_status, infos, TransferPoll.Success)
+            if failures:
+                reason = "; ".join(failures)
+                logger.error(
+                    f"embedding completion failed for room {chunk.room}: {reason}"
+                )
+                self._fail_room(chunk.room, reason, infos)
                 continue
             # All N receivers served: mark the room Success ONCE and pop only now,
             # so a partial fanout can never conclude/pop early.
@@ -340,8 +344,11 @@ class MooncakeEmbeddingManagerEncode(MooncakeEmbeddingManagerBase):
         if reason is not None:
             self.record_failure(room, reason)
         self.update_status(room, TransferPoll.Failed)
-        for info in infos:
-            self._sync_status(info, TransferPoll.Failed)
+        failures = notify_fanout(self._sync_status, infos, TransferPoll.Failed)
+        if failures:
+            logger.error(
+                f"embedding failure notification for room {room}: {'; '.join(failures)}"
+            )
 
     def is_parked(self, room: int) -> bool:
         """Whether ``room`` still has a chunk parked awaiting receiver

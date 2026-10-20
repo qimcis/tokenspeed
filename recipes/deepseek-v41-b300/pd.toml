@@ -1,0 +1,38 @@
+mode = "pd"
+model = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
+revision = "1bae0e1088993b9b82de08f59de5be5a34e42170"
+served_model_name = "deepseek-v41-flash"
+gpu_budget = 8
+base_port = 18000
+
+[engine]
+speculation = "dspark"
+engram = "host_sharded"
+max_model_len = 32768
+max_total_tokens = 131072
+max_num_seqs = 16
+chunked_prefill_size = 8192
+graph_max_seqs = 16
+gpu_memory_utilization = 0.9
+
+[metrics]
+reporter = "jsonl"
+queue_size = 8192
+
+[transport]
+encode_cache_mib = 4096
+encode_host_cache_mib = 0
+encode_slots = 8
+encode_slot_mib = 32
+receive_slots = 8
+receive_slot_mib = 32
+
+[[workers]]
+role = "prefill"
+gpus = [0, 1, 2, 3]
+attention_tp = 4
+
+[[workers]]
+role = "decode"
+gpus = [4, 5, 6, 7]
+attention_tp = 4

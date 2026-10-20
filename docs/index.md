@@ -32,6 +32,7 @@ features:
 - [Getting started](./guides/getting-started.md)
 - [Launching a server](./guides/launching.md)
 - [Model recipes](./recipes/models.md)
+- [DeepSeek V4.1 on B300](./guides/deepseek-v41-b300.md)
 - [Server parameters](./configuration/server.md)
 - [Compatible parameters](./configuration/compatible-parameters.md)
 - [Parallelism](./serving/parallelism.md)

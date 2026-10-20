@@ -40,8 +40,8 @@ from tokenspeed.runtime.grammar.reasoning_structural_tag import (
     reasoning_block_markers,
     structural_tag_for_reasoning_json_schema,
 )
-from tokenspeed.runtime.multimodal.embedder import pad_input_tokens
 from tokenspeed.runtime.multimodal.mrope import compute_mrope_positions
+from tokenspeed.runtime.multimodal.token_padding import pad_input_tokens
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 # Most alternatives a top-k logprob request may ask for per position (the
@@ -343,8 +343,14 @@ class InputProcessor:
             and self.engine.server_args.language_model_only
             and self.engine.model_config.is_multimodal
         ):
-            # Decode only needs the expanded prompt length to size its remote-KV
-            # destination; it never executes the multimodal prefill.
+            # Decode never executes the multimodal prefill, but its bounded
+            # Engram seed still needs the same physical image IDs as Prefill.
+            # Preserve those IDs without retaining the image tensors on Decode.
+            decode_mm = obj.precomputed_multimodal_inputs
+            decode_mm.ensure_pad_values()
+            if input_ids is not None:
+                input_ids_unpadded = list(input_ids)
+                input_ids = pad_input_tokens(input_ids_unpadded, decode_mm)
             precomputed_mm = False
         if precomputed_mm:
             # Gateway-side preprocess path (e.g. SMG): mm tensors are already
