@@ -38,6 +38,7 @@ export default defineConfig({
         items: [
           { text: "Getting Started", link: "/guides/getting-started" },
           { text: "Launching a Server", link: "/guides/launching" },
+          { text: "DeepSeek V4.1 on B300", link: "/guides/deepseek-v41-b300" },
           { text: "InstantTensor Loading", link: "/guides/instanttensor" }
         ]
       },

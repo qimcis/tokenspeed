@@ -168,53 +168,26 @@ the runtime does not provide durable queues or exactly-once reporting.
 
 ## Local JSONL output
 
-The bundled `jsonl_metrics` runtime plugin registers the `jsonl` reporter. Select
-it explicitly with `--metrics-reporters jsonl`; installing TokenSpeed does not
-create a file or start a writer until metrics selects this reporter. Use the
-same `--enable-metrics` and `--metrics-reporter-config` arguments described above.
-A configuration example is:
+The bundled `jsonl_metrics` plugin registers `jsonl`. Select it explicitly with
+`--enable-metrics --metrics-reporters jsonl --metrics-reporter-config FILE`:
 
 ```json
-{
-  "jsonl": {
-    "output_dir": "/var/log/tokenspeed/observations",
-    "queue_size": 8192
-  }
-}
+{"jsonl": {"output_dir": "/var/log/tokenspeed/observations", "queue_size": 8192}}
 ```
 
-`output_dir` is required and must be absolute. `queue_size` is optional, defaults
-to 8192 events, and accepts integers from 1 through 1000000. Unknown fields fail
-validation. Each producer writes a unique `metrics-<pid>-<random-id>.jsonl` file,
-so roles and ranks do not contend for a shared file. There is no collector service
-or network endpoint. Each row contains the six `MetricEvent` fields above,
-including the original operation and observation weight. Existing labels identify
-collection points; file names do not add a role or rank that the producer did not
-provide.
+`output_dir` must be absolute. The optional queue size defaults to 8192 records
+and accepts 1 through 1000000; unknown fields fail validation. Each producer
+writes a unique `metrics-<pid>-<random-id>.jsonl`, preserving event operations,
+weights and labels. Registration alone creates no files or threads.
 
-The queue bounds pending event count, not file size or individual label size.
-Serialization and line-buffered writes run on a daemon thread. Full queues drop
-new observations, and rate-limited warnings expose cumulative dropped events and
-write errors. `JsonlMetricSink.stats` also exposes written, dropped, queued and
-error counts. An output or serialization failure stops that producer's writer and
-drops remaining events. Files are strict JSON; non-finite metric values cannot be
-serialized. Manage retention externally and keep these files separate from
-request-level benchmark records.
+A bounded queue feeds the background writer. Full queues drop new events;
+warnings and `JsonlMetricSink.stats` expose losses and errors. Invalid values
+or write failures stop the affected writer. The queue does not bound file size;
+manage retention externally. Close stops admission and drains within its initial
+budget, but cannot interrupt a blocked filesystem write. This is best-effort
+diagnostic output, not a durable audit log.
 
-Shutdown stops admission immediately and drains within the first close budget.
-Repeated close calls may wait for cleanup but do not extend the drain deadline.
-A blocked filesystem write cannot be interrupted; close bounds the caller's wait,
-and the daemon releases its file after the write returns. Forced process exit can
-lose buffered observations. This reporter is diagnostic, not a durable audit log.
-
-### Encoder work observations
-
-With metrics enabled, encode TP rank zero emits `tokenspeed:encoder_*`
-queue and in-flight patch gauges plus cumulative cache-hit, completed-patch,
-and failed-patch counter deltas through the configured reporters. Input patches
-come from CPU preprocessing metadata; unknown counts remain an explicit item
-gauge. Completed patches describe encoder forward work, not transfer completion.
-These observations retain actual units and do not infer throughput, latency,
-cache-hit token lengths, or worker free capacity. The observer keeps constant
-state, and the reporter owns bounded asynchronous output. Other TP ranks do not
-publish duplicate copies of the same worker's observations.
+Encode TP rank zero also publishes `tokenspeed:encoder_*` queue/inflight patch
+gauges and cache-hit/completed/failed counter deltas. Counts come from actual
+preprocessing metadata; unknown geometry remains explicit. Completed patches
+mean encoder forward work, not transfer completion or inferred free capacity.

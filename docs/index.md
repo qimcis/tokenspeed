@@ -33,7 +33,6 @@ features:
 - [Launching a server](./guides/launching.md)
 - [Model recipes](./recipes/models.md)
 - [DeepSeek V4.1 on B300](./guides/deepseek-v41-b300.md)
-- [DeepSeek V4.1 performance candidates](./guides/deepseek-v41-b300-performance.md)
 - [Server parameters](./configuration/server.md)
 - [Compatible parameters](./configuration/compatible-parameters.md)
 - [Parallelism](./serving/parallelism.md)
@@ -71,7 +70,3 @@ See [Model recipes](./recipes/models.md) for concrete examples and
 [Server parameters](./configuration/server.md) for the parameter reference.
 
 See [Biweekly releases](./guides/weekly-release.md) for the release sequence and recovery.
-
-- [DeepSeek V4.1 load balancing](./guides/deepseek-v41-b300-load-balancing.md)
-
-- [DeepSeek V4.1 load balancing](./guides/deepseek-v41-b300-load-balancing.md)

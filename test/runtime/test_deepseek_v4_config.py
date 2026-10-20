@@ -1514,9 +1514,7 @@ class TestDeepseekV4Config:
             bias = embedding.weight[previous].float() @ projection.weight.float().T
             previous = torch.argmax(logits[:, step] + bias, dim=-1)
             expected[:, step] = previous
-        candidates, partials, _ = dspark_greedy_workspace(
-            tp_size, rows + 3, vocab, device, candidate_communication="tiles"
-        )
+        candidates, partials = dspark_greedy_workspace(tp_size, rows + 3, vocab, device)
         return markov, lm_head, logits, bonus, expected, candidates, partials
 
     @pytest.mark.skipif(not (torch.cuda.is_available()), reason=("requires CUDA"))
@@ -1530,16 +1528,7 @@ class TestDeepseekV4Config:
             "tokenspeed.runtime.models.deepseek_v41_dspark_heads.all_gather_single"
         ) as gather:
             sample_dspark_block_greedy(
-                logits,
-                bonus,
-                markov,
-                lm_head,
-                object(),
-                candidates,
-                partials,
-                output,
-                candidate_communication="tiles",
-                compact_partials=None,
+                logits, bonus, markov, lm_head, object(), candidates, partials, output
             )
 
         gather.assert_not_called()
@@ -1566,16 +1555,7 @@ class TestDeepseekV4Config:
             side_effect=fake_all_gather,
         ) as gather:
             sample_dspark_block_greedy(
-                logits,
-                bonus,
-                markov,
-                lm_head,
-                object(),
-                candidates,
-                partials,
-                output,
-                candidate_communication="tiles",
-                compact_partials=None,
+                logits, bonus, markov, lm_head, object(), candidates, partials, output
             )
 
         assert (gather.call_count) == (4)
@@ -1591,22 +1571,11 @@ class TestDeepseekV4Config:
                 candidates[:, :, :2].contiguous(),
                 partials[:2],
                 output,
-                candidate_communication="tiles",
-                compact_partials=None,
             )
         lm_head.shard_indices.num_added_elements = 8
         with pytest.raises((ValueError), match=("without added vocabulary")):
             sample_dspark_block_greedy(
-                logits,
-                bonus,
-                markov,
-                lm_head,
-                object(),
-                candidates,
-                partials,
-                output,
-                candidate_communication="tiles",
-                compact_partials=None,
+                logits, bonus, markov, lm_head, object(), candidates, partials, output
             )
 
     def test_dspark_speculative_config_uses_block_plus_bonus_width(self):
