@@ -1179,3 +1179,49 @@ lands in the same change as the pin, never a release apart.
   remainder (4). Only the empty-round retraction (2), in a round that builds
   nothing and waits for no finished request, retracts or aborts an exempt
   request.
+
+
+## 6. Experimental expert-affinity decode selection
+
+An explicit `max_decode_batch_size` caps only local decode operations and is
+independent of resident request slots and prefill tokens. Zero preserves the
+original scheduling order when affinity is disabled. With a positive cap, both
+FIFO and expert-affinity use a fair ready queue (affinity also enables it with
+an uncapped batch): first-ready requests enter its tail in submission order,
+and successful decode service moves them to its tail. Failed admission does
+not consume a service turn. The admission queue and prefill head of line do not
+move. Retraction retries respect the same cap. A comparison must use identical
+caps; reducing the batch is not itself evidence of a throughput improvement.
+
+`ConfigureExpertAffinity(lookahead, max_deferrals, max_hint_age_tokens)` is an
+explicit opt-in before submission, supported on fused and D roles with ordinary
+single-token decode, no overlap and no mixed prefill. The lookahead (at most
+256) must cover the configured resident slots. Runtime integration must deliver
+identical completed observations to every mirrored scheduler; rank-local hints
+must never select a distributed batch.
+
+The policy considers only quiescent `Decoding` requests whose next step fits
+already-reserved capacity. First decodes, missing/stale observations and steps
+requiring capacity growth or reclamation form FIFO barriers. Inside each bounded
+eligible window, the oldest ready request seeds the batch; subsequent requests
+minimize additional predicted `(layer, expert)` keys, with FIFO ties. Only
+successful admissions add to that union. `max_deferrals` is a preference
+promotion threshold: a continuously eligible request skipped by an affinity
+window is forced ahead of younger preferences once it reaches the threshold,
+with older debt first. It is not a universal latency limit: a full batch still
+needs multiple rounds to serve a larger resident set. Unknown and stale hints
+retain fair ready-queue service even though they accrue no affinity debt.
+With a fixed continuously ready, capacity-admissible resident set, an oldest
+queue entry gets service within `max_deferrals + max_batch_size` productive
+decode rounds; newly ready arrivals join behind it. Prefill-only rounds, pending
+results and admission failures cannot promise decode service and are excluded.
+
+Hints contain at most 256 distinct packed layer/expert keys and are accepted
+only after a completed ordinary decode, with a strictly newer frontier no later
+than the request's committed frontier and no older than the configured token
+age. Request generations are renewed on submission, retraction and successful
+cache flush. A delayed observation with an obsolete generation is rejected;
+finished requests reject feedback and their records are removed at the next
+plan cleanup. Forward batches snapshot generations and expected completed
+frontiers before crossing the execution-thread boundary. No future routing,
+router change or extra model pass participates in scheduling.

@@ -128,6 +128,9 @@ void SchedulerConfig::ValidateCapacityInputs() const {
     if (max_batch_size < 0) {
         throw std::invalid_argument("Scheduler: max_batch_size must be >= 0");
     }
+    if (max_decode_batch_size < 0 || max_decode_batch_size > max_batch_size) {
+        throw std::invalid_argument("Scheduler: max_decode_batch_size must be in [0, max_batch_size]");
+    }
     if (decode_input_tokens < 0) {
         throw std::invalid_argument("Scheduler: decode_input_tokens must be >= 0");
     }

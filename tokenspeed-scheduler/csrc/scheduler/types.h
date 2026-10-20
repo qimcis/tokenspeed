@@ -66,6 +66,9 @@ struct SchedulerConfig {
 
     std::int32_t max_scheduled_tokens{};
     std::int32_t max_batch_size{};
+    // Independent decode batch cap; 0 retains max_batch_size. This also
+    // applies to FIFO so experimental comparisons preserve identical capacity.
+    std::int32_t max_decode_batch_size{0};
     std::int32_t decode_input_tokens{1};
     // Number of scheduler iterations that may be dispatched before the
     // accepted decode length is committed. The current event loop supports

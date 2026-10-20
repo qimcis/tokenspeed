@@ -77,6 +77,11 @@ from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.quantization.fp8 import Mxfp8Config
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
+from tokenspeed.runtime.models.engram_cache_runtime import EngramCacheRuntime
+from tokenspeed.runtime.models.engram_hot_cache import (
+    EngramHotSetManifest,
+    plan_engram_hot_cache,
+)
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
@@ -352,8 +357,7 @@ def resolve_engram_host_layout(host_table: bool, tp_size: int) -> str:
     if requested in ("shared", "sharded"):
         return requested
     raise ValueError(
-        "engram_host_table_layout must be auto, shared, or sharded; "
-        f"got {requested!r}"
+        f"engram_host_table_layout must be auto, shared, or sharded; got {requested!r}"
     )
 
 
@@ -489,6 +493,7 @@ class RowShardedEngramEmbedding(nn.Module):
         self.host_table = host_table
         self.host_layout = host_layout
         self.layer_id = layer_id
+        self.hot_cache_runtime: EngramCacheRuntime | None = None
         self._mmap_keep: list[object] = []
         self._host_gpu_registered = False
         row_sharded = (not host_table) or host_layout == "sharded"
@@ -579,6 +584,42 @@ class RowShardedEngramEmbedding(nn.Module):
             self.scale.data[local_rows:].fill_(127)
             self._register_host_for_gpu()
 
+    def configure_hot_cache(
+        self,
+        manifest: EngramHotSetManifest,
+        *,
+        capacity_rows: int,
+        model_revision: str,
+        device: torch.device | str,
+    ) -> None:
+        """Select immutable cache membership before loading or graph capture."""
+        if not self.host_table:
+            raise ValueError("Engram hot caching requires canonical host tables")
+        if self.hot_cache_runtime is not None:
+            raise RuntimeError(
+                "Engram cache membership is immutable; restart to change it"
+            )
+        plan = plan_engram_hot_cache(
+            manifest,
+            layer_id=self.layer_id,
+            model_revision=model_revision,
+            total_rows=self.num_embeddings,
+            row_start=self.row_start,
+            row_end=self.row_end,
+            capacity_rows=capacity_rows,
+            embedding_dim=self.embedding_dim,
+        )
+        if capacity_rows:
+            self.hot_cache_runtime = EngramCacheRuntime(plan, device=device)
+
+    def begin_hot_cache_update(self) -> None:
+        if self.hot_cache_runtime is not None:
+            self.hot_cache_runtime.begin_update()
+
+    def finish_hot_cache_loading(self) -> None:
+        if self.hot_cache_runtime is not None:
+            self.hot_cache_runtime.finish_loading(self.weight, self.scale)
+
     def _register_host_for_gpu(self) -> None:
         """cudaHostRegister once. Gather kernels must not register."""
         if self._host_gpu_registered or not self.host_table:
@@ -639,7 +680,12 @@ class RowShardedEngramEmbedding(nn.Module):
             raise ValueError(
                 "Engram weight is neither a full table nor this rank's row shard"
             )
+        field = "scale" if param is self.scale else "weight"
+        if self.hot_cache_runtime is not None:
+            self.hot_cache_runtime.begin_table_load(field)
         self._copy_rows(param, loaded_weight, 0)
+        if self.hot_cache_runtime is not None:
+            self.hot_cache_runtime.complete_table_load(field)
 
     def load_sharded(self, parameter_name: str, tensor_slice, chunk_rows: int) -> None:
         """Copy table rows from a CPU safetensors get_slice() in bounded chunks.
@@ -653,9 +699,14 @@ class RowShardedEngramEmbedding(nn.Module):
         """
         if parameter_name not in ("weight", "scale") or chunk_rows < 1:
             raise ValueError("Expected weight/scale and a positive row chunk size")
+        if self.hot_cache_runtime is not None:
+            self.hot_cache_runtime.begin_table_load(parameter_name)
         if self.host_table and not self._shared_writer:
+            # Publication is completed by the caller's existing load barrier.
+            if self.hot_cache_runtime is not None:
+                self.hot_cache_runtime.complete_table_load(parameter_name)
             return
-        param = getattr(self, parameter_name)
+        param = self.weight if parameter_name == "weight" else self.scale
         if tuple(tensor_slice.get_shape()) != (self.num_embeddings, param.shape[1]):
             raise ValueError("Checkpoint Engram shape does not match the global table")
         for start in range(self.row_start, self.row_end, chunk_rows):
@@ -664,6 +715,8 @@ class RowShardedEngramEmbedding(nn.Module):
             if rows.device.type != "cpu":
                 raise ValueError("Open Engram safetensors on CPU before slicing")
             self._copy_rows(param, rows, start - self.row_start)
+        if self.hot_cache_runtime is not None:
+            self.hot_cache_runtime.complete_table_load(parameter_name)
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
         """Gather [..., hash columns] IDs into BF16 [..., hash columns, head dim].
@@ -673,7 +726,30 @@ class RowShardedEngramEmbedding(nn.Module):
         only local rows and reduce. Dequantization uses the same FP8/E8M0
         torch casts in both paths.
         """
-        if indices.is_cuda and not self.host_table:
+        if self.hot_cache_runtime is not None:
+            cache = self.hot_cache_runtime.require_ready()
+            if indices.is_cuda:
+                from tokenspeed_kernel.ops.embedding import engram_cached_embedding
+
+                values = torch.empty(
+                    (*indices.shape, self.embedding_dim),
+                    device=indices.device,
+                    dtype=torch.bfloat16,
+                )
+                engram_cached_embedding(
+                    self.weight,
+                    self.scale,
+                    indices.contiguous(),
+                    cache.local_row_ids,
+                    cache.codes,
+                    cache.scales,
+                    self.row_start,
+                    self.row_end,
+                    out=values,
+                )
+            else:
+                values = cache.lookup_reference(self.weight, self.scale, indices)
+        elif indices.is_cuda and not self.host_table:
             from tokenspeed_kernel.ops.embedding import mxfp8_embedding
 
             values = mxfp8_embedding(
@@ -802,6 +878,18 @@ class DeepseekV41Engram(nn.Module):
             host_layout,
             layer_id,
         )
+        cache_capacity = global_server_args_dict["engram_hot_cache_capacity"]
+        if cache_capacity:
+            self.embed.configure_hot_cache(
+                EngramHotSetManifest.load(
+                    global_server_args_dict["engram_hot_cache_manifest"]
+                ),
+                capacity_rows=cache_capacity,
+                model_revision=global_server_args_dict[
+                    "engram_hot_cache_model_revision"
+                ],
+                device=device,
+            )
         self.q_weight.weight_loader = default_weight_loader
         self.k_weight.weight_loader = default_weight_loader
         # The embedding reduces [tokens, n_hash_cols * head_dim] across attention

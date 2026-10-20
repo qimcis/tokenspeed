@@ -164,11 +164,15 @@ def test_rejects_unsized_pool_only_in_the_scheduler() -> None:
 @pytest.mark.parametrize("overlap_schedule_depth", [0, 1])
 @pytest.mark.parametrize("max_scheduled_tokens", [4, 9])
 @pytest.mark.parametrize(
-    "groups",
+    "make_groups",
     [
-        [_full("full", 4, 1)],
-        [_full("full", 4, 2), _state("state", 1)],
-        [_full("full", 4, 3), _sliding("swa", 4, 5, 1), _sliding("tail", 2, 9, 2)],
+        lambda: [_full("full", 4, 1)],
+        lambda: [_full("full", 4, 2), _state("state", 1)],
+        lambda: [
+            _full("full", 4, 3),
+            _sliding("swa", 4, 5, 1),
+            _sliding("tail", 2, 9, 2),
+        ],
     ],
     ids=["full", "full+state", "full+two-windows"],
 )
@@ -176,9 +180,12 @@ def test_pool_sized_by_the_model_admits_what_the_scheduler_bounds(
     decode_input_tokens: int,
     overlap_schedule_depth: int,
     max_scheduled_tokens: int,
-    groups: list,
+    make_groups,
 ) -> None:
     """Size a pool for one request of L tokens, then ask the sized Scheduler."""
+    # Pytest retains parameter values until interpreter shutdown. Keep native
+    # instances local so they are released before the extension is finalized.
+    groups = make_groups()
     for token_limit in range(decode_input_tokens + 1, 40):
         cfg = _sizing_config(
             role=ts.SchedulerConfig.Role.Fused,

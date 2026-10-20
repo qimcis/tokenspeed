@@ -38,6 +38,7 @@
 #include "fsm/forward_events.h"
 #include "fsm/pd_events.h"
 #include "resource/allocator/req_pool_allocator.h"
+#include "scheduler/expert_affinity.h"
 #include "scheduler/execution_event.h"
 #include "scheduler/execution_plan.h"
 #include "scheduler/kv_cache_events.h"
@@ -52,6 +53,12 @@ public:
     explicit Scheduler(SchedulerConfig config);
 
     void SubmitRequests(const std::vector<RequestSpec>& request_specs);
+
+    // Explicit experimental policy; configure before submitting any requests.
+    void ConfigureExpertAffinity(std::int32_t lookahead, std::int32_t max_deferrals, std::int32_t max_hint_age_tokens);
+    std::uint64_t RequestGeneration(const std::string& request_id) const;
+    bool UpdateExpertRoute(const std::string& request_id, std::uint64_t generation, std::int32_t computed_frontier,
+                           std::vector<std::uint64_t> expert_keys);
 
     ExecutionPlan NextExecutionPlan();
     void Advance(const ExecutionEvent& event);
@@ -294,6 +301,7 @@ private:
         std::int32_t pending_prefill_reserve{0};
         bool pushed_prefill{false};
         bool pushed_decode{false};
+        std::int32_t decode_count{0};
         bool Full(std::int32_t max_batch_size) const {
             return token_budget <= 0 || operations.size() == static_cast<std::size_t>(max_batch_size);
         }
@@ -310,6 +318,11 @@ private:
     // slot, so it bypasses this (but still marks the request scheduled).
     template <typename Operation>
     void pushOperation(PlanBuild& build, const Request& request, Operation operation) {
+        if (expert_affinity_) {
+            operation.request_generation = RequestGeneration(request.Id());
+            operation.computed_frontier =
+                request.NumComputedTokens() + (std::is_same_v<Operation, DecodeOperation> ? operation.input_length : 0);
+        }
         build.scheduled.insert(&request);
         // The D role budgets prompt tokens only: its prefills are the peer's
         // work (they ride plan.remote_prefill and never reach here), so its
@@ -322,6 +335,10 @@ private:
         }
         if constexpr (std::is_same_v<Operation, DecodeOperation>) {
             build.pushed_decode = true;
+            ++build.decode_count;
+            if (config_.max_decode_batch_size > 0 || expert_affinity_) {
+                decode_service_tickets_[&request] = ++next_decode_service_ticket_;
+            }
         }
         build.operations.push_back(std::move(operation));
     }
@@ -432,7 +449,28 @@ private:
                                   bool new_prompts_sealed, std::int32_t decode_reserve);
     void scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);
 
+    struct ExpertRouteState {
+        std::uint64_t generation{0};
+        std::int32_t frontier{-1};
+        std::int32_t deferrals{0};
+        std::vector<std::uint64_t> keys;
+    };
+    struct ExpertAffinityConfig {
+        std::int32_t lookahead;
+        std::int32_t max_deferrals;
+        std::int32_t max_hint_age_tokens;
+    };
     SchedulerConfig config_;
+    std::optional<ExpertAffinityConfig> expert_affinity_;
+    std::unordered_map<const Request*, ExpertRouteState> expert_routes_;
+    std::uint64_t next_request_generation_{0};
+    // Fair service order is enabled with a decode cap or affinity. It is
+    // independent of route hints and leaves the admission FIFO untouched.
+    // Newly ready requests join its tail; successful service requeues there.
+    std::unordered_map<const Request*, std::uint64_t> decode_service_tickets_;
+    std::uint64_t next_decode_service_ticket_{0};
+    void invalidateExpertRoute(const Request& request);
+
     ReqPoolAllocator req_pool_allocator_;
     // One slot per retracted request: the index of its slot-state blob in
     // the runtime's arena, released by the FSM transition that drops the image.

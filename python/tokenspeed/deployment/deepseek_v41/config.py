@@ -24,10 +24,17 @@ from __future__ import annotations
 
 import sys
 import tomllib
+from dataclasses import asdict
 from pathlib import Path
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from tokenspeed.runtime.performance_options import (
+    PerformanceCapabilities,
+    PerformanceOptions,
+    validate_performance_options,
+)
 
 Positive = Annotated[int, Field(gt=0)]
 Role = Literal["aggregate", "encode", "prefill", "decode"]
@@ -81,6 +88,29 @@ class Engine(StrictConfig):
         return self
 
 
+class Performance(StrictConfig):
+    # Selecting this section requires explicit path choices.
+    expert_affinity: bool
+    execution: Literal["default", "eager_serial"]
+    dspark_candidate_communication: Literal["tiles", "compact"]
+    max_decode_batch_size: Annotated[int, Field(ge=0)] = 0
+    expert_affinity_lookahead: int = 256
+    expert_affinity_max_deferrals: int = 8
+    expert_affinity_max_hint_age_tokens: int = 64
+    expert_affinity_capture_interval: int = 16
+    expert_affinity_max_layers: int = 4
+    engram_hot_cache_manifest: str | None = None
+    engram_hot_cache_capacity: int = 0
+
+    def options(self, revision: str) -> PerformanceOptions:
+        return PerformanceOptions(
+            **self.model_dump(exclude={"execution"}),
+            engram_hot_cache_model_revision=(
+                revision if self.engram_hot_cache_capacity else None
+            ),
+        )
+
+
 class Transport(StrictConfig):
     encode_cache_mib: Annotated[int, Field(ge=0)]
     encode_host_cache_mib: Annotated[int, Field(ge=0)]
@@ -109,6 +139,7 @@ class Deployment(StrictConfig):
     gpu_budget: Positive
     base_port: Annotated[int, Field(ge=1024, le=64000)]
     engine: Engine
+    performance: Performance | None = None
     transport: Transport
     metrics: Metrics
     workers: list[Worker] = Field(min_length=1, max_length=8)
@@ -132,12 +163,118 @@ class Deployment(StrictConfig):
             sizes = {worker.role: worker.attention_tp for worker in self.workers}
             if sizes["prefill"] % sizes["encode"]:
                 raise ValueError("prefill TP must be a multiple of encode TP")
+        if self.performance is not None:
+            options = self.performance.options(self.revision)
+            options.validate()
+            if options.max_decode_batch_size > self.engine.max_num_seqs:
+                raise ValueError("max_decode_batch_size exceeds max_num_seqs")
+            if (
+                options.expert_affinity
+                and self.engine.max_num_seqs > options.expert_affinity_lookahead
+            ):
+                raise ValueError("expert_affinity_lookahead must cover max_num_seqs")
+            for worker in self.workers:
+                if worker.role in ("encode", "prefill"):
+                    continue
+                validate_performance_options(
+                    options,
+                    PerformanceCapabilities(
+                        model_is_deepseek_v41=True,
+                        nvidia_cuda=True,
+                        role=worker.role,
+                        speculation=(
+                            "DSPARK" if self.engine.speculation == "dspark" else None
+                        ),
+                        speculative_sampling=False,
+                        pipeline_size=1,
+                        attention_dp=1,
+                        attention_tp=worker.attention_tp,
+                        world_size=len(worker.gpus),
+                        query_context_size=1,
+                        kv_parallel_size=1,
+                        eager=self.performance.execution == "eager_serial",
+                        prefill_graph_disabled=self.performance.execution
+                        == "eager_serial",
+                        overlap_disabled=self.performance.execution == "eager_serial",
+                        mixed_batch=False,
+                        expert_rebalancing=False,
+                        custom_expert_placement=False,
+                        routing_simulation=False,
+                        host_engram=self.engine.engram != "gpu",
+                        host_engram_layout=self.engine.engram.removeprefix("host_"),
+                        load_format="auto",
+                    ),
+                )
+            if options.engram_hot_cache_capacity:
+                _hot_cache_ledger(self)
         return self
 
     @classmethod
     def load(cls, path: Path) -> Deployment:
         with path.open("rb") as source:
-            return cls.model_validate(tomllib.load(source))
+            data = tomllib.load(source)
+        performance = data.get("performance")
+        if isinstance(performance, dict) and performance.get(
+            "engram_hot_cache_manifest"
+        ):
+            manifest = Path(performance["engram_hot_cache_manifest"])
+            if not manifest.is_absolute():
+                performance["engram_hot_cache_manifest"] = str(
+                    (path.parent / manifest).resolve()
+                )
+        return cls.model_validate(data)
+
+
+def _hot_cache_ledger(config: Deployment) -> dict[str, list[dict[str, int]]]:
+    """Account actual selected rows on every TP rank, including metadata/staging."""
+    if config.performance is None or not config.performance.engram_hot_cache_capacity:
+        return {}
+    from tokenspeed.runtime.models.engram_hot_cache import (
+        EngramHotSetManifest,
+        plan_engram_hot_cache,
+    )
+
+    manifest = EngramHotSetManifest.load(config.performance.engram_hot_cache_manifest)
+    expected = {1: 384006168, 14: 384016682}
+    if {layer.layer_id: layer.total_rows for layer in manifest.layers} != expected:
+        raise ValueError("Engram manifest layers must match the pinned V4.1 checkpoint")
+    ledger = {}
+    for worker in config.workers:
+        if worker.role == "encode":
+            continue
+        rank_entries = []
+        for rank in range(worker.attention_tp):
+            payload = metadata = staging = 0
+            for layer_id, rows in expected.items():
+                shard = (rows + worker.attention_tp - 1) // worker.attention_tp
+                start, end = (
+                    (rank * shard, min((rank + 1) * shard, rows))
+                    if config.engine.engram == "host_sharded"
+                    else (0, rows)
+                )
+                plan = plan_engram_hot_cache(
+                    manifest,
+                    layer_id=layer_id,
+                    model_revision=config.revision,
+                    total_rows=rows,
+                    row_start=start,
+                    row_end=end,
+                    capacity_rows=config.performance.engram_hot_cache_capacity,
+                    embedding_dim=256,
+                )
+                payload += len(plan.local_row_ids) * 264
+                metadata += len(plan.local_row_ids) * 8
+                staging = max(staging, plan.staging_nbytes)
+            rank_entries.append(
+                {
+                    "rank": rank,
+                    "codes_and_scales": payload,
+                    "lookup_metadata": metadata,
+                    "host_staging_peak": staging,
+                }
+            )
+        ledger[worker.role] = rank_entries
+    return ledger
 
 
 def memory_lower_bound(config: Deployment) -> dict:
@@ -150,6 +287,7 @@ def memory_lower_bound(config: Deployment) -> dict:
     engram = (384006168 + 384016682) * (256 + 8)
     experts = 40 * 384 * 3 * 5120 * 2304 // 2
     rows = []
+    hot_caches = _hot_cache_ledger(config)
     for worker in config.workers:
         size = len(worker.gpus)
         if worker.role == "encode":
@@ -198,14 +336,48 @@ def memory_lower_bound(config: Deployment) -> dict:
             "draft_windows": draft_windows,
             "embedding_receive_pool": receive,
         }
+        route_capture_host = (
+            config.engine.max_num_seqs
+            * config.performance.expert_affinity_max_layers
+            * 6
+            * 8
+            if config.performance is not None
+            and config.performance.expert_affinity
+            and worker.role in ("aggregate", "decode")
+            else 0
+        )
+        hot_ranks = hot_caches.get(worker.role, [])
+        if hot_ranks:
+            components["engram_hot_codes_and_scales_max"] = max(
+                row["codes_and_scales"] for row in hot_ranks
+            )
+            components["engram_hot_lookup_metadata_max"] = max(
+                row["lookup_metadata"] for row in hot_ranks
+            )
         rows.append(
             {
                 "role": worker.role,
                 "gpus": worker.gpus,
+                **(
+                    {"expert_route_capture_pinned_host_bytes": route_capture_host}
+                    if route_capture_host
+                    else {}
+                ),
+                **(
+                    {
+                        "engram_hot_cache_per_rank": hot_ranks,
+                        "engram_hot_host_staging_peak_per_worker": sum(
+                            row["host_staging_peak"] for row in hot_ranks
+                        ),
+                    }
+                    if hot_ranks
+                    else {}
+                ),
                 "components_per_rank": components,
                 "known_device_bytes_per_rank": sum(components.values()),
                 "known_host_bytes_per_worker": (
-                    0 if config.engine.engram == "gpu" else engram
+                    (0 if config.engine.engram == "gpu" else engram)
+                    + route_capture_host
                 ),
             }
         )
@@ -218,7 +390,7 @@ def memory_lower_bound(config: Deployment) -> dict:
             "dense/shared/vision/draft weights",
             "cache packing and allocator slack",
             "graph and kernel workspaces",
-            "load peaks",
+            "load peaks (Engram hot-cache staging peak is reported separately)",
             "communication buffers",
             "host process overhead",
             "embedding payloads outside configured pools",
@@ -358,6 +530,35 @@ def build_manifest(
                 ]
             if engine.speculation == "dspark":
                 argv += ["--speculative-algorithm", "DSPARK"]
+            if config.performance is not None:
+                performance = config.performance
+                if performance.engram_hot_cache_capacity:
+                    argv += [
+                        "--engram-hot-cache-manifest",
+                        performance.engram_hot_cache_manifest,
+                        "--engram-hot-cache-capacity",
+                        str(performance.engram_hot_cache_capacity),
+                        "--engram-hot-cache-model-revision",
+                        config.revision,
+                    ]
+                if worker.role in ("aggregate", "decode"):
+                    argv += [
+                        "--dspark-candidate-communication",
+                        performance.dspark_candidate_communication,
+                        "--max-decode-batch-size",
+                        str(performance.max_decode_batch_size),
+                    ]
+                    if performance.execution == "eager_serial":
+                        argv += [
+                            "--enforce-eager",
+                            "--disable-prefill-graph",
+                            "--disable-overlap-schedule",
+                        ]
+                    if performance.expert_affinity:
+                        argv += ["--expert-affinity"]
+                        for key, value in performance.model_dump().items():
+                            if key.startswith("expert_affinity_"):
+                                argv += ["--" + key.replace("_", "-"), str(value)]
             if worker.role == "decode":
                 argv += ["--disable-prefix-caching", "--disable-prefill-graph"]
             if worker.role == "prefill" and config.mode == "epd":
@@ -436,4 +637,22 @@ def build_manifest(
         },
         "memory": memory_lower_bound(config),
         "hardware_validated": False,
+        **(
+            {
+                "performance": {
+                    "resolved": {
+                        **asdict(config.performance.options(config.revision)),
+                        "execution": config.performance.execution,
+                    },
+                    "validation": "CPU contract only; GPU numerical, graph and performance gates unrun",
+                    "decode_policy_roles": [
+                        w.role
+                        for w in config.workers
+                        if w.role in ("aggregate", "decode")
+                    ],
+                }
+            }
+            if config.performance is not None
+            else {}
+        ),
     }

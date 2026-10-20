@@ -71,6 +71,9 @@ def _config(sizes: list[int], *, max_num_seqs: int, max_capture: int):
         query_shard_rank=0,
         prefill_graph_max_tokens=256,
         enable_memory_saver=False,
+        expert_affinity=False,
+        expert_affinity_capture_interval=16,
+        expert_affinity_max_layers=4,
     )
 
 

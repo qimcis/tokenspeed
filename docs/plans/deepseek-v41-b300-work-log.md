@@ -72,7 +72,7 @@ experiment schema. No subagent should commit or publish independently.
 | Checkpoint inventory | Safetensors metadata audit without allocating weights | Stored bytes do not establish runtime residency |
 | Experiment analysis | Complete task population, itemized cost, paired cluster quality/cost bounds | Conditional statistical evidence; no automatic release approval |
 | Calibration and replay | Per-phase linear fit and FCFS role queues | No batching or admission model; extrapolation is flagged |
-| Route and locality screens | Small-window exact future-route oracle and LRU hit curves | No online scheduler or GPU hot-row cache implemented |
+| Route and locality screens | Small-window exact future-route oracle and LRU hit curves | Foundation-only screens; see the performance increment for runtime candidates |
 | Frontend image positions | Decode language-model-only path retains physical image padding while preserving authored IDs | Pure padding tests pass; full frontend role tests require runtime dependencies |
 | EPD transfer hardening | Compatible wire validation and drain-before-terminal fanout barrier | CPU fake-transport checks; no external cancellation/DMA or CUDA recovery proof |
 | Endpoint qualification | Opt-in text/image/prefix/concurrency/streaming/tool smoke suite | Skipped without endpoint; no quality or recovery claim |
@@ -162,8 +162,8 @@ records below distinguish integrated CPU evidence from deferred hardware work.
    queue, and speculative-round observations.
 4. Evaluate topology under equal offered workload and whole-system cost; retain
    failures, rejections, retries, and idle resource allocations.
-5. Implement conditional scheduling, caching, or kernel changes only after their
-   mechanism and correctness gates are supported by evidence.
+5. Qualify the implemented opt-in scheduling, caching and kernel candidates
+   described in the performance increment before promoting them as defaults.
 6. Keep model co-design separate from engine-only evaluation. Router changes
    require separately versioned artifacts and independent quality acceptance.
 
@@ -172,3 +172,25 @@ The implementation is tracked on branch `deepseek-b300`; use
 destination is `origin/deepseek-b300`. The user prohibits opening pull requests.
 CPU completion must never be reported as full hardware or optimization-plan
 completion.
+
+## Performance implementation increment
+
+The [next implementation plan](deepseek-v41-b300-performance.md) was saved before
+launching the requested fifteen agents. The [performance work log](deepseek-v41-b300-performance-log.md)
+records their deliberation, changes, reviews and validation. Actual opt-in paths
+now exist for native expert-aware scheduling with past-route feedback, immutable
+Engram hot-row caching with fused gather/dequantization, and compact DSpark
+candidate communication. The original serving path remains the default.
+
+The corresponding [performance guide](../guides/deepseek-v41-b300-performance.md)
+documents supported configurations and qualification commands. These additions
+have CPU/native validation only; GPU compilation, numerics, graph replay,
+distributed device behavior and performance gains remain unverified. No 3x claim
+is supported. Branch updates are published without opening a PR.
+
+Integrated performance-increment verification: 628 Python tests passed with
+22 explicit environment/hardware skips, plus 610 native C++ tests passed. The
+Python total includes the 247 native binding tests. Full repository hooks passed
+and independent review found no remaining blockers. No GPU compilation or
+performance run was performed. The detailed performance record owns the exact
+commands, review corrections and remaining qualification gates.

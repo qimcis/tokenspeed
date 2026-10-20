@@ -28,7 +28,8 @@ all-gather: the kernel scores this rank's vocabulary tiles and emits one packed
 candidates, and the next step's kernel (or the final resolve) reduces them to
 the winning token. Packing the ordered logit bits above the negated token id
 makes a plain integer max pick the largest logit and, on ties, the lowest
-token id -- ``torch.argmax`` semantics over the concatenated shards.
+token id. Signed zeros and NaNs retain their packed bit ordering; see the
+sampling README for that upstream numerical contract.
 
 The bias is a tensor-core dot of the previous token's BF16 bigram row against
 the BF16 projection shard: BF16 products are exact in FP32, so this matches
@@ -42,6 +43,7 @@ from tokenspeed_kernel._triton import tl, triton
 
 __all__ = [
     "dspark_block_candidate_tiles",
+    "dspark_block_compact_candidates",
     "dspark_block_greedy_resolve",
     "dspark_block_greedy_step",
 ]
@@ -120,7 +122,8 @@ def _block_step_kernel(
     TP: tl.constexpr,
     TP_PAD: tl.constexpr,
     N_TILES: tl.constexpr,
-    N_TILES_PAD: tl.constexpr,
+    CANDIDATE_TILES: tl.constexpr,
+    CANDIDATE_TILES_PAD: tl.constexpr,
     RESOLVE_PREVIOUS: tl.constexpr,
 ):
     tile = tl.program_id(0)
@@ -134,8 +137,8 @@ def _block_step_kernel(
             row_mask,
             TP,
             TP_PAD,
-            N_TILES,
-            N_TILES_PAD,
+            CANDIDATE_TILES,
+            CANDIDATE_TILES_PAD,
         )
         if tile == 0:
             tl.store(
@@ -245,8 +248,9 @@ def dspark_block_greedy_step(
         anchor_ids: ``[rows]`` int32/int64 tokens preceding step 0, in any
             stride (the drafters pass a column of their token table); read
             only when ``step == 0``.
-        candidates: ``[tp, rows, n_tiles]`` int64 candidates gathered after
-            the previous step; read only when ``step > 0``, and then disjoint
+        candidates: ``[tp, rows, n_tiles]`` baseline or ``[tp, rows, 1]``
+            compact int64 candidates gathered after the previous step; read
+            only when ``step > 0``, and then disjoint
             from ``partials``.
         embedding: ``[vocab, rank]`` BF16 replicated bigram table.
         projection: ``[padded_local_vocab, rank]`` BF16 projection shard whose
@@ -297,7 +301,10 @@ def dspark_block_greedy_step(
     ):
         raise ValueError(f"anchor_ids must be [{rows}] int32/int64")
     n_tiles = dspark_block_candidate_tiles(local_vocab)
-    tp = _check_candidates(candidates, rows, n_tiles)
+    candidate_tiles = candidates.shape[2] if candidates.ndim == 3 else 0
+    if candidate_tiles not in (1, n_tiles):
+        raise ValueError(f"candidate tile count must be 1 or {n_tiles}")
+    tp = _check_candidates(candidates, rows, candidate_tiles)
     if partials.shape != (rows, n_tiles) or partials.dtype != torch.int64:
         raise ValueError(f"partials must be [{rows}, {n_tiles}] int64")
     if not partials.is_contiguous():
@@ -338,7 +345,8 @@ def dspark_block_greedy_step(
         TP=tp,
         TP_PAD=triton.next_power_of_2(tp),
         N_TILES=n_tiles,
-        N_TILES_PAD=triton.next_power_of_2(n_tiles),
+        CANDIDATE_TILES=candidate_tiles,
+        CANDIDATE_TILES_PAD=triton.next_power_of_2(candidate_tiles),
         RESOLVE_PREVIOUS=step > 0,
         num_warps=4,
     )
@@ -383,5 +391,75 @@ def dspark_block_greedy_resolve(
         TP_PAD=triton.next_power_of_2(tp),
         N_TILES=n_tiles,
         N_TILES_PAD=triton.next_power_of_2(n_tiles),
+        num_warps=4,
+    )
+
+
+@triton.jit(do_not_specialize=["rows"])
+def _block_compact_candidates_kernel(
+    partials_ptr,
+    output_ptr,
+    rows,
+    N_TILES: tl.constexpr,
+    TILES_PAD: tl.constexpr,
+):
+    # One CTA per request avoids repeating the tile reduction in every
+    # vocabulary-scoring CTA of the following block step.
+    row = tl.program_id(0)
+    tiles = tl.arange(0, TILES_PAD)
+    packed = tl.load(
+        partials_ptr + row.to(tl.int64) * N_TILES + tiles,
+        mask=(row < rows) & (tiles < N_TILES),
+        other=_INT64_MIN,
+    )
+    tl.store(output_ptr + row, tl.max(packed, axis=0), mask=row < rows)
+
+
+def dspark_block_compact_candidates(
+    partials: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    """Reduce local tile candidates to one signed int64 winner per request.
+
+    Args:
+        partials: Contiguous ``[rows, n_tiles]`` int64 candidates from
+            :func:`dspark_block_greedy_step`; ``n_tiles`` must be positive.
+        output: Disjoint contiguous ``[rows, 1]`` int64 destination on the
+            same GPU. Allocate this buffer before graph capture.
+
+    Returns:
+        None. Writes every output row in place without allocation or host
+        synchronization. An empty request batch performs no GPU launch.
+
+    The reduction preserves the existing DSpark packed ordering bit for bit,
+    including infinities, NaN payload ordering and positive versus negative
+    zero. It does not change scoring, repack candidates or canonicalize NaNs.
+    All-sentinel rows stay INT64_MIN; their decoded token remains -1.
+    """
+    if partials.ndim != 2 or partials.shape[1] <= 0:
+        raise ValueError("partials must be [rows, positive n_tiles]")
+    rows, n_tiles = partials.shape
+    if partials.dtype != torch.int64 or not partials.is_contiguous():
+        raise ValueError("partials must be contiguous int64")
+    if output.shape != (rows, 1) or output.dtype != torch.int64:
+        raise ValueError(f"output must be [{rows}, 1] int64")
+    if not output.is_contiguous():
+        raise ValueError("output must be contiguous")
+    if not partials.is_cuda or output.device != partials.device:
+        raise ValueError("partials and output must be on the same GPU")
+    if (
+        rows > 0
+        and partials.data_ptr() < output.data_ptr() + output.numel() * 8
+        and output.data_ptr() < partials.data_ptr() + partials.numel() * 8
+    ):
+        raise ValueError("partials and output must not overlap")
+    if rows == 0:
+        return
+    _block_compact_candidates_kernel[(rows,)](
+        partials,
+        output,
+        rows,
+        N_TILES=n_tiles,
+        TILES_PAD=triton.next_power_of_2(n_tiles),
         num_warps=4,
     )

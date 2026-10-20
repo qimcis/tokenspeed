@@ -191,6 +191,7 @@ def scheduler_config_from_args(
         num_device_pages=geometry.num_device_pages,
         max_scheduled_tokens=max_scheduled_tokens,
         max_batch_size=max_batch_size,
+        max_decode_batch_size=server_args.max_decode_batch_size,
         prefix_granularity=geometry.prefix_granularity,
         num_host_pages=specs.num_host_pages,
         disable_l2_cache=not server_args.enable_kvstore,
@@ -440,6 +441,24 @@ class EventLoop:
             f"cache_groups={[group.group_id for group in cache_groups]!s}",
         )
         self.scheduler = Scheduler(scheduler_cfg)
+        self._route_feedback_hooks = None
+        if server_args.expert_affinity:
+            from tokenspeed.runtime.engine.route_feedback_hooks import (
+                RouteFeedbackHooks,
+            )
+
+            self.scheduler.configure_expert_affinity(
+                server_args.expert_affinity_lookahead,
+                server_args.expert_affinity_max_deferrals,
+                server_args.expert_affinity_max_hint_age_tokens,
+            )
+            self._route_feedback_hooks = RouteFeedbackHooks(
+                interval=server_args.expert_affinity_capture_interval,
+                max_requests=server_args.max_num_seqs,
+                leader=self.attn_tp_rank == 0,
+                group=self.attn_tp_cpu_group,
+                source_rank=server_args.mapping.attn.tp_group[0],
+            )
         self._l3_hooks = L3CacheHooks(
             self.scheduler,
             self._device if scheduler_cfg.enable_l3_storage else None,
@@ -978,6 +997,12 @@ class EventLoop:
         # Everything below reads host tensors.
         with nvtx_range("commit:sync", color="red"):
             results = pending.result()
+        if self._route_feedback_hooks is not None:
+            self._route_feedback_hooks.collect(
+                num_extends=forward_op.num_extends(),
+                input_lengths=tuple(forward_op.input_lengths),
+                captured=results.captured_routes,
+            )
         self.request_handler.forward_ct += 1
         forward_mode = ForwardMode.from_num_extends(
             forward_op.num_extends(),
@@ -1348,6 +1373,17 @@ class EventLoop:
                 # the only caller of scheduler.advance.)
                 if request_changes:
                     advance_scheduler(self.scheduler, request_changes)
+
+                # Completed routes become hints only after their frontier commits.
+                # The C++ generation check rejects finished, retracted or reused IDs.
+                if self._route_feedback_hooks is not None:
+                    for observation in self._route_feedback_hooks.drain():
+                        self.scheduler.update_expert_route(
+                            observation.request_id,
+                            observation.generation,
+                            observation.computed_frontier,
+                            list(observation.expert_keys),
+                        )
 
                 self._publish_scheduler_kv_events()
 

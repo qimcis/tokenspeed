@@ -150,6 +150,7 @@ from tokenspeed.runtime.models.base import BaseCausalLM
 from tokenspeed.runtime.models.deepseek_v41_engram import (
     DeepseekV41Engram,
     EngramHashState,
+    RowShardedEngramEmbedding,
     is_engram_embed_checkpoint_name,
     resolve_engram_host_layout,
 )
@@ -2600,6 +2601,11 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             loaded.add(raw)
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
+        # Shared mappings become readable on every rank at the existing barrier.
+        # Materialize or refresh resident rows only after both byte tensors load.
+        for module in self.modules():
+            if isinstance(module, RowShardedEngramEmbedding):
+                module.finish_hot_cache_loading()
 
     def post_load_weights(self) -> None:
         for module in self.modules():
@@ -2643,6 +2649,11 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]], **kwargs
     ) -> None:
+        # The weight-update caller quiesces execution. Invalidate captured keys
+        # before any writes; a failed load cannot replay stale resident bytes.
+        for module in self.modules():
+            if isinstance(module, RowShardedEngramEmbedding):
+                module.begin_hot_cache_update()
         params = dict(self.vision.named_parameters()) if self.vision is not None else {}
         loaded = set()
 

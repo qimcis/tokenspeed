@@ -110,11 +110,17 @@ class DeepseekV41DSpark(BaseDrafter):
         self.start_pos_buf = torch.empty(
             (max_bs,), dtype=torch.int64, device=self.device
         )
-        self.candidates, self.partials = dspark_greedy_workspace(
+        self.candidate_communication = (
+            draft_model_runner.server_args.dspark_candidate_communication
+        )
+        if self.candidate_communication == "compact" and self.device.type != "cuda":
+            raise ValueError("Compact DSpark candidates require a CUDA device")
+        self.candidates, self.partials, self.compact_partials = dspark_greedy_workspace(
             int(self.draft_model.mapping.attn.tp_size),
             max_bs,
             int(self.model.markov_projection.num_embeddings_per_partition),
             self.device,
+            candidate_communication=self.candidate_communication,
         )
 
     def idle_forward_global_num_tokens(
@@ -134,6 +140,14 @@ class DeepseekV41DSpark(BaseDrafter):
         self.target_model = target_model
         self.lm_head = self.draft_model.lm_head
         self.tp_group = target_model.logits_processor.tp_group
+        if self.candidate_communication == "compact":
+            projection = self.model.markov_projection
+            if projection.tp_size != self.candidates.shape[1] or (
+                projection.tp_size > 1 and projection.tp_group != self.tp_group
+            ):
+                raise ValueError(
+                    "Compact DSpark candidates require the LM head TP group"
+                )
 
     def prepare_request_state(
         self,
@@ -219,6 +233,8 @@ class DeepseekV41DSpark(BaseDrafter):
             self.candidates,
             self.partials,
             self.draft_tokens_buf[:num_decodes],
+            candidate_communication=self.candidate_communication,
+            compact_partials=self.compact_partials,
         )
         next_tokens[num_extends:, 1:].copy_(self.draft_tokens_buf[:num_decodes])
 

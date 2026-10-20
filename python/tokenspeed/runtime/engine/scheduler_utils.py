@@ -360,6 +360,7 @@ def make_config(
     cache_groups: Sequence[CacheGroupConfig] | None = None,
     enable_mixed_prefill_decode: bool = False,
     prefix_replay_tokens: int = 0,
+    max_decode_batch_size: int = 0,
 ) -> SchedulerConfig:
     """Build the C++ scheduler's configuration.
 
@@ -400,6 +401,7 @@ def make_config(
         cache_groups: The arena's scheduler group configs.
         enable_mixed_prefill_decode: Mixed prefill/decode batches.
         prefix_replay_tokens: Prompt tail recomputed after a prefix hit.
+        max_decode_batch_size: Decode selection cap; 0 retains the slot capacity.
     """
     if not 0 <= prefix_replay_tokens <= (1 << 31) - 1:
         raise ValueError(
@@ -427,6 +429,13 @@ def make_config(
     cfg.num_device_pages = num_device_pages
     cfg.max_scheduled_tokens = max_scheduled_tokens
     cfg.max_batch_size = max_batch_size
+    if max_decode_batch_size:
+        try:
+            cfg.max_decode_batch_size = max_decode_batch_size
+        except AttributeError as exc:
+            raise ValueError(
+                "max_decode_batch_size requires the updated tokenspeed-scheduler; build/install it from this source checkout"
+            ) from exc
     cfg.prefix_granularity = prefix_granularity
 
     cfg.num_host_pages = num_host_pages

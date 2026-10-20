@@ -33,6 +33,8 @@ namespace tokenspeed {
 
 struct ForwardOperationBase {
     std::string request_id;
+    std::uint64_t request_generation{0};
+    std::int32_t computed_frontier{0};
     std::int32_t request_pool_index{-1};
     std::int32_t input_length{0};
     std::int32_t prefill_length{0};
@@ -72,6 +74,8 @@ using ForwardOperation = std::variant<PrefillOperation, DecodeOperation>;
 
 struct ForwardBatch {
     std::vector<std::string> request_ids;
+    std::vector<std::uint64_t> request_generations;
+    std::vector<std::int32_t> computed_frontiers;
     std::vector<std::int32_t> request_pool_indices;
     std::vector<std::int32_t> input_lengths;
     // Per-request total number of prompt tokens (Request::PrefillSize()).
@@ -104,6 +108,8 @@ struct ForwardBatch {
             std::visit(
                 [this](auto& inner) {
                     request_ids.push_back(std::move(inner.request_id));
+                    request_generations.push_back(inner.request_generation);
+                    computed_frontiers.push_back(inner.computed_frontier);
                     request_pool_indices.push_back(inner.request_pool_index);
                     input_lengths.push_back(inner.input_length);
                     prefill_lengths.push_back(inner.prefill_length);

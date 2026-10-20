@@ -136,17 +136,17 @@ def expert_placement_requested(server_args) -> bool:
     )
 
 
-def _checkpoint_architectures(
+def _checkpoint_metadata(
     model: str, revision: str | None, download: bool = False
-) -> list[str] | None:
-    """The ``architectures`` of ``model``'s ``config.json``: from the model
+) -> dict | None:
+    """The configuration of ``model``'s ``config.json``: from the model
     directory, else from the local Hugging Face cache, else, with ``download``,
     by downloading that file alone as ``get_config`` resolves a hub id
     (HF_HUB_OFFLINE keeps it to the cache; a ModelScope id is not looked up on
     the Hugging Face Hub). None when it cannot be read.
     """
     if not model:
-        return []
+        return {}
     path = os.path.join(model, "config.json")
     if not os.path.isdir(model):
         import huggingface_hub.constants
@@ -179,7 +179,16 @@ def _checkpoint_architectures(
             config = json.load(file)
     except (OSError, ValueError):
         return None
-    architectures = config.get("architectures") if isinstance(config, dict) else None
+    return config if isinstance(config, dict) else {}
+
+
+def _checkpoint_architectures(
+    model: str, revision: str | None, download: bool = False
+) -> list[str] | None:
+    config = _checkpoint_metadata(model, revision, download)
+    if config is None:
+        return None
+    architectures = config.get("architectures")
     return list(architectures) if isinstance(architectures, list) else []
 
 
@@ -580,6 +589,18 @@ class ServerArgs:
     deepseek_v4_indexer_prefill_max_logits_mb: int = 512
     deepseek_v4_prefill_chunk_size: int = 4
     # DeepSeek V4.1 Engram host tables. Off by default (GPU-sharded).
+    # Experimental paths are inert unless explicitly selected.
+    expert_affinity: bool = False
+    expert_affinity_lookahead: int = 256
+    expert_affinity_max_deferrals: int = 8
+    expert_affinity_max_hint_age_tokens: int = 64
+    expert_affinity_capture_interval: int = 16
+    expert_affinity_max_layers: int = 4
+    max_decode_batch_size: int = 0
+    engram_hot_cache_manifest: str | None = None
+    engram_hot_cache_capacity: int = 0
+    engram_hot_cache_model_revision: str | None = None
+    dspark_candidate_communication: Literal["tiles", "compact"] = "tiles"
     engram_host_table: bool = False
     engram_host_table_dir: str | None = None
     engram_host_table_layout: str = "auto"
@@ -2283,7 +2304,130 @@ class ServerArgs:
                 "--init-expert-location or --expert-distribution-recorder-mode)."
             )
 
+    def validate_performance_options(self):
+        from tokenspeed.runtime.performance_options import (
+            PerformanceCapabilities,
+            PerformanceOptions,
+            require_scheduler_performance_support,
+            validate_performance_options,
+        )
+
+        options = PerformanceOptions(
+            expert_affinity=self.expert_affinity,
+            expert_affinity_lookahead=self.expert_affinity_lookahead,
+            expert_affinity_max_deferrals=self.expert_affinity_max_deferrals,
+            expert_affinity_max_hint_age_tokens=self.expert_affinity_max_hint_age_tokens,
+            expert_affinity_capture_interval=self.expert_affinity_capture_interval,
+            expert_affinity_max_layers=self.expert_affinity_max_layers,
+            max_decode_batch_size=self.max_decode_batch_size,
+            engram_hot_cache_manifest=self.engram_hot_cache_manifest,
+            engram_hot_cache_capacity=self.engram_hot_cache_capacity,
+            engram_hot_cache_model_revision=self.engram_hot_cache_model_revision,
+            dspark_candidate_communication=self.dspark_candidate_communication,
+        )
+        options.validate()
+        if self.max_decode_batch_size > self.max_num_seqs // self.mapping.attn.dp_size:
+            raise ValueError(
+                "max_decode_batch_size cannot exceed rank-local max_num_seqs"
+            )
+        if self.max_decode_batch_size and self.disaggregation_mode in (
+            "encode",
+            "prefill",
+        ):
+            raise ValueError("max_decode_batch_size requires aggregate or decode role")
+        if self.expert_affinity and self.max_num_seqs > self.expert_affinity_lookahead:
+            raise ValueError(
+                "expert_affinity_lookahead must cover max_num_seqs for bounded fairness"
+            )
+        if self.max_decode_batch_size or self.expert_affinity:
+            from tokenspeed_scheduler import Scheduler, SchedulerConfig
+
+            require_scheduler_performance_support(options, SchedulerConfig, Scheduler)
+        if not options.experimental:
+            return
+        from tokenspeed.env import is_cuda_build
+        from tokenspeed.runtime.utils.env import envs
+
+        checkpoint = _checkpoint_metadata(self.model, self.revision)
+        validate_performance_options(
+            options,
+            PerformanceCapabilities(
+                model_is_deepseek_v41=checkpoint is not None
+                and (
+                    checkpoint.get("model_type") == "deepseek_v41"
+                    or "DeepseekV41ForCausalLM" in checkpoint.get("architectures", [])
+                ),
+                nvidia_cuda=self.device == "cuda" and is_cuda_build(),
+                role=self.disaggregation_mode,
+                speculation=self.speculative_algorithm,
+                speculative_sampling=self.enable_speculative_sampling,
+                pipeline_size=self.pipeline_parallel_size,
+                attention_dp=self.mapping.attn.dp_size,
+                attention_tp=self.mapping.attn.tp_size,
+                world_size=self.mapping.world_size,
+                query_context_size=self.query_context_parallel_size,
+                kv_parallel_size=self.kv_parallel_size,
+                eager=self.enforce_eager,
+                prefill_graph_disabled=self.disable_prefill_graph,
+                overlap_disabled=self.disable_overlap_schedule,
+                mixed_batch=self.enable_mixed_batch,
+                expert_rebalancing=self.enable_eplb,
+                custom_expert_placement=self.init_expert_location != "trivial"
+                or self.ep_num_redundant_experts != 0,
+                routing_simulation=bool(envs.TOKENSPEED_MOE_ROUTING_SIMULATION.get()),
+                host_engram=self.engram_host_table,
+                host_engram_layout=self.engram_host_table_layout,
+                load_format=self.load_format,
+            ),
+        )
+        if self.engram_hot_cache_capacity:
+            from tokenspeed.runtime.models.engram_hot_cache import (
+                EngramHotSetManifest,
+                plan_engram_hot_cache,
+            )
+
+            manifest = EngramHotSetManifest.load(self.engram_hot_cache_manifest)
+            text = checkpoint.get("text_config", checkpoint)
+            if text.get("engram_head_dim") != 256:
+                raise ValueError("Engram hot cache requires 256-element rows")
+            layers = dict(
+                zip(
+                    text.get("engram_layer_ids", []),
+                    text.get("engram_num_embeddings", []),
+                    strict=True,
+                )
+            )
+            if (
+                not layers
+                or {layer.layer_id: layer.total_rows for layer in manifest.layers}
+                != layers
+            ):
+                raise ValueError(
+                    "Engram manifest layers do not match checkpoint geometry"
+                )
+            for layer_id, rows in layers.items():
+                shard = (
+                    rows + self.mapping.attn.tp_size - 1
+                ) // self.mapping.attn.tp_size
+                for rank in range(self.mapping.attn.tp_size):
+                    start, end = (
+                        (rank * shard, min((rank + 1) * shard, rows))
+                        if self.engram_host_table_layout == "sharded"
+                        else (0, rows)
+                    )
+                    plan_engram_hot_cache(
+                        manifest,
+                        layer_id=layer_id,
+                        model_revision=self.engram_hot_cache_model_revision,
+                        total_rows=rows,
+                        row_start=start,
+                        row_end=end,
+                        capacity_rows=self.engram_hot_cache_capacity,
+                        embedding_dim=text.get("engram_head_dim", 256),
+                    )
+
     def validate(self):
+        self.validate_performance_options()
         if self.low_latency_max_num_tokens_per_gpu <= 0:
             raise ValueError("--low-latency-max-num-tokens-per-gpu must be positive")
         if self.input_logprob_chunk_tokens <= 0:
@@ -3255,6 +3399,63 @@ class ServerArgs:
             help=(
                 "Maximum number of requests per DeepSeek V4 FlashMLA prefill " "chunk."
             ),
+        )
+        parser.add_argument(
+            "--expert-affinity",
+            action="store_true",
+            default=ServerArgs.expert_affinity,
+            help="Opt in to bounded expert-aware decode selection (eager, no overlap or speculation).",
+        )
+        parser.add_argument(
+            "--expert-affinity-lookahead",
+            type=int,
+            default=ServerArgs.expert_affinity_lookahead,
+        )
+        parser.add_argument(
+            "--expert-affinity-max-deferrals",
+            type=int,
+            default=ServerArgs.expert_affinity_max_deferrals,
+        )
+        parser.add_argument(
+            "--expert-affinity-max-hint-age-tokens",
+            type=int,
+            default=ServerArgs.expert_affinity_max_hint_age_tokens,
+        )
+        parser.add_argument(
+            "--expert-affinity-capture-interval",
+            type=int,
+            default=ServerArgs.expert_affinity_capture_interval,
+        )
+        parser.add_argument(
+            "--expert-affinity-max-layers",
+            type=int,
+            default=ServerArgs.expert_affinity_max_layers,
+        )
+        parser.add_argument(
+            "--max-decode-batch-size",
+            type=int,
+            default=ServerArgs.max_decode_batch_size,
+        )
+        parser.add_argument(
+            "--engram-hot-cache-capacity",
+            type=int,
+            default=ServerArgs.engram_hot_cache_capacity,
+        )
+        parser.add_argument(
+            "--engram-hot-cache-manifest",
+            type=str,
+            default=ServerArgs.engram_hot_cache_manifest,
+        )
+        parser.add_argument(
+            "--engram-hot-cache-model-revision",
+            type=str,
+            default=ServerArgs.engram_hot_cache_model_revision,
+        )
+        parser.add_argument(
+            "--dspark-candidate-communication",
+            choices=("tiles", "compact"),
+            default=ServerArgs.dspark_candidate_communication,
+            help="DSpark tile gather baseline or compact local-max candidate exchange.",
         )
         parser.add_argument(
             "--engram-host-table",

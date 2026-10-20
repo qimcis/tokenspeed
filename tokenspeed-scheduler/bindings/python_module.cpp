@@ -138,6 +138,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("prefix_granularity", &tokenspeed::SchedulerConfig::prefix_granularity)
         .def_rw("max_scheduled_tokens", &tokenspeed::SchedulerConfig::max_scheduled_tokens)
         .def_rw("max_batch_size", &tokenspeed::SchedulerConfig::max_batch_size)
+        .def_rw("max_decode_batch_size", &tokenspeed::SchedulerConfig::max_decode_batch_size)
         .def_rw("decode_input_tokens", &tokenspeed::SchedulerConfig::decode_input_tokens)
         .def_rw("overlap_schedule_depth", &tokenspeed::SchedulerConfig::overlap_schedule_depth)
         .def_rw("role", &tokenspeed::SchedulerConfig::role)
@@ -281,7 +282,9 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
 
     auto forward_batch = nb::class_<tokenspeed::ForwardBatch>(forward, "Batch");
     BindForwardCommonFields<tokenspeed::ForwardBatch>(forward_batch);
-    forward_batch.def_ro("input_ids", &tokenspeed::ForwardBatch::input_ids)
+    forward_batch.def_ro("request_generations", &tokenspeed::ForwardBatch::request_generations)
+        .def_ro("computed_frontiers", &tokenspeed::ForwardBatch::computed_frontiers)
+        .def_ro("input_ids", &tokenspeed::ForwardBatch::input_ids)
         .def_ro("shifted_input_ids", &tokenspeed::ForwardBatch::shifted_input_ids)
         .def_ro("extend_prefix_lens", &tokenspeed::ForwardBatch::extend_prefix_lens)
         .def_ro("extend_replay_lens", &tokenspeed::ForwardBatch::extend_replay_lens)
@@ -515,6 +518,11 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("tail_cap_evictions", &tokenspeed::Scheduler::TailCapEvictions,
              "Tails dropped because more than eight were published under one prior page.")
         .def("request_token_size", &tokenspeed::Scheduler::RequestTokenSize, nb::arg("id"))
+        .def("configure_expert_affinity", &tokenspeed::Scheduler::ConfigureExpertAffinity, nb::arg("lookahead"),
+             nb::arg("max_deferrals"), nb::arg("max_hint_age_tokens"))
+        .def("request_generation", &tokenspeed::Scheduler::RequestGeneration, nb::arg("request_id"))
+        .def("update_expert_route", &tokenspeed::Scheduler::UpdateExpertRoute, nb::arg("request_id"),
+             nb::arg("generation"), nb::arg("computed_frontier"), nb::arg("expert_keys"))
         .def("max_single_request_tokens", &tokenspeed::Scheduler::MaxSingleRequestTokens)
         .def("clear_l1_cache", &tokenspeed::Scheduler::ClearL1Cache)
         .def("clear_cache", &tokenspeed::Scheduler::ClearCache)

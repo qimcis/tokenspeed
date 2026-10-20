@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.grammar.capturable_grammar import (
         GrammarStepCompletion,
     )
+    from tokenspeed.runtime.moe.route_capture import CapturedRoutes
 
 
 @dataclass(frozen=True)
@@ -301,6 +302,7 @@ class ModelExecutionResult:
     input_top_logprobs_idx: torch.Tensor | None = None
     output_top_logprobs_val: torch.Tensor | None = None
     output_top_logprobs_idx: torch.Tensor | None = None
+    captured_routes: CapturedRoutes | None = None
     _synced: bool = field(default=False, init=False, repr=False, compare=False)
 
     def sync(self) -> None:

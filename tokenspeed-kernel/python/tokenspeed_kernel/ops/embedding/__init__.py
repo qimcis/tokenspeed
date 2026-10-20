@@ -410,6 +410,7 @@ __all__ = [
     "apply_rope",
     "apply_rope_mla",
     "vocab_shard_embedding",
+    "engram_cached_embedding",
 ]
 
 
@@ -419,7 +420,9 @@ import tokenspeed_kernel.ops.embedding.ascend  # noqa: E402,F401
 import tokenspeed_kernel.ops.embedding.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.embedding.flashinfer  # noqa: E402,F401
 import tokenspeed_kernel.ops.embedding.triton  # noqa: E402,F401
+import tokenspeed_kernel.ops.embedding.triton_cached  # noqa: E402,F401
 import tokenspeed_kernel.ops.embedding.triton_host_gather  # noqa: E402,F401
+from tokenspeed_kernel.ops.embedding.cached import engram_cached_embedding  # noqa: E402
 
 
 def mxfp8_embedding(weight, scales, indices, row_start, row_end):
@@ -519,6 +522,7 @@ def vocab_shard_embedding(
     kernel = select_kernel(
         "embedding",
         "vocab_shard_embedding",
+        "engram_cached_embedding",
         format_signature(weight=dense_tensor_format(weight.dtype)),
         traits=None,
         override=None,

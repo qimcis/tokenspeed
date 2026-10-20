@@ -12,6 +12,8 @@ bias of a shard column lands on the rank that owns that column's base logit.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Literal
+
 import torch
 from tokenspeed_kernel.ops.sampling.triton import (
     dspark_block_candidate_tiles,
@@ -21,10 +23,12 @@ from tokenspeed_kernel.ops.sampling.triton import (
 from torch import nn
 
 from tokenspeed.runtime.distributed.comm_ops import all_gather_single
-from tokenspeed.runtime.layers.vocab_parallel_embedding import (
-    ParallelLMHead,
-    VocabParallelEmbedding,
-)
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.vocab_parallel_embedding import (
+        ParallelLMHead,
+        VocabParallelEmbedding,
+    )
 
 
 class DSparkVanillaMarkov(nn.Module):
@@ -42,36 +46,78 @@ class DSparkVanillaMarkov(nn.Module):
         self.projection = projection
 
 
+DSparkCandidateCommunication = Literal["tiles", "compact"]
+
+
+def _compact_candidates_kernel():
+    # Existing kernel wheels remain sufficient for the default tiles path.
+    # Workspace setup calls this before graph warmup/capture when opted in.
+    try:
+        from tokenspeed_kernel.ops.sampling.triton import (
+            dspark_block_compact_candidates,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "Compact DSpark candidates require a tokenspeed-kernel build with "
+            "dspark_block_compact_candidates; install the matching kernel build "
+            "or select --dspark-candidate-communication tiles"
+        ) from exc
+    return dspark_block_compact_candidates
+
+
 def dspark_greedy_workspace(
-    tp_size: int, max_rows: int, local_vocab: int, device: torch.device
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Allocate the candidate buffers ``sample_dspark_block_greedy`` gathers into.
+    tp_size: int,
+    max_rows: int,
+    local_vocab: int,
+    device: torch.device,
+    *,
+    candidate_communication: DSparkCandidateCommunication,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Allocate stable packed-candidate buffers before graph capture.
 
     Args:
         tp_size: Ranks the LM head is sharded over.
         max_rows: Most rows one call will sample.
         local_vocab: Columns of this rank's head shard.
         device: Device of the draft.
+        candidate_communication: Gather every vocabulary tile (``tiles``), or
+            reduce each rank's tiles before gathering (``compact``).
 
     Returns:
-        ``(candidates, partials)``: a ``[2, tp_size, max_rows, tiles]`` int64
-        double buffer holding every rank's packed candidates -- consecutive
-        steps alternate slots, so a step's programs never overwrite the
-        candidates they are still resolving -- and, when the head spans
-        several ranks, the ``[max_rows, tiles]`` buffer this rank scores into
-        before the gather. A single rank scores straight into its slot, so
-        ``partials`` is None.
+        ``(candidates, partials, compact_partials)``. Candidates are an int64
+        double buffer ``[2, tp_size, max_rows, communicated_tiles]``. Steps
+        alternate slots so scoring never overwrites the previous candidates
+        it is still resolving. communicated_tiles is one in compact mode.
+        Partials hold local tile scores; only single-rank tiles mode writes
+        directly into candidates.
+        Compact partials hold ``[max_rows, 1]`` local maxima for a multi-rank
+        compact gather. Single-rank compact mode reduces directly into its
+        current candidate slot. No allocation is needed during sampling.
     """
+    if candidate_communication not in ("tiles", "compact"):
+        raise ValueError("DSpark candidate communication must be tiles or compact")
+    if tp_size < 1 or max_rows < 0 or local_vocab < 1:
+        raise ValueError("Invalid DSpark greedy workspace dimensions")
     tiles = dspark_block_candidate_tiles(local_vocab)
+    compact = candidate_communication == "compact"
+    if compact:
+        _compact_candidates_kernel()
     candidates = torch.empty(
-        (2, tp_size, max_rows, tiles), dtype=torch.int64, device=device
+        (2, tp_size, max_rows, 1 if compact else tiles),
+        dtype=torch.int64,
+        device=device,
     )
     partials = (
-        None
-        if tp_size == 1
-        else torch.empty((max_rows, tiles), dtype=torch.int64, device=device)
+        torch.empty((max_rows, tiles), dtype=torch.int64, device=device)
+        if compact or tp_size > 1
+        else None
     )
-    return candidates, partials
+    compact_partials = (
+        torch.empty((max_rows, 1), dtype=torch.int64, device=device)
+        if compact and tp_size > 1
+        else None
+    )
+    return candidates, partials, compact_partials
 
 
 def sample_dspark_block_greedy(
@@ -83,6 +129,9 @@ def sample_dspark_block_greedy(
     candidates: torch.Tensor,
     partials: torch.Tensor | None,
     output: torch.Tensor,
+    *,
+    candidate_communication: DSparkCandidateCommunication,
+    compact_partials: torch.Tensor | None,
 ) -> torch.Tensor:
     """Apply the trained Markov correction and greedily sample a fixed block.
 
@@ -95,8 +144,9 @@ def sample_dspark_block_greedy(
         tp_group: Tensor-parallel group of the head.
         candidates: Gathered-candidate double buffer from
             ``dspark_greedy_workspace``.
-        partials: This rank's candidate buffer from
-            ``dspark_greedy_workspace``; None on a single rank.
+        partials: This rank's tile buffer from ``dspark_greedy_workspace``.
+        candidate_communication: Explicit tile or compact exchange selection.
+        compact_partials: Compact local maxima from ``dspark_greedy_workspace``.
         output: ``[rows, block]`` int32 destination for the block tokens.
 
     Returns:
@@ -112,26 +162,47 @@ def sample_dspark_block_greedy(
         or projection.shard_indices.num_org_elements != shard.num_org_elements
     ):
         raise ValueError("DSpark Markov projection is not sharded like the LM head")
+    if candidate_communication not in ("tiles", "compact"):
+        raise ValueError("DSpark candidate communication must be tiles or compact")
+    compact = candidate_communication == "compact"
+    compact_kernel = _compact_candidates_kernel() if compact else None
     if candidates.ndim != 4 or candidates.shape[0] != 2:
         raise ValueError(
             "DSpark greedy candidates must be a [2, tp, rows, tiles] buffer"
         )
     _, tp_size, capacity, tiles = candidates.shape
-    if capacity < rows or (partials is None) != (tp_size == 1):
+    score_tiles = dspark_block_candidate_tiles(local_vocab)
+    needs_partials = compact or tp_size > 1
+    if (
+        tp_size < 1
+        or capacity < rows
+        or tiles != (1 if compact else score_tiles)
+        or (partials is not None) != needs_partials
+        or (compact_partials is not None) != (compact and tp_size > 1)
+    ):
         raise ValueError("DSpark greedy workspace does not cover the batch")
-    if partials is not None and partials.shape != (capacity, tiles):
+    if partials is not None and partials.shape != (capacity, score_tiles):
         raise ValueError("DSpark greedy workspace does not cover the batch")
+    if compact_partials is not None and compact_partials.shape != (capacity, 1):
+        raise ValueError("DSpark greedy compact workspace does not cover the batch")
+    for buffer in (candidates, partials, compact_partials):
+        if buffer is not None and (
+            buffer.dtype != torch.int64
+            or buffer.device != local_base_logits.device
+            or not buffer.is_contiguous()
+        ):
+            raise ValueError(
+                "DSpark workspace needs contiguous int64 buffers on the logits device"
+            )
+    if rows == 0 or block == 0:
+        return output
     slots = [
         candidates[slot].view(-1)[: tp_size * rows * tiles].view(tp_size, rows, tiles)
         for slot in range(2)
     ]
     for step in range(block):
         previous, current = slots[(step - 1) % 2], slots[step % 2]
-        scored = (
-            current[0]
-            if partials is None
-            else partials.view(-1)[: rows * tiles].view(rows, tiles)
-        )
+        scored = current[0] if partials is None else partials[:rows]
         dspark_block_greedy_step(
             local_base_logits,
             step,
@@ -144,7 +215,13 @@ def sample_dspark_block_greedy(
             scored,
             output,
         )
-        if partials is not None:
-            all_gather_single(current.view(-1), scored.view(-1), tp_group)
+        communicated = scored
+        if compact:
+            communicated = (
+                current[0] if compact_partials is None else compact_partials[:rows]
+            )
+            compact_kernel(scored, communicated)
+        if tp_size > 1:
+            all_gather_single(current.view(-1), communicated.view(-1), tp_group)
     dspark_block_greedy_resolve(slots[(block - 1) % 2], output, block - 1)
     return output

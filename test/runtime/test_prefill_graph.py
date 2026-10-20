@@ -162,6 +162,9 @@ class TestPrefillCaptureArgsTest:
             query_shard_size=1,
             query_shard_rank=0,
             enable_memory_saver=False,
+            expert_affinity=False,
+            expert_affinity_capture_interval=16,
+            expert_affinity_max_layers=4,
         )
         with pytest.raises((TypeError), match=("prefill_graph_capture_batch_sizes")):
             ModelExecutorConfig(**config_args)
@@ -1385,6 +1388,9 @@ class TestPrefillRoleGraphsTest:
             query_shard_size=1,
             query_shard_rank=0,
             enable_memory_saver=False,
+            expert_affinity=False,
+            expert_affinity_capture_interval=16,
+            expert_affinity_max_layers=4,
             prefill_graph_max_tokens=256,
         )
 

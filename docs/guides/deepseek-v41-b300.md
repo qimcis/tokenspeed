@@ -273,6 +273,8 @@ The CPU work supplies deployment and evidence tooling plus targeted runtime
 correctness hardening. It does not implement every conditional optimization in
 the plan. B300 numerical correctness, real transfer completion, cancellation and
 recovery, per-rank peak memory, model quality, performance, and cost acceptance
-remain hardware gates. Expert-aware online scheduling, Engram hot-row caching,
-new B300 DSpark kernels, remote cache policy, and tree speculation require their
-own evidence and correctness gates before implementation or promotion.
+remain hardware gates. The [performance increment](deepseek-v41-b300-performance.md) now implements
+opt-in expert-aware scheduling, immutable Engram hot-row caching and compact
+DSpark/fused-gather kernels. Their GPU compilation and performance promotion
+remain separate gates. Remote cache policy, adaptive cache replacement and tree
+speculation remain additional work.

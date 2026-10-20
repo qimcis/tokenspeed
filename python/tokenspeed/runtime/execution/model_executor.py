@@ -403,6 +403,9 @@ class ModelExecutorConfig:
     # Sleep/wake (--enable-memory-saver): decode CUDA graphs are captured into
     # the memory saver's ``cuda_graph`` region so a release can free them.
     enable_memory_saver: bool
+    expert_affinity: bool
+    expert_affinity_capture_interval: int
+    expert_affinity_max_layers: int
     enable_nan_detection: bool = False
     disable_autotune: bool = False
     enable_cudagraph_gc: bool = False
@@ -507,6 +510,9 @@ class ModelExecutorConfig:
             query_shard_size=server_args.mapping.attn.qcp_size,
             query_shard_rank=server_args.mapping.attn.qcp_rank,
             enable_memory_saver=server_args.enable_memory_saver,
+            expert_affinity=server_args.expert_affinity,
+            expert_affinity_capture_interval=server_args.expert_affinity_capture_interval,
+            expert_affinity_max_layers=server_args.expert_affinity_max_layers,
             data_parallel_size=server_args.mapping.attn.dp_size,
             world_size=server_args.mapping.world_size,
             world_group=server_args.mapping.world_group,
@@ -553,6 +559,25 @@ class ModelExecutor:
         self.device = config.device
         self.config = config
         self.model_runner = model_runner
+        self._route_capture = None
+        if config.expert_affinity:
+            from tokenspeed.runtime.moe.route_capture import create_route_capture
+
+            if (
+                not config.enforce_eager
+                or config.overlap_schedule_depth
+                or config.spec_algo
+            ):
+                raise ValueError(
+                    "expert affinity requires eager, non-overlapped, non-speculative execution"
+                )
+            self._route_capture = create_route_capture(
+                model_runner.model,
+                interval=config.expert_affinity_capture_interval,
+                max_layers=config.expert_affinity_max_layers,
+                max_requests=config.max_num_seqs,
+                leader=config.global_rank == 0,
+            )
         self.sampling_backend = sampling_backend
         self.attn_backend = attn_backend
         self.token_to_kv_pool = token_to_kv_pool
@@ -2205,6 +2230,12 @@ class ModelExecutor:
         sampled_top_k: int,
         stop_criteria: Sequence[StopCriteria],
     ) -> ModelExecutionResult:
+        if self._route_capture is not None:
+            self._route_capture.begin(
+                num_extends=forward_op.num_extends(),
+                input_lengths=tuple(forward_op.input_lengths),
+            )
+        captured_routes = None
         self._reset_valid_cache_length(forward_op)
         self.log_step += 1
         num_extends = forward_op.num_extends()
@@ -2604,7 +2635,14 @@ class ModelExecutor:
                     f"{mm_delta_count!s}",
                 )
 
+        if self._route_capture is not None:
+            captured_routes = self._route_capture.finish(
+                request_ids=tuple(forward_op.request_ids),
+                generations=tuple(forward_op.request_generations),
+                computed_frontiers=tuple(forward_op.computed_frontiers),
+            )
         return ModelExecutionResult(
+            captured_routes=captured_routes,
             output_tokens=output_tokens,
             output_lengths=output_lengths,
             output_logprobs=output_logprobs,

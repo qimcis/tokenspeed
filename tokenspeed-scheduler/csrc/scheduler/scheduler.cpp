@@ -243,6 +243,7 @@ bool Scheduler::clearCache(bool include_host) {
         spdlog::info("[Scheduler] flush {}cache rejected: cached blocks are still pinned", include_host ? "" : "L1 ");
         return false;
     }
+    for (const auto& request : requests_) invalidateExpertRoute(*request);
     spdlog::info("[Scheduler] flush {}cache completed", include_host ? "" : "L1 ");
     return true;
 }
@@ -323,6 +324,63 @@ void Scheduler::markKvEventBoundaryForReconcile(const CacheKey& boundary) {
     }
 }
 
+void Scheduler::ConfigureExpertAffinity(std::int32_t lookahead, std::int32_t max_deferrals,
+                                        std::int32_t max_hint_age_tokens) {
+    if (!requests_.empty() || next_request_generation_ != 0) {
+        throw std::invalid_argument("Expert affinity must be configured before submitting requests");
+    }
+    if (lookahead < 2 || lookahead > 256 || max_deferrals < 1 || max_deferrals > 1024 || max_hint_age_tokens < 1 ||
+        max_hint_age_tokens > 4096) {
+        throw std::invalid_argument(
+            "Expert affinity requires lookahead [2,256], max_deferrals [1,1024], "
+            "max_hint_age_tokens [1,4096]");
+    }
+    if (lookahead < config_.max_batch_size) {
+        throw std::invalid_argument("Expert affinity lookahead must cover max_batch_size resident slots");
+    }
+    if (config_.role == Role::kP || config_.decode_input_tokens != 1 || config_.overlap_schedule_depth != 0 ||
+        config_.enable_mixed_prefill_decode) {
+        throw std::invalid_argument(
+            "Expert affinity requires fused/D ordinary non-overlapped decode without mixed prefill");
+    }
+    expert_affinity_ = ExpertAffinityConfig{lookahead, max_deferrals, max_hint_age_tokens};
+}
+
+std::uint64_t Scheduler::RequestGeneration(const std::string& request_id) const {
+    const auto request = requests_by_id_.find(request_id);
+    if (request == requests_by_id_.end()) return 0;
+    const auto state = expert_routes_.find(request->second);
+    return state == expert_routes_.end() ? 0 : state->second.generation;
+}
+
+void Scheduler::invalidateExpertRoute(const Request& request) {
+    if (expert_affinity_) {
+        expert_routes_[&request] = ExpertRouteState{.generation = ++next_request_generation_};
+    }
+}
+
+bool Scheduler::UpdateExpertRoute(const std::string& request_id, std::uint64_t generation,
+                                  std::int32_t computed_frontier, std::vector<std::uint64_t> expert_keys) {
+    if (!expert_affinity_ || expert_keys.empty() || expert_keys.size() > 256) return false;
+    const auto request_it = requests_by_id_.find(request_id);
+    if (request_it == requests_by_id_.end()) return false;
+    const Request& request = *request_it->second;
+    if (!request.Is<fsm::Decoding>() || request.ResultsInFlight() != 0) return false;
+    auto state_it = expert_routes_.find(&request);
+    if (state_it == expert_routes_.end()) return false;
+    auto& state = state_it->second;
+    const auto frontier = request.NumComputedTokens();
+    if (generation != state.generation || computed_frontier < 0 || computed_frontier <= state.frontier ||
+        computed_frontier > frontier || frontier - computed_frontier > expert_affinity_->max_hint_age_tokens) {
+        return false;
+    }
+    std::ranges::sort(expert_keys);
+    expert_keys.erase(std::unique(expert_keys.begin(), expert_keys.end()), expert_keys.end());
+    state.frontier = computed_frontier;
+    state.keys = std::move(expert_keys);
+    return true;
+}
+
 void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
     std::unordered_set<std::string> request_ids;
     request_ids.reserve(request_specs.size());
@@ -358,6 +416,7 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
     for (std::size_t i = 0; i < request_specs.size(); ++i) {
         const bool inserted = requests_by_id_.emplace(request_specs[i].request_id, pending_requests[i].get()).second;
         FatalCheck(inserted, "validated request id became duplicate before insertion");
+        invalidateExpertRoute(*pending_requests[i]);
         requests_.push_back(std::move(pending_requests[i]));
     }
 }
@@ -443,6 +502,8 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
         if (!request->template Is<fsm::Finished>()) {
             return false;
         }
+        expert_routes_.erase(request.get());
+        decode_service_tickets_.erase(request.get());
         kv_event_hash_progress_.erase(request->Id());
         requests_by_id_.erase(request->Id());
         return true;

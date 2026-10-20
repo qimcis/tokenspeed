@@ -763,6 +763,7 @@ std::optional<Scheduler::ImageShortfall> Scheduler::retractVictim(
         return ImageShortfall::kSnapshotPool;  // the publication stands; the victim keeps running
     }
     victim.NoteRetracted();
+    invalidateExpertRoute(victim);
     if (stores->host_store) {
         write_back_operations.push_back(std::move(*stores->host_store));
     }
@@ -848,6 +849,12 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
                                         std::vector<WriteBackOperation>& write_back_operations) {
     Request* blocker = std::exchange(feedback.capacity_blocker, nullptr);
     if (!build.NoPrefillProgress() || blocker == nullptr) {
+        return;
+    }
+    // A full explicit decode cap cannot accept this grant. Wait for its next
+    // fair service turn instead of retracting pages for work we cannot issue.
+    if (config_.max_decode_batch_size > 0 && build.decode_count >= config_.max_decode_batch_size &&
+        blocker->IsAnyOf<fsm::PrefillDone, fsm::Decoding>()) {
         return;
     }
     // A load-back mid-flight is writing pages its admission owns; the victim
@@ -956,6 +963,9 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
 
         feedback.admission_failed = false;
         if (blocked_on_decode) {
+            if (config_.max_decode_batch_size > 0 && build.decode_count >= config_.max_decode_batch_size) {
+                return;
+            }
             if (auto event = scheduleDecode(build.plan, feedback, blocker)) {
                 pushOperation(build, *blocker, applyEventAndBuildOperation(blocker, std::move(*event)));
                 blocker->TrackScheduledForward();
@@ -1195,22 +1205,97 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
 // role decodes consume no budget, so it never binds there.
 void Scheduler::scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build,
                                     std::span<Request* const> candidates) {
-    for (Request* request : candidates) {
-        if (build.Full(config_.max_batch_size) ||
-            build.token_budget < build.pending_prefill_reserve + config_.decode_input_tokens) {
-            return;
+    const auto decode_cap = config_.max_decode_batch_size > 0 ? config_.max_decode_batch_size : config_.max_batch_size;
+    std::vector<Request*> service_order;
+    if (config_.max_decode_batch_size > 0 || expert_affinity_) {
+        for (Request* request : candidates) {
+            if (request->IsAnyOf<fsm::PrefillDone, fsm::Decoding>() && !build.Scheduled(*request)) {
+                service_order.push_back(request);
+                if (!decode_service_tickets_.contains(request)) {
+                    decode_service_tickets_.emplace(request, ++next_decode_service_ticket_);
+                }
+            }
         }
-        if ((!request->Is<fsm::PrefillDone>() && !request->Is<fsm::Decoding>()) || build.Scheduled(*request)) {
-            continue;
-        }
+        std::stable_sort(service_order.begin(), service_order.end(), [this](const Request* a, const Request* b) {
+            return decode_service_tickets_.at(a) < decode_service_tickets_.at(b);
+        });
+        candidates = service_order;
+    }
+    const auto full = [&] {
+        return build.Full(config_.max_batch_size) || build.decode_count >= decode_cap ||
+               build.token_budget < build.pending_prefill_reserve + config_.decode_input_tokens;
+    };
+    const auto schedule = [&](Request* request) {
         feedback.admission_failed = false;
         if (auto event = scheduleDecode(build.plan, feedback, request)) {
             pushOperation(build, *request, applyEventAndBuildOperation(request, std::move(*event)));
             request->TrackScheduledForward();
-        } else if (feedback.admission_failed) {
-            feedback.NoteCapacityBlocked(request);
+            return true;
         }
+        if (feedback.admission_failed) feedback.NoteCapacityBlocked(request);
+        return false;
+    };
+    // The uncapped default retains the original scan. Experimental windows
+    // preserve the fair service order, including missing/stale hint barriers.
+    std::vector<Request*> window;
+    std::unordered_set<std::uint64_t> expert_union;
+    const auto flush_window = [&] {
+        while (!window.empty() && !full()) {
+            std::vector<ExpertAffinityCandidate> scores;
+            scores.reserve(window.size());
+            for (const auto* request : window) {
+                const auto& state = expert_routes_.at(request);
+                scores.push_back({state.keys, state.deferrals});
+            }
+            const auto index = SelectExpertAffinity(scores, expert_union, expert_affinity_->max_deferrals);
+            Request* request = window[index];
+            auto& state = expert_routes_.at(request);
+            if (schedule(request)) {
+                expert_union.insert(state.keys.begin(), state.keys.end());
+                state.deferrals = 0;
+            } else {
+                // A failed admission neither contributes routes nor incurs
+                // fairness debt; the ordinary capacity retry retains ownership.
+                state.deferrals = 0;
+            }
+            window.erase(window.begin() + static_cast<std::ptrdiff_t>(index));
+        }
+        if (!expert_union.empty()) {
+            for (const auto* request : window) {
+                auto& state = expert_routes_.at(request);
+                state.deferrals =
+                    std::min(state.deferrals + 1, expert_affinity_->max_deferrals + expert_affinity_->lookahead);
+            }
+        }
+        window.clear();
+    };
+    for (Request* request : candidates) {
+        if ((!request->Is<fsm::PrefillDone>() && !request->Is<fsm::Decoding>()) || build.Scheduled(*request)) continue;
+        if (full()) return;
+        if (expert_affinity_) {
+            auto& state = expert_routes_.at(request);
+            const auto frontier = request->NumComputedTokens();
+            const bool fresh = state.frontier >= 0 && state.frontier <= frontier &&
+                               frontier - state.frontier <= expert_affinity_->max_hint_age_tokens;
+            // Only already-resident quiescent steps with prepaid capacity may
+            // incur fairness debt. First decode, growth, reclaim and PD arrivals
+            // retain their original admission positions and form FIFO barriers.
+            const bool eligible =
+                request->Is<fsm::Decoding>() && request->ResultsInFlight() == 0 && fresh && !state.keys.empty() &&
+                canConsumeReservedTokensInPlace(coordinator_, request->BlockTablesRef(),
+                                                request->ReserveNumTokensInNextScheduleEvent(), frontier);
+            if (eligible) {
+                window.push_back(request);
+                if (window.size() == static_cast<std::size_t>(expert_affinity_->lookahead)) flush_window();
+                continue;
+            }
+            state.deferrals = 0;
+            flush_window();
+            if (full()) return;
+        }
+        schedule(request);
     }
+    if (expert_affinity_) flush_window();
 }
 
 // P role: prefill worker. Completed prompts leave on plan.remote_decode

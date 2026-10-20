@@ -70,6 +70,11 @@ def main(argv: list[str] | None = None) -> None:
     cache.add_argument("estimate", type=Path)
     checkpoint = commands.add_parser("checkpoint")
     checkpoint.add_argument("directory", type=Path)
+    hotset = commands.add_parser("hotset")
+    hotset.add_argument("frequencies", type=Path)
+    hotset.add_argument("--capacity-rows", type=int, required=True)
+    screen = commands.add_parser("performance-screen")
+    screen.add_argument("observations", type=Path)
     measure = commands.add_parser("measure")
     measure.add_argument("workload", type=Path)
     measure.add_argument("--endpoint", required=True)
@@ -101,6 +106,16 @@ def main(argv: list[str] | None = None) -> None:
         from tokenspeed.deployment.deepseek_v41.checkpoint import audit_checkpoint
 
         result = audit_checkpoint(args.directory)
+    elif args.command == "hotset":
+        from tokenspeed.deployment.deepseek_v41.hotset import build_hotset
+
+        result = build_hotset(_read(args.frequencies), capacity_rows=args.capacity_rows)
+    elif args.command == "performance-screen":
+        from tokenspeed.deployment.deepseek_v41.performance_bench import (
+            run_mechanism_screen,
+        )
+
+        result = run_mechanism_screen(_read(args.observations))
     elif args.command == "measure":
         from tokenspeed.deployment.deepseek_v41.workload import (
             ReplayConfig,
