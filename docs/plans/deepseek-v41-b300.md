@@ -5,7 +5,7 @@
 Build a specialized TokenSpeed engine for `deepseek-ai/DeepSeek-V4.1-Flash-1017`
 with encoder/prefill/decode disaggregation. Preserve the upstream scheduler,
 execution path, cache ownership, kernel registry and transport abstractions.
-The implementation branch is `codex/deepseek-b300`, based on `qimcis/tokenspeed`
+The implementation branch is `deepseek-b300`, based on `qimcis/tokenspeed`
 main at `4fd85df66b4e3c127a587943c783dbc9d941c87c`. The checkpoint revision is
 `1bae0e1088993b9b82de08f59de5be5a34e42170`.
 

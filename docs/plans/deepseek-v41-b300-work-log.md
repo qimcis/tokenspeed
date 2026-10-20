@@ -12,9 +12,11 @@ calendar dates or delivery estimates in the plan.
 
 ## Repository and provenance
 
-- Branch: `codex/deepseek-b300`.
+- Branch: `deepseek-b300`. The user requires branch names without the assistant name prefix.
 - Base: `qimcis/tokenspeed` main, `4fd85df66b4e3c127a587943c783dbc9d941c87c`.
 - Origin: `https://github.com/qimcis/tokenspeed.git`.
+- Publication: the user authorized pushing `deepseek-b300` and requires that no
+  pull requests ever be opened. Push branch updates only; do not create a PR.
 - Upstream: `https://github.com/lightseekorg/tokenspeed.git`.
 - Model: `deepseek-ai/DeepSeek-V4.1-Flash-1017`.
 - Model revision: `1bae0e1088993b9b82de08f59de5be5a34e42170`.
@@ -165,8 +167,8 @@ records below distinguish integrated CPU evidence from deferred hardware work.
 6. Keep model co-design separate from engine-only evaluation. Router changes
    require separately versioned artifacts and independent quality acceptance.
 
-The implementation is tracked on local branch `codex/deepseek-b300`; use
-`git log -1 --oneline` to identify its current commit. The branch has not been
-published remotely. Remote publication follows the applicable review workflow.
+The implementation is tracked on branch `deepseek-b300`; use
+`git log -1 --oneline` to identify its current commit. Its authorized remote
+destination is `origin/deepseek-b300`. The user prohibits opening pull requests.
 CPU completion must never be reported as full hardware or optimization-plan
 completion.
